@@ -1,0 +1,142 @@
+// ============================================================================
+// LiquidityFlowAuse — Session Markers Module
+// ----------------------------------------------------------------------------
+// Module:   Session Markers
+// Version:  LiquidityFlowAuse v1.0.0
+//
+// Purpose:  Detects which traditional market session(s) — Asia, London,
+//           New York, or the London + New York overlap — are active on the
+//           current bar, using configurable time windows and timezone.
+//           Renders visual cues (background tints and boundary lines) and
+//           produces the sessionStrength score and sessionMultiplier for
+//           downstream Signal Engine consumption.
+//
+// Pine:     Pine Script v5. The //@version=5 directive is declared once in
+//           the main indicator file (src/liquidityflowause.pine); this
+//           module MUST NOT contain an indicator() or study() declaration.
+//
+// Usage:    Designed for file concatenation into the main indicator file.
+//           For a standalone syntax check in the Pine Editor, wrap the
+//           contents of this file in a temporary indicator() declaration.
+// ============================================================================
+
+// ─── User Inputs ─────────────────────────────────────────────────────────────
+
+sessionAsiaEnabled   = input.bool(true, "Enable Asia Session", group="Sessions")
+sessionLondonEnabled = input.bool(true, "Enable London Session", group="Sessions")
+sessionNYEnabled     = input.bool(true, "Enable New York Session", group="Sessions")
+showOverlapOnly      = input.bool(false, "Show Overlap Only (Lon+NY)", group="Sessions")
+
+sessionTimezone = input.string("exchange", "Session Timezone", group="Sessions", options=["exchange", "UTC", "America/New_York", "Europe/London", "Asia/Tokyo"])
+
+asiaStart   = input.time("00:00", "Asia Session Start", group="Sessions")
+asiaEnd     = input.time("09:00", "Asia Session End", group="Sessions")
+londonStart = input.time("07:00", "London Session Start", group="Sessions")
+londonEnd   = input.time("16:00", "London Session End", group="Sessions")
+nyStart     = input.time("13:00", "New York Session Start", group="Sessions")
+nyEnd       = input.time("22:00", "New York Session End", group="Sessions")
+
+// ─── Color Constants ─────────────────────────────────────────────────────────
+
+COLOR_ASIA_TINT    = color.new(color.purple, 96)
+COLOR_LONDON_TINT  = color.new(color.blue, 94)
+COLOR_NY_TINT      = color.new(color.orange, 94)
+COLOR_OVERLAP_TINT = color.new(color.yellow, 92)
+
+COLOR_ASIA_LINE    = color.purple
+COLOR_LONDON_LINE  = color.blue
+COLOR_NY_LINE      = color.orange
+
+// ─── Time Evaluation ─────────────────────────────────────────────────────────
+
+// Current bar time as a UNIX timestamp in the user-selected timezone.
+// The "00:00-23:59" session string includes every bar of the day.
+// na when sessionTimezone is na — guarded below.
+int currentTime = na
+if not na(sessionTimezone)
+    currentTime := time(timeframe.period, "00:00-23:59", sessionTimezone)
+
+// ─── Session Membership ──────────────────────────────────────────────────────
+// Half-open intervals [start, end): start inclusive, end exclusive.
+// A session counts only when its enable toggle is on and none of the
+// involved inputs are na; otherwise the flag stays false (no errors).
+
+var bool inAsia    = false
+var bool inLondon  = false
+var bool inNY      = false
+var bool inOverlap = false
+
+inAsia := false
+if not na(currentTime) and not na(asiaStart) and not na(asiaEnd)
+    inAsia := sessionAsiaEnabled and currentTime >= asiaStart and currentTime < asiaEnd
+
+inLondon := false
+if not na(currentTime) and not na(londonStart) and not na(londonEnd)
+    inLondon := sessionLondonEnabled and currentTime >= londonStart and currentTime < londonEnd
+
+inNY := false
+if not na(currentTime) and not na(nyStart) and not na(nyEnd)
+    inNY := sessionNYEnabled and currentTime >= nyStart and currentTime < nyEnd
+
+// Overlap is a derived state: both constituent sessions enabled AND active.
+inOverlap := sessionLondonEnabled and sessionNYEnabled and inLondon and inNY
+
+// ─── Scoring (Signal Engine Interface) ───────────────────────────────────────
+
+// Persistent module-level outputs consumed by the Signal Engine when this
+// module is concatenated: sessionStrength (int, 0-8) and
+// sessionMultiplier (float, 0.3-1.5).
+
+var int sessionStrength = 0
+sessionStrength := 0
+if inAsia
+    sessionStrength += 1
+if inLondon
+    sessionStrength += 2
+if inNY
+    sessionStrength += 2
+if inOverlap
+    sessionStrength += 3
+
+var float sessionMultiplier = 0.3
+if inOverlap
+    sessionMultiplier := 1.5
+else if inLondon or inNY
+    sessionMultiplier := 1.0
+else if inAsia
+    sessionMultiplier := 0.5
+else
+    sessionMultiplier := 0.3
+
+// ─── Background Tint ────────────────────────────────────────────────────────
+// One color per bar. Priority chain: Overlap > London/NY > Asia.
+// showOverlapOnly suppresses every tint except the Lon+NY overlap.
+
+color bgColor = na
+if showOverlapOnly
+    if inOverlap
+        bgColor := COLOR_OVERLAP_TINT
+else
+    if inOverlap
+        bgColor := COLOR_OVERLAP_TINT
+    else if inLondon
+        bgColor := COLOR_LONDON_TINT
+    else if inNY
+        bgColor := COLOR_NY_TINT
+    else inAsia
+        bgColor := COLOR_ASIA_TINT
+
+bgcolor(bgColor, title="Session Background")
+
+// ─── Session Boundary Lines ──────────────────────────────────────────────────
+// Vertical dotted line on the first bar of each session (false -> true
+// edge), only for enabled sessions. Unaffected by showOverlapOnly.
+
+if sessionAsiaEnabled and ta.change(inAsia)
+    line.new(bar_index, low, bar_index, high, color=COLOR_ASIA_LINE, style=line.style_dotted, width=1)
+
+if sessionLondonEnabled and ta.change(inLondon)
+    line.new(bar_index, low, bar_index, high, color=COLOR_LONDON_LINE, style=line.style_dotted, width=1)
+
+if sessionNYEnabled and ta.change(inNY)
+    line.new(bar_index, low, bar_index, high, color=COLOR_NY_LINE, style=line.style_dotted, width=1)
