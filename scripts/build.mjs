@@ -234,6 +234,18 @@ function validate(assembled) {
     }
   }
 
+  // 4. Pine v5 has no `else <condition>:` form. `else` alone or `else if` is
+  //    a keyword that may open an indented block; `else someCondition` is a
+  //    syntax error. Caught twice in this project before being encoded here.
+  //    Use the ternary operator for that case.
+  lines.forEach((l, i) => {
+    const m = /^\s*else\s+(?!if\b|if$|\{)([A-Za-z_][\w.]*)/.exec(l);
+    if (m) {
+      fail(`line ${i + 1}: 'else ${m[1]}' cannot open an indented block in ` +
+        "Pine v5. Write 'else if' or use the ternary operator");
+    }
+  });
+
   return { lineCount: lines.length };
 }
 

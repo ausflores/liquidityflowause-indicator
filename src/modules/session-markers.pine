@@ -100,19 +100,18 @@ else if inAsia
 // One color per bar. Priority chain: Overlap > London/NY > Asia.
 // showOverlapOnly suppresses every tint except the Lon+NY overlap.
 
+// Pine v5 does not allow `else <condition>` to open an indented block, so the
+// terminal Asia case is expressed with the ternary operator rather than a
+// fourth else-branch.
+
 color bgColor = na
 if showOverlapOnly
-    if inOverlap
-        bgColor := COLOR_OVERLAP_TINT
+    bgColor := inOverlap ? COLOR_OVERLAP_TINT : na
 else
-    if inOverlap
-        bgColor := COLOR_OVERLAP_TINT
-    else if inLondon
-        bgColor := COLOR_LONDON_TINT
-    else if inNY
-        bgColor := COLOR_NY_TINT
-    else inAsia
-        bgColor := COLOR_ASIA_TINT
+    bgColor := inOverlap     ? COLOR_OVERLAP_TINT :
+               inLondon      ? COLOR_LONDON_TINT :
+               inNY          ? COLOR_NY_TINT     :
+               inAsia        ? COLOR_ASIA_TINT   : na
 
 bgcolor(bgColor, title="Session Background")
 
