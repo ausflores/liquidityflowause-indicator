@@ -230,7 +230,7 @@ type LiquidityZone
     float halfWidth
     int   tier
     int   bornBar
-    int   lastTestedBar
+    int   sweptBar       // bar_index of the sweep; na while the zone is untested
     box   zoneBox
 
 var array<LiquidityZone> zones = array.new<LiquidityZone>()
@@ -259,15 +259,29 @@ f_newZone(int tier, float center, float halfWidth) =>
          xloc         = xloc.bar_index,
          extend       = extend.right)
 
-// Add a confirmed pivot as a zone, if the tier is enabled and there is room.
+// Make room by evicting the oldest zone. A brand-new pivot is always more
+// relevant than a zone hundreds of bars old, so eviction replaces the
+// "if array.size(zones) < maxZones" guard, which silently DROPPED the new zone
+// precisely when the array was full — backwards.
+f_makeRoom() =>
+    if array.size(zones) >= maxZones
+        int oldest = 0
+        for i = 1 to array.size(zones) - 1
+            if array.get(zones, i).bornBar < array.get(zones, oldest).bornBar
+                oldest := i
+        box.delete(array.get(zones, oldest).zoneBox)
+        array.remove(zones, oldest)
+
+// Add a confirmed pivot as a zone, if the tier is enabled.
 f_addZone(int tier, float pivotPrice, float atr, bool showTier) =>
-    if showTier and not na(pivotPrice) and not na(atr) and array.size(zones) < maxZones
+    if showTier and not na(pivotPrice) and not na(atr)
+        f_makeRoom()
         array.push(zones, LiquidityZone.new(
              pivotPrice,
              atr * zoneATRMult,
              tier,
              bar_index,
-             bar_index,
+             na,
              f_newZone(tier, pivotPrice, atr * zoneATRMult)))
 
 if not na(d1_pivotHigh)
@@ -305,35 +319,54 @@ Zones are **culled** by any of three independent rules:
 
 | Rule | Threshold | Rationale |
 |------|-----------|-----------|
-| **Tested** | the bar's high/low entered the zone body | A zone that price has already swept has served its purpose |
 | **Age** | older than `maxZoneAgeBars` (default 500 bars) | Stops unbounded accumulation and keeps old structure out of the picture |
 | **Distance** | beyond `maxZoneDistanceATR` (default 15 × ATR) | Far-away zones are no longer actionable |
+| **Swept and aged out** | swept longer ago than `sweptRetainBars` (default 100 bars) | Bounds how long a swept zone lingers |
 
-Every cull **must delete the drawing**. Removing the record from the array
-without `box.delete()` leaves a zone visible on the chart that no longer
-participates in proximity logic — a visual and logical divergence, which is the
-bug present in the earlier draft.
+**A sweep does not remove a zone — it marks it.** The premise of the indicator
+is that price travels to hunt liquidity, so the sweep is the event of interest,
+not the end of the zone's life. Deleting a zone on first touch would destroy the
+one piece of information the Signal Engine most wants: that a sweep just
+happened, and where. The sweep is recorded in `sweptBar` and the zone persists
+until its own age, distance, or swept-retention limit expires.
+
+That retention limit is what keeps a swept zone from lingering forever. It is
+deliberately shorter than `maxZoneAgeBars`, because a swept zone has a short
+useful life while an untouched one is a target that may still be approached.
+
+Every cull **must delete the drawing**. Removing the record without
+`box.delete()` leaves a zone visible on the chart that no longer participates in
+proximity logic — a visual and logical divergence, and the bug present in the
+earlier draft.
 
 ```pine
-maxZoneAgeBars     = input.int(500,   "Max Zone Age (bars)",     minval=50, group="Liquidity Zones")
+maxZoneAgeBars     = input.int(500,   "Max Zone Age (bars)",        minval=50, group="Liquidity Zones")
 maxZoneDistanceATR = input.float(15.0, "Max Zone Distance (× ATR)", minval=5.0, group="Liquidity Zones")
+sweptRetainBars    = input.int(100,   "Swept Zone Retention (bars)", minval=10, group="Liquidity Zones")
 
 // Proximity and culling thresholds both measure on the entry timeframe, since
 // that is the timeframe on which price is being evaluated.
 atrChart = ta.atr(14)
 
-// Iterate backwards so removal does not skip the following element.
+// Runs AFTER zone creation, so a zone that is born and swept on the same bar is
+// correctly marked rather than surviving untouched.
 if array.size(zones) > 0
+    for i = 0 to array.size(zones) - 1
+        LiquidityZone z = array.get(zones, i)
+
+        bool inZone = high >= z.center - z.halfWidth and low <= z.center + z.halfWidth
+        if inZone and na(z.sweptBar)
+            array.set(zones, i, LiquidityZone.new(
+                 z.center, z.halfWidth, z.tier, z.bornBar, bar_index, z.zoneBox))
+
     for i = array.size(zones) - 1 to 0
         LiquidityZone z = array.get(zones, i)
 
-        bool tooOld      = bar_index - z.bornBar > maxZoneAgeBars
-        bool tooFar      = math.abs(close - z.center) > atrChart * maxZoneDistanceATR
-        bool testedAbove = high >= z.center + z.halfWidth
-        bool testedBelow = low  <= z.center - z.halfWidth
-        bool wasTested   = testedAbove or testedBelow
+        bool tooOld   = bar_index - z.bornBar > maxZoneAgeBars
+        bool tooFar   = math.abs(close - z.center) > atrChart * maxZoneDistanceATR
+        bool stale    = not na(z.sweptBar) and bar_index - z.sweptBar > sweptRetainBars
 
-        if tooOld or tooFar or wasTested
+        if tooOld or tooFar or stale
             box.delete(z.zoneBox)
             array.remove(zones, i)
 ```
@@ -355,28 +388,38 @@ an `atrValue` that was never defined, which does not compile.
 // Module-level outputs consumed by the Signal Engine.
 bool nearLiquidityLong  = false
 bool nearLiquidityShort = false
+bool sweptLong          = false
+bool sweptShort         = false
 bool nearD1Liquidity    = false
 bool nearH4Liquidity    = false
 bool nearH1Liquidity    = false
 
 proxATRMult = input.float(3.0, "Proximity (× ATR)", minval=0.5, step=0.5, group="Liquidity Zones")
+sweepWindow = input.int(10, "Sweep Signal Window (bars)", minval=1, group="Liquidity Zones")
 
 if array.size(zones) > 0 and not na(atrChart)
     for i = 0 to array.size(zones) - 1
         LiquidityZone z = array.get(zones, i)
 
-        // Already culled if swept, but a zone can be entered between bars.
         bool inBody = high >= z.center - z.halfWidth and low <= z.center + z.halfWidth
         bool near   = math.abs(close - z.center) <= atrChart * proxATRMult
 
+        // A recent sweep of a zone below price = demand-side liquidity taken.
+        if not na(z.sweptBar) and bar_index - z.sweptBar <= sweepWindow
+            if z.center < close
+                sweptLong := true
+            else
+                sweptShort := true
+
+        // Proximity is deliberately exclusive of an in-body bar: the zone has
+        // already been reached on that bar, and reporting "near" at the same
+        // time as "swept" would double-count one event as two factors.
         if near and not inBody
-            // Zone below price = demand-side liquidity
             if z.center < close
                 nearLiquidityLong := true
                 nearD1Liquidity    := nearD1Liquidity or z.tier == 1
                 nearH4Liquidity    := nearH4Liquidity or z.tier == 2
                 nearH1Liquidity    := nearH1Liquidity or z.tier == 3
-            // Zone above price = supply-side liquidity
             else
                 nearLiquidityShort := true
                 nearD1Liquidity    := nearD1Liquidity or z.tier == 1
@@ -390,11 +433,24 @@ What this module exports to the Signal Engine:
 
 | Output | Type | Meaning |
 |--------|------|---------|
-| `nearLiquidityLong` | bool | Price is near demand-side liquidity below it |
-| `nearLiquidityShort` | bool | Price is near supply-side liquidity above it |
+| `nearLiquidityLong` | bool | Price is near untested demand-side liquidity below it |
+| `nearLiquidityShort` | bool | Price is near untested supply-side liquidity above it |
+| `sweptLong` | bool | Demand-side liquidity below was swept within `sweepWindow` bars |
+| `sweptShort` | bool | Supply-side liquidity above was swept within `sweepWindow` bars |
 | `nearD1Liquidity` | bool | That proximity is to a D1 (tier 1) zone |
 | `nearH4Liquidity` | bool | That proximity is to a 4H (tier 2) zone |
 | `nearH1Liquidity` | bool | That proximity is to a 1H (tier 3) zone |
+
+**Proximity and sweep are mutually exclusive on any given bar.** `near*` requires
+the bar's range to be outside the zone body; once price reaches the body the
+zone is swept and reports through `swept*` instead. The Signal Engine therefore
+cannot double-count a single event as both "approaching liquidity" and "took
+liquidity" — which would inflate a three-factor confluence score on one factor.
+
+**Sweep direction is derived from the zone's position at sweep time, not from
+the bar's direction.** A zone below price that gets swept is demand-side
+liquidity taken, regardless of whether the bar closed up or down; the reversal
+that may follow is the Structure Break module's concern, not this one's.
 
 **`max_boxes_count` constraint.** The main indicator declares
 `max_boxes_count=500`. `maxZones` is capped at 200, and every cull calls
@@ -1073,15 +1129,20 @@ alertcondition(bearishBoS,     "LF_BearishBoS",     "Bearish BoS on {{ticker}}")
 alertcondition(bullishChoCh,   "LF_BullishChoCh",   "Bullish ChoCh on {{ticker}}")
 alertcondition(bearishChoCh,   "LF_BearishChoCh",   "Bearish ChoCh on {{ticker}}")
 
-// Liquidity zone approach alert.
-// Fires on the transition INTO proximity, using the module's proximity outputs.
-// An earlier draft read array.get(zonePrices, 0), which is the OLDEST zone in
-// the array — unrelated to whatever price is actually approaching, and an
-// out-of-bounds read whenever the array is empty.
+// Liquidity zone approach and sweep alerts.
+// Approach fires on the transition INTO proximity. An earlier draft read
+// array.get(zonePrices, 0) — the OLDEST zone in the array, unrelated to
+// whatever price was approaching, and an out-of-bounds read when empty.
+// Sweep fires on the bar liquidity is actually taken, which is the event the
+// indicator's thesis is built around.
 bool liquidityTestLong  = nearLiquidityLong  and not nearLiquidityLong[1]
 bool liquidityTestShort = nearLiquidityShort and not nearLiquidityShort[1]
-alertcondition(liquidityTestLong,  "LF_LiquidityTest",  "Price testing LONG liquidity on {{ticker}}")
-alertcondition(liquidityTestShort, "LF_LiquidityTest",  "Price testing SHORT liquidity on {{ticker}}")
+bool liquiditySweepLong  = sweptLong  and not sweptLong[1]
+bool liquiditySweepShort = sweptShort and not sweptShort[1]
+alertcondition(liquidityTestLong,   "LF_LiquidityTest",  "Price approaching LONG liquidity on {{ticker}}")
+alertcondition(liquidityTestShort,  "LF_LiquidityTest",  "Price approaching SHORT liquidity on {{ticker}}")
+alertcondition(liquiditySweepLong,  "LF_LiquiditySweep", "LONG liquidity swept on {{ticker}}")
+alertcondition(liquiditySweepShort, "LF_LiquiditySweep", "SHORT liquidity swept on {{ticker}}")
 
 // Session overlap alert
 alertcondition(ta.change(inOverlap) and inOverlap, "LF_OverlapStart", "London+NY overlap started on {{ticker}}")
@@ -1360,43 +1421,45 @@ Not all zones are equal. A zone tested 5 minutes ago is more relevant than one t
 
 ```pine
 // ─── Zone Freshness Decay ─────────────────────────────────────────────────────
-// Exponential decay since the last test, carried on the zone record itself.
-// The earlier draft used a third parallel array (zoneLastTested) alongside
-// zonePrices and zoneTiers, all of which had to be mutated in lockstep, and
-// removed entries without deleting the box — the same divergence between what
-// is drawn and what the logic sees.
+// Exponential decay since the sweep, carried on the zone record itself via
+// sweptBar. The earlier draft used a third parallel array (zoneLastTested)
+// alongside zonePrices and zoneTiers, all of which had to be mutated in
+// lockstep, and removed entries without deleting the box — the same divergence
+// between what is drawn and what the logic sees.
+//
+// This is an OPTIONAL refinement, not part of the core module. It supersedes
+// sweptRetainBars: with decay enabled, a swept zone is culled by falling below
+// the strength threshold rather than by a flat bar count.
 
 zoneDecayFactor       = input.float(50.0, "Zone Decay Half-Life (bars)", minval=10.0, group="Liquidity Zones")
 zoneStrengthThreshold = input.float(0.1,  "Min Zone Strength", minval=0.01, maxval=1.0, step=0.01, group="Liquidity Zones")
+useDecayCulling       = input.bool(false, "Use Decay Instead Of Swept Retention", group="Liquidity Zones")
 
-f_zoneStrength(int barsSinceTest) =>
-    math.exp(-barsSinceTest / zoneDecayFactor)
+f_zoneStrength(int barsSinceSweep) =>
+    math.exp(-barsSinceSweep / zoneDecayFactor)
 
-// Record a test, then cull on weakness. Both loops walk backwards or in
-// place so removal never skips an element.
 if array.size(zones) > 0
-    for i = 0 to array.size(zones) - 1
-        LiquidityZone z = array.get(zones, i)
-        if math.abs(close - z.center) < atrChart * zoneATRMult
-            array.set(zones, i, LiquidityZone.new(
-                 z.center, z.halfWidth, z.tier, z.bornBar, bar_index, z.zoneBox))
-
     for i = array.size(zones) - 1 to 0
         LiquidityZone z = array.get(zones, i)
-        if f_zoneStrength(bar_index - z.lastTestedBar) < zoneStrengthThreshold
+
+        // Only a swept zone can decay. An untouched zone has no sweep to measure
+        // from, and must fall back to the flat age rule in 3.2.3.
+        bool decayed = useDecayCulling and not na(z.sweptBar) and
+                       f_zoneStrength(bar_index - z.sweptBar) < zoneStrengthThreshold
+
+        if decayed
             box.delete(z.zoneBox)
             array.remove(zones, i)
 ```
 
 **Why:** Stale zones clutter the chart and reduce signal quality. Fresh zones attract price; dead zones do not.
 
-**Interaction with section 3.2.3.** This decay is a *fourth* cull rule layered on
-top of the three in 3.2.3, and both operate on the same `zones` array in the same
-bar. Whichever runs first removes elements; the second then operates on an
-already-shortened array. That is safe because both iterate backwards, but it
-means the effective lifetime is `min(age, distance, tested, strength)` — not a
-choice between rules. If the decay rule is enabled, `maxZoneAgeBars` should be
-loosened accordingly, or the two will fight over which zone dies first.
+**Interaction with section 3.2.3.** Both loops walk the same `zones` array in the
+same bar. Decay only ever applies to swept zones; untouched zones are governed
+by the age and distance rules in 3.2.3, so the two do not compete for the same
+zone. `useDecayCulling` selects between the flat `sweptRetainBars` and the
+exponential curve — enabling both is not meaningful, so the flag replaces the
+flat rule rather than adding to it.
 
 ---
 
