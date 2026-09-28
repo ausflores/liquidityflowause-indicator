@@ -132,6 +132,54 @@ threshold on structure alone.
 
 ---
 
+---
+
+## Signal Engine
+
+| Check | Status | Evidence |
+|---|---|---|
+| Compiles | confirmed | Pine Editor, no errors, five modules in one script |
+| Renders alongside the others | confirmed | session tints, swing level lines and a `ChoCh ▼` marker all visible |
+| Identifier attribution | confirmed | 37 read identifiers attributed to a declaring file, each declared before first use |
+| Unresolved identifier sweep | confirmed | all 67 bare identifiers resolved against every declaration, parameter, UDT field, builtin and named argument in the spliced file |
+| Duplicate top-level declarations | confirmed | 125 zero-indent declarations scanned, none duplicated |
+| Score arithmetic | confirmed | all 192 reachable combinations enumerated: max 110, every tier reaches the 70 threshold including 1H-only |
+| **LONG/SHORT exclusivity** | **unverified** | `SE DIAG DUAL fires` not read from the legend |
+| **Weights calibrated** | **not attempted** | a trading judgement, not a code property |
+
+**The exclusivity check is the one that matters.** LONG and SHORT are not
+mutually exclusive by construction: a setup with an H4 zone below *and* an H4
+zone above, untouched gaps on both sides, in the London/NY overlap, on elevated
+volume, scores 70 on both sides and clears the threshold twice on one bar. The
+implementation resolves it with `marketStructure` as tiebreaker and drops the
+signal entirely when structure is unestablished. `SE DIAG DUAL fires` must be 0;
+a non-zero value means that block is absent or ineffective.
+
+**The weights are deliberately uncalibrated.** D1 30, 4H 20, 1H 10, overlap 25,
+London/NY 15, Asia 5, reversal 30 versus continuation 20, imbalance 15, volume
+10 — maximum 110, threshold 70. They are coherent with the spec's design intent,
+where rarer events score higher, but nothing in the code can determine whether
+they suit a given risk profile. Tuning them is the maintainer's decision against
+real data; §7.3.1 records the reasoning so a future change is traceable rather
+than arbitrary.
+
+### Reading the numbers
+
+```bash
+node scripts/build.mjs --diagnostic
+```
+
+Paste `dist/liquidityflowause-diag.pine` into the Pine Editor. Every invariant
+above is a series in the chart legend. Three are assertions about behaviour that
+no static check can reach:
+
+- `SE DIAG DUAL fires` — **must be 0.** Both signals on one bar.
+- `SB DIAG ORPHAN flips` — **must be 0.** A reversal property with no break.
+- `IMB DIAG virgin gaps` — must be **non**-zero. Zero means every gap is born
+  touched, which silently pins both `nearImbalance*` flags at false.
+
+---
+
 ## Outstanding across the project
 
 | Item | Why it matters | Where |
@@ -139,15 +187,19 @@ threshold on structure alone.
 | `America/New_York` | only untested timezone direction | Session Markers |
 | DST transitions | needs data spanning a boundary | Session Markers |
 | Weekend spans | 24/7 markets, so a data question | Session Markers |
-| SB DIAG numbers | the orphan invariant is unconfirmed | Structure Break |
+| `SB DIAG ORPHAN flips` = 0 | `structureFlipped` reachability unconfirmed | Structure Break |
+| `SE DIAG DUAL fires` = 0 | LONG/SHORT exclusivity is unconfirmed | Signal Engine |
+| Weight calibration | a trading judgement, not a code property | Signal Engine |
 | Box liveness | not assertable from outside a module | Liquidity Zones |
-| `atrValue` | referenced and never defined | Signal Engine, section 7 |
 | `src/lib/inputs.pine` | does not exist yet | shared inputs |
 
-**`src/lib/inputs.pine` does not exist.** The zone and structure modules declare
-their own inputs. Whoever writes that library must not redeclare them, or the
-splice produces duplicate declarations — the same class of defect as the
-`h1_pivotHigh` collision.
+**`src/lib/inputs.pine` does not exist.** The zone, imbalance and structure
+modules declare their own inputs. Whoever writes that library must not redeclare
+them, or the splice produces duplicate declarations — the same class of defect as
+the `h1_pivotHigh` collision. `enableLongSignals`, `enableShortSignals`,
+`signalBullColor`, `signalBearColor` and `labelSize` from §8.1 are declared
+nowhere and consumed nowhere; they were deliberately not implemented rather than
+left as inputs wired to nothing.
 
 ---
 
