@@ -1034,8 +1034,10 @@ liquidityflowause-indicator/
 │       ├── eth-range-bound.md
 │       └── low-cap-altcoin.md
 ├── scripts/
+│   ├── build.mjs                     # Concatenate modules + structural checks
 │   ├── validate-pine.py              # Pine Script syntax checker
 │   └── export-data.py                # Export indicator data for testing
+├── dist/                             # Build output (gitignored)
 ├── LICENSE                           # MIT License
 ├── README.md                         # Project overview & quick start
 ├── CHANGELOG.md                      # Version history
@@ -1052,21 +1054,77 @@ liquidityflowause-indicator/
 
 ### 12.3 Build Process
 
+Modules are concatenated **into** the main indicator file, not appended after
+it. The order is semantic and cannot be rearranged.
+
+**Why the main file comes first:** Pine v5 requires `//@version=5` to precede all
+code, and `indicator()` / `study()` to be the first statement in the script. The
+`input.*` family is only legal *inside* a declared script. Concatenating modules
+ahead of the main file therefore cannot compile, regardless of platform.
+
+The main file exposes a `[CONCATENATION POINT]` marker comment; the build splices
+each module in at that marker, so the header (`//@version=5` + `indicator()`)
+stays first and module code lands beneath it.
+
+**Declaration order within the modules:** Pine v5 has no forward declarations.
+Every input, constant, and function must be declared before its first use, which
+fixes the order below.
+
 ```bash
-# scripts/build.sh
-#!/bin/bash
-# Concatenate modules into single-file distribution
-cat src/lib/colors.pine \
-    src/lib/utils.pine \
-    src/lib/inputs.pine \
-    src/modules/liquidity-zones.pine \
-    src/modules/session-markers.pine \
-    src/modules/imbalance-detector.pine \
-    src/modules/structure-break.pine \
-    src/modules/signal-engine.pine \
-    src/liquidityflowause.pine \
-    > dist/liquidityflowause-v1.0.0.pine
+# Build the distributable single file, then run structural checks.
+node scripts/build.mjs
+
+# Validate only; write nothing.
+node scripts/build.mjs --check
 ```
+
+Output: `dist/liquidityflowause.pine` — paste into the TradingView Pine Editor.
+`dist/` is gitignored; the file is regenerated, never edited by hand.
+
+**Source order** (encoded in the `SOURCES` list in `scripts/build.mjs`):
+
+| # | Source | Role |
+|---|--------|------|
+| 1 | `src/liquidityflowause.pine` | `//@version=5` + `indicator()` + header |
+| 2 | `src/lib/colors.pine` | Color constants |
+| 3 | `src/lib/utils.pine` | Shared utility functions |
+| 4 | `src/lib/inputs.pine` | All input declarations |
+| 5 | `src/modules/liquidity-zones.pine` | Liquidity zone detection |
+| 6 | `src/modules/session-markers.pine` | Session detection & rendering |
+| 7 | `src/modules/imbalance-detector.pine` | Imbalance & volume delta |
+| 8 | `src/modules/structure-break.pine` | BoS/ChoCh detection |
+| 9 | `src/modules/signal-engine.pine` | Confluence & signal output |
+
+A source that does not exist yet is reported as a **warning**, not a failure, so
+the project builds incrementally instead of waiting for the final module.
+
+### 12.3.1 Structural Checks
+
+`scripts/build.mjs` verifies what is decidable from the text alone. These are
+**not** a Pine parser:
+
+| Check | Failure condition |
+|-------|-------------------|
+| Version directive | Zero, or more than one, `//@version=` |
+| Version placement | `//@version=` appears after the first statement |
+| Script declaration | Zero, or more than one, `indicator()` / `study()` |
+| Input legality | An `input.*` call precedes the script declaration |
+| Module independence | A module file declares its own `indicator()` / `study()` |
+
+Type errors, unknown builtins, and runtime behavior are **not** covered. Only the
+TradingView Pine Editor verifies those.
+
+### 12.3.2 Module Contract
+
+A file under `src/modules/` is a **splice unit**, not a script. It must:
+
+- contain no `//@version=` directive
+- contain no `indicator()` or `study()` declaration
+- expose its outputs as plain module-level variables, since Pine has no `export`
+- declare only `input.*` calls, which is legal once spliced beneath `indicator()`
+
+A module's decorative header banner is stripped during the build; the
+descriptive prose is preserved.
 
 ### 12.4 Versioning
 
