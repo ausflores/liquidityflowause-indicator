@@ -445,9 +445,17 @@ What this module exports to the Signal Engine:
 | `nearLiquidityShort` | bool | Price is near untested supply-side liquidity above it |
 | `sweptLong` | bool | Demand-side liquidity below was swept within `sweepWindow` bars |
 | `sweptShort` | bool | Supply-side liquidity above was swept within `sweepWindow` bars |
-| `nearD1Liquidity` | bool | That proximity is to a D1 (tier 1) zone |
-| `nearH4Liquidity` | bool | That proximity is to a 4H (tier 2) zone |
-| `nearH1Liquidity` | bool | That proximity is to a 1H (tier 3) zone |
+| `nearD1LiquidityLong` / `Short` | bool | That proximity is to a D1 (tier 1) zone, **per side** |
+| `nearH4LiquidityLong` / `Short` | bool | That proximity is to a 4H (tier 2) zone, **per side** |
+| `nearH1LiquidityLong` / `Short` | bool | That proximity is to a 1H (tier 3) zone, **per side** |
+
+**Tier flags are per side, and must stay that way.** An earlier draft exposed
+`nearD1Liquidity` as a single flag set from both the demand and the supply
+branch. That flag is under-determined: it cannot say which side the nearby D1
+liquidity is on. The Signal Engine scores direction, so a LONG setup would earn
+"near D1 liquidity" points because a D1 zone *above* price — the one a short
+would use — happened to be nearby. Six per-side flags replace three shared ones
+so that (tier, side) is always jointly determined.
 
 **Proximity and sweep are mutually exclusive on any given bar.** `near*` requires
 the bar's range to be outside the zone body; once price reaches the body the
@@ -536,16 +544,18 @@ bool inNY     = sessionNYEnabled     and currentTime >= nyStart     and currentT
 // Overlap detection (London + New York)
 bool inOverlap = inLondon and inNY
 
-// Session strength score (used by signal engine)
-int sessionScore = 0
+// Session strength score (used by signal engine).
+// Additive: 0 none, 1 Asia, 2 London, 2 NY, 5 London+NY together.
+// The Signal Engine gates on `sessionStrength >= 2`.
+int sessionStrength = 0
 if inAsia
-    sessionScore += 1
+    sessionStrength += 1
 if inLondon
-    sessionScore += 2
+    sessionStrength += 2
 if inNY
-    sessionScore += 2
+    sessionStrength += 2
 if inOverlap
-    sessionScore += 3  // Bonus for overlap
+    sessionStrength += 3
 ```
 
 ### 4.5 Visual Rendering
@@ -1113,73 +1123,116 @@ to avoid.
 
 ### 7.3 Confidence Scoring
 
-Not all signals are equal. We compute a confidence score (0–100) based on:
+Not all signals are equal. **Two scores are computed, one per direction**, and
+each is compared only against its own signal.
+
+This is the single largest correctness constraint in the module. An earlier
+draft computed **one** `confidenceScore` shared by both signals, from inputs
+that do not know which direction is being scored. A LONG signal would earn
+liquidity points for a nearby D1 zone *above* price, structure points for a
+bearish break, and imbalance points for a bearish gap. The score would praise
+the setup for reasons that contradict the signal it was gating.
+
+### 7.3.1 Weights
 
 | Factor | Condition | Points |
 |--------|-----------|--------|
-| **Liquidity** | Near D1 zone | 30 |
-| | Near 4H zone | 20 |
-| | Near 1H zone | 10 |
+| **Liquidity** | Near D1 zone, same side | 30 |
+| | Near 4H zone, same side | 20 |
+| | Near 1H zone, same side | 10 |
 | **Session** | In overlap (Lon+NY) | 25 |
 | | In London or NY | 15 |
 | | In Asia | 5 |
-| **Structure** | BoS aligned | 20 |
-| | ChoCh aligned | 30 |
-| | Imbalance confirmed | 15 |
-| | Volume confirmed | 10 |
+| **Structure** | Reversal break, same side | 30 |
+| | Continuation break, same side | 20 |
+| **Imbalance** | Same-side gap approach or fill | 15 |
+| **Volume** | Volume above its average | 10 |
+
+**The maximum is 110, not 100.** An earlier draft documented the score as 0–100,
+which made "confidence" read as a percentage that the arithmetic cannot produce.
+Calling it a score, and bounding the threshold at 110, is honest. Renormalising
+to 100 would only move the number without changing any behaviour.
+
+**These weights are a trading judgement, not a derived quantity.** Nothing in the
+code can tell you whether a reversal deserves 1.5× a continuation for your risk
+profile. That calibration is the maintainer's, made against real data.
+
+### 7.3.2 Session Factor
+
+`sessionScore` **does not exist.** The Session Markers module exports
+`sessionStrength` (int, 0–8, additive across sessions) and `sessionMultiplier`
+(float, 0.3–1.5). An earlier draft of this section referenced a `sessionScore`
+described in section 4 but never implemented, which is an undefined identifier
+and a compile error. The implementation uses the actual export.
 
 ```pine
-int confidenceScore = 0
+// Session strength, as the module actually exports it: 0 none, 1 Asia,
+// 2 London, 2 NY, +3 when the London/NY overlap is active.
+sessionOK = sessionStrength >= 2
+```
 
-// Liquidity points
-if nearD1Liquidity
-    confidenceScore += 30
-else if nearH4Liquidity
-    confidenceScore += 20
-else if nearH1Liquidity
-    confidenceScore += 10
+`sessionStrength >= 2` means a single active major session or better, which is
+the intended "session is worth trading in" test.
 
-// Session points
-if inOverlap
-    confidenceScore += 25
-else if inLondon or inNY
-    confidenceScore += 15
-else if inAsia
-    confidenceScore += 5
+### 7.3.3 Scoring
 
-// Structure points — the reversal weight REPLACES the base, it does not add.
-//
-// An earlier draft awarded +20 for any break and a further +30 for a ChoCh.
-// Since ChoCh is a subset of BoS, every reversal break scored 50 — fifty points
-// more than a continuation break, for what is the same single event. That is
-// the double-count made concrete, and it would have let every reversal signal
-// clear the 60-point threshold on structure alone.
-if breakUp or breakDown
-    confidenceScore += structureFlipped ? 30 : 20
-if bullishImbalance or bearishImbalance
-    confidenceScore += 15
+```pine
+// Directional tier weight. The `else if` chain is correct here: only the
+// highest tier nearby counts, so a D1 zone is not also counted as a 4H one.
+f_liquidityWeight(bool d1, bool h4, bool h1) =>
+    d1 ? 30 : h4 ? 20 : h1 ? 10 : 0
+
+int longScore  = 0
+int shortScore = 0
+
+// Liquidity — per side, using the per-side tier flags.
+longScore  += f_liquidityWeight(nearD1LiquidityLong,  nearH4LiquidityLong,  nearH1LiquidityLong)
+shortScore += f_liquidityWeight(nearD1LiquidityShort, nearH4LiquidityShort, nearH1LiquidityShort)
+
+// Session — direction-neutral, so both scores see it.
+int sessionPoints = inOverlap ? 25 : inLondon or inNY ? 15 : inAsia ? 5 : 0
+longScore  += sessionPoints
+shortScore += sessionPoints
+
+// Structure — the reversal weight REPLACES the base, it does not add. An
+// earlier draft awarded +20 for any break and a further +30 for a ChoCh; since
+// ChoCh is a subset of BoS, every reversal scored 50 for one event.
+if breakUp
+    longScore += structureFlipped ? 30 : 20
+if breakDown
+    shortScore += structureFlipped ? 30 : 20
+
+// Imbalance — same side only.
+if nearImbalanceLong or inImbalanceLong
+    longScore += 15
+if nearImbalanceShort or inImbalanceShort
+    shortScore += 15
+
+// Volume — confirms a direction without implying one, so it scores both.
 if volumeConfirmed
-    confidenceScore += 10
+    longScore  += 10
+    shortScore += 10
 ```
 
 ### 7.4 Signal Thresholds
 
 ```pine
-minConfidence = input.int(60, "Minimum Confidence Score", minval=0, maxval=100, group="Signal Engine")
+minConfidence = input.int(70, "Minimum Confidence Score", minval=0, maxval=110, group="Signal Engine")
 
-// LONG signal: all factors bullish + score above threshold.
-// The third factor is a disjunction of long-direction confirmations, never a
-// sum — a break plus a ChoCh is one event, and a fresh gap approach plus a
-// gap fill are two states of one gap.
-bool longSignal = nearLiquidityLong and sessionScore >= 2 and
+// LONG: liquidity on the long side, a tradable session, a long-direction
+// confirmation, and the long score above threshold.
+bool longSignal = nearLiquidityLong and sessionOK and
                   (breakUp or nearImbalanceLong or inImbalanceLong) and
-                  confidenceScore >= minConfidence
+                  longScore >= minConfidence and not inCooldown
 
-// SHORT signal: all factors bearish + score above threshold
-bool shortSignal = nearLiquidityShort and sessionScore >= 2 and
+// SHORT: the mirror image.
+bool shortSignal = nearLiquidityShort and sessionOK and
                    (breakDown or nearImbalanceShort or inImbalanceShort) and
-                   confidenceScore >= minConfidence
+                   shortScore >= minConfidence and not inCooldown
 ```
+
+Each score is gated by its own signal, so a setup can never be admitted by the
+strength of the opposite direction.
 
 ### 7.5 Signal Cooldown
 
@@ -1201,28 +1254,33 @@ if longSignal and not inCooldown
 ```pine
 // ─── Signal Labels ─────────────────────────────────────────────────────────────
 if longSignal and not inCooldown
-    label.new(barIndex, low - atrValue, 
-      "LONG\nScore: " + str.tostring(confidenceScore) + "%", 
-      style=label.style_label_up, 
-      color=color.new(color.green, 20), 
-      textcolor=color.white, 
+    // bar_index, not barIndex — see the note on the SHORT label below.
+    label.new(bar_index, low - atrChart * 0.5,
+      "LONG\nScore: " + str.tostring(longScore) + "/110",
+      style=label.style_label_up,
+      color=color.new(color.green, 20),
+      textcolor=color.white,
       size=size.normal,
       yloc=yloc.belowbar)
     
     // Alert
-    alert("LiquidityFlowAuse LONG signal on " + syminfo.ticker + " | Score: " + str.tostring(confidenceScore) + "%", alert.freq_once_per_bar_close)
+    alert("LiquidityFlowAuse LONG signal on " + syminfo.ticker + " | Score: " + str.tostring(longScore) + "/110", alert.freq_once_per_bar_close)
 
 if shortSignal and not inCooldown
-    label.new(barIndex, high + atrValue, 
-      "SHORT\nScore: " + str.tostring(confidenceScore) + "%", 
-      style=label.style_label_down, 
-      color=color.new(color.red, 20), 
-      textcolor=color.white, 
+    // bar_index, not barIndex — the latter is a TradingView alert placeholder
+    // variable that does not exist in script scope. The label offset uses
+    // atrChart, the entry-timeframe ATR, and is expressed in ATRs so the label
+    // sits the same visual distance away regardless of price scale.
+    label.new(bar_index, high + atrChart * 0.5,
+      "SHORT\nScore: " + str.tostring(shortScore) + "/110",
+      style=label.style_label_down,
+      color=color.new(color.red, 20),
+      textcolor=color.white,
       size=size.normal,
       yloc=yloc.abovebar)
-    
+
     // Alert
-    alert("LiquidityFlowAuse SHORT signal on " + syminfo.ticker + " | Score: " + str.tostring(confidenceScore) + "%", alert.freq_once_per_bar_close)
+    alert("LiquidityFlowAuse SHORT signal on " + syminfo.ticker + " | Score: " + str.tostring(shortScore) + "/110", alert.freq_once_per_bar_close)
 ```
 
 ### 7.7 Signal Engine Flow Diagram
@@ -1233,7 +1291,7 @@ if shortSignal and not inCooldown
 │                                                          │
 │  Liquidity Zones ──► nearLiquidityLong/Short ──────┐     │
 │                                                    │     │
-│  Session Markers ───► sessionScore >= 2 ──────────┤     │
+│  Session Markers ───► sessionStrength >= 2 ──────────┤     │
 │                                                    │     │
 │  Imbalance Detector ─► imbalance detected ────────┤     │
 │                                                    ├──► Confluence Check ──► LONG/SHORT
@@ -1469,7 +1527,7 @@ For external automation (Discord, Telegram, trading bots):
 // JSON payload for webhook (used with external alert bridges)
 if longSignal
     alertMessage = '{"indicator":"LiquidityFlowAuse","signal":"LONG","symbol":"' + syminfo.ticker + 
-                   '","score":' + str.tostring(confidenceScore) + 
+                   '","score":' + str.tostring(longScore) + 
                    ',"price":' + str.tostring(close) + 
                    ',"structure":"' + (breakUp and structureFlipped ? "ChoCh" : breakUp or breakDown ? "BoS" : "Imbalance") + '"}'
     alert(alertMessage, alert.freq_once_per_bar_close)
@@ -1705,7 +1763,7 @@ Replace the 0–100 confidence score with strict boolean flags. A signal either 
 ```pine
 // ─── Binary Confluence Model ──────────────────────────────────────────────────
 bool liquidityOK    = nearLiquidityLong or nearLiquidityShort
-bool sessionOK      = sessionScore >= 2
+bool sessionOK      = sessionStrength >= 2
 bool structureOK    = breakUp or breakDown or nearImbalanceLong or nearImbalanceShort
 
 // LONG requires ALL three — no partial credit
