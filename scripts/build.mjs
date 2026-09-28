@@ -77,17 +77,21 @@ function fail(message) {
 const BANNER = "// " + "=".repeat(75);
 
 /**
- * Strips a module's own header banner and blank edges.
+ * Strips a module's entire header banner, prose included, plus blank edges.
  *
  * Each module opens with a decorative box comment describing itself. Once
  * concatenated, that box is misleading: it reads like a section of the
- * indicator but sits mid-file with no scope boundary. The descriptive prose
- * stays; only the box frame goes.
+ * indicator but sits mid-file with no scope boundary.
  *
- * The box contains prose, so it cannot be matched by "lines until the first
- * non-box character" — the prose lines are inside it. The box is instead
- * delimited by its two rules of '=' characters, and the banner ends at the
- * closing rule.
+ * The WHOLE box is removed, not just its frame. An earlier version of this
+ * docstring claimed the descriptive prose survived; the implementation never
+ * did that, and the docstring was wrong rather than the code. The prose inside
+ * the banner duplicates what the spec already documents, and the module body
+ * carries its own section comments.
+ *
+ * The box cannot be matched by "lines until the first non-box character",
+ * because the prose lines are inside it. It is delimited by its two rules of
+ * '=' characters and ends at the closing rule.
  */
 function stripBanner(source) {
   const lines = source.split(/\r?\n/);
