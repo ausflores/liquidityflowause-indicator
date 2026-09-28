@@ -1,0 +1,271 @@
+// ============================================================================
+// LiquidityFlowAuse — Structure Break Module
+// ----------------------------------------------------------------------------
+// Module:   Structure Break (BoS/ChoCh)
+// Version:  LiquidityFlowAuse v1.0.0
+//
+// Purpose:  Tracks confirmed 1H swing highs and lows, detects a break of the
+//           most recent opposite swing by CLOSE, classifies that break as
+//           continuation (BoS) or reversal (ChoCh) against the structure in
+//           force, persists the structure bias, and renders the swing levels
+//           and break markers.
+//
+// THE CENTRAL INVARIANT: structureFlipped IS A PROPERTY OF A BREAK, NOT A
+// SECOND BREAK. ChoCh is BoS plus a structure precondition — a SUBSET, not a
+// sibling. An earlier draft exposed bullishBoS and bullishChoCh as independent
+// booleans, and spec 7.3 then awarded +20 for any break and a further +30 for
+// a ChoCh, so every reversal break scored 50 points for one event. Do not
+// reintroduce parallel flags; a consumer that wants "structure turned
+// bullish" tests `breakUp and structureFlipped`.
+//
+// Pine:     Pine Script v5. The //@version=5 directive is declared once in
+//           the main indicator file (src/liquidityflowause.pine); this
+//           module MUST NOT contain an indicator() or study() declaration.
+//
+// Depends:  Nothing from the earlier modules. The pivots this module needs are
+//           fetched here under the sb_ prefix — see the mandatory note on the
+//           1H fetch below for why they cannot be shared with Liquidity Zones.
+//
+// Usage:    Designed for file concatenation into the main indicator file.
+//           For a standalone syntax check in the Pine Editor, wrap the
+//           contents of this file in a temporary indicator() declaration.
+// ============================================================================
+
+// ─── User Inputs ─────────────────────────────────────────────────────────────
+
+// Structure pivot length. DELIBERATELY DIFFERENT from Liquidity Zones'
+// pivotLenHigh / pivotLenLow (default 10). A shorter length here describes
+// finer-grained 1H structure: the swings a break is measured against, not the
+// swing points liquidity is expected to pool behind. They are two different
+// descriptions of the same price, so they are two different inputs.
+structPivotLen = input.int(5, "Structure Pivot Length", minval=3, group="Structure Break")
+
+// Marker toggle. Separate from the level toggle below because the LEVELS are
+// context (where price is relative to the last swing) while the MARKERS are
+// events (a break happened) — useful to want one without the other.
+showStructureBreaks = input.bool(true, "Show Structure Breaks", group="Structure Break")
+showSwingLevels     = input.bool(true, "Show Swing Levels",     group="Structure Break")
+
+// ─── 1H Swing Fetch ──────────────────────────────────────────────────────────
+//
+// THE sb_ PREFIX IS MANDATORY, NOT COSMETIC. liquidity-zones.pine already
+// declares h1_pivotHigh / h1_pivotLow at module scope, and the modules are
+// concatenated into a single script, so reusing those names here is a duplicate
+// declaration and a compile error.
+//
+// They could not be shared even if naming permitted it: Liquidity Zones uses
+// pivotLenHigh / pivotLenLow (default 10) to place tier-3 liquidity zones,
+// while this module uses structPivotLen (default 5) to define the structure
+// that a break is measured against. Different lengths describe different
+// structure, so they must be different variables.
+//
+// NO [1] OFFSET. ta.pivothigh() / ta.pivotlow() are intrinsically
+// non-repainting — they return a value only on the bar where the pivot is
+// confirmed, and na afterwards. Combined with lookahead=barmerge.lookahead_off
+// that is sufficient on its own. The [1] pattern in spec 2.2 applies to direct
+// OHLC access, where the previously confirmed bar is specifically wanted;
+// adding one here would delay every swing by a full extra 1H bar for no gain.
+// The same reasoning as the identical block in liquidity-zones.pine.
+
+sb_pivotHigh = request.security(syminfo.tickerid, "60", ta.pivothigh(high, structPivotLen, structPivotLen), lookahead=barmerge.lookahead_off)
+sb_pivotLow  = request.security(syminfo.tickerid, "60", ta.pivotlow(low,  structPivotLen, structPivotLen),  lookahead=barmerge.lookahead_off)
+
+// ─── Swing State (spec 6.3) ──────────────────────────────────────────────────
+//
+// Persistent across bars via var. lastSwingHigh / lastSwingLow are the LEVELS a
+// break is measured against; the Bar fields record WHEN each was confirmed so a
+// level line can be anchored at its pivot bar.
+//
+// ALL MUTATION IS AT GLOBAL SCOPE BY DESIGN. There is no array here, so this is
+// not the array-mutation question the other two modules answer, but the choice
+// is the same one: every write to a `var` is visible in this one block instead
+// of inside a call graph. (For the record, Pine v5 functions CAN reassign
+// globals too, so a helper here would compile — it is a readability choice,
+// not a language limitation.)
+//
+// prevSwingHigh / prevSwingLow hold the level BEFORE the most recent
+// confirmation. Nothing in this module or in the Signal Engine reads them yet;
+// they are kept because spec 6.3 declares them and a future Fractal-structure
+// variant consumes the pair. They are inert state today, not a live signal.
+
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+var float prevSwingHigh = na
+var float prevSwingLow  = na
+var int   lastSwingHighBar = na
+var int   lastSwingLowBar  = na
+
+// Structure in force: 1 bullish, -1 bearish, 0 not yet established. Declared
+// here, next to the swing state it is derived from, so the break block below
+// can both read it and write it. `var` — it PERSISTS across bars and is part
+// of this module's exported interface (spec 6.7).
+var int marketStructure = 0
+
+// A confirmed pivot supersedes the previous level of the same kind.
+//
+// The Bar field is stamped with bar_index, i.e. the bar the pivot was
+// CONFIRMED on, not the bar the pivot itself sits on. The pivot sits
+// structPivotLen bars in the past, and this level did not exist — was not
+// knowable, and could not have been broken — until the confirmation bar. The
+// level line is therefore anchored where the level became tradeable, which is
+// also the only anchor available without a second request.security() fetch to
+// recover the pivot bar.
+
+if not na(sb_pivotHigh)
+    prevSwingHigh   := lastSwingHigh
+    lastSwingHigh   := sb_pivotHigh
+    lastSwingHighBar := bar_index
+
+if not na(sb_pivotLow)
+    prevSwingLow   := lastSwingLow
+    lastSwingLow   := sb_pivotLow
+    lastSwingLowBar := bar_index
+
+// ─── Break Detection and Module Outputs (spec 6.4 / 6.7) ────────────────────
+//
+//   breakUp           price crossed ABOVE the last confirmed 1H swing high
+//   breakDown         price crossed BELOW the last confirmed 1H swing low
+//   structureFlipped  that break opposed the structure in force → ChoCh
+//   marketStructure   1 bullish, -1 bearish, 0 not yet established
+//
+// The first three are recomputed each bar, so no var. marketStructure is a var
+// declared above and persists. All four are declared before the block that
+// assigns three of them, and are read by the Signal Engine after this module is
+// spliced in.
+//
+// A BREAK IS A CROSS, NOT A THRESHOLD. The condition needs the level held on
+// the previous bar and lost on this one. Testing `close` rather than high /
+// low is deliberate: a wick through a level that is immediately rejected is
+// liquidity being taken, which is the Liquidity Zones module's job. Using the
+// bar's extreme here would have both modules reporting the same event.
+//
+// The na guard is required, not defensive: lastSwingHigh is na until the first
+// pivot is confirmed, and every comparison against na is na, which would leave
+// structureFlipped indeterminate rather than false.
+
+bool breakUp         = false
+bool breakDown       = false
+bool structureFlipped = false
+
+bool crossedAbove = not na(lastSwingHigh) and close >  lastSwingHigh and close[1] <= lastSwingHigh
+bool crossedBelow = not na(lastSwingLow)  and close <  lastSwingLow  and close[1] >= lastSwingLow
+
+// REVERSAL IS DECIDED AGAINST THE STRUCTURE IN FORCE BEFORE THIS BAR, which is
+// why structureFlipped is read before marketStructure is overwritten below.
+//
+// With marketStructure == 0 — no break seen yet — the first break in either
+// direction is a break but NOT a change of character: it is the ESTABLISHMENT
+// of structure, not a reversal of it. So structureFlipped stays false. That is
+// the `marketStructure == -1` test, not a special case bolted on.
+//
+// The two conditions are independent `if` blocks, not `else if`, because
+// crossedAbove and crossedBelow are genuinely independent: a bullish and a
+// bearish break on the same bar would require lastSwingHigh < lastSwingLow,
+// i.e. malformed structure. In that case both flags fire and structureFlipped
+// ends up holding the second block's verdict, which is an arbitrary answer to a
+// question the input data should not be able to ask. `else if` would instead
+// silently resolve malformed structure in favour of the bull, which is worse —
+// it looks like a real bearish break is being ignored.
+
+if crossedAbove
+    breakUp         := true
+    structureFlipped := marketStructure == -1
+    marketStructure  := 1
+
+if crossedBelow
+    breakDown       := true
+    structureFlipped := marketStructure == 1
+    marketStructure  := -1
+
+// ─── Rendering: Swing Levels (spec 6.6) ─────────────────────────────────────
+//
+// TWO `var` LINE HANDLES FOR THE MODULE'S WHOLE LIFETIME, NOT ONE PER BAR.
+//
+// An earlier draft called line.new() whenever the last two swings were both
+// non-na — true on nearly every bar after the first two pivots. That draws
+// hundreds of overlapping horizontal lines, exhausts the max_lines_count budget
+// shared with the Session Markers boundary lines, and renders a solid bar of
+// colour rather than a readable level.
+//
+// Each handle is created once and afterwards only its RIGHT EDGE is moved with
+// line.set_xy2(), so a stable level costs one drawing, not one per bar. Two
+// handles exist, so live lines never exceed two — the spec 6.8 budget argument
+// holds.
+//
+// THE PRICE COORDINATE IS LATCHED AT CREATION, because set_xy2() moves x2/y2
+// and leaves y1 alone. That is correct for a level that has not changed, and
+// WRONG for a new pivot at a different price: the line would keep drawing the
+// old level while lastSwingHigh already holds the new one, so the chart and the
+// break logic would disagree about where structure sits. The price is therefore
+// compared against the line's own latched y1, and a changed price deletes and
+// recreates the line. The delete frees the slot in the same execution, so the
+// count is still bounded at two and the budget is untouched.
+
+var line swingHighLine = na
+var line swingLowLine  = na
+
+if showSwingLevels
+    if not na(lastSwingHigh)
+        if na(swingHighLine) or lastSwingHigh != line.get_y1(swingHighLine)
+            if not na(swingHighLine)
+                line.delete(swingHighLine)
+            swingHighLine := line.new(lastSwingHighBar, lastSwingHigh, bar_index, lastSwingHigh,
+                 color=color.new(color.red, 45), style=line.style_dashed, width=1)
+        else
+            line.set_xy2(swingHighLine, bar_index, lastSwingHigh)
+
+    if not na(lastSwingLow)
+        if na(swingLowLine) or lastSwingLow != line.get_y1(swingLowLine)
+            if not na(swingLowLine)
+                line.delete(swingLowLine)
+            swingLowLine := line.new(lastSwingLowBar, lastSwingLow, bar_index, lastSwingLow,
+                 color=color.new(color.green, 45), style=line.style_dashed, width=1)
+        else
+            line.set_xy2(swingLowLine, bar_index, lastSwingLow)
+
+// If the level toggle is switched off, the handles are dropped so re-enabling
+// starts from a clean slate rather than resurrecting a stale line. Still two
+// lines maximum, so the budget argument in spec 6.8 is unchanged.
+
+else
+    if not na(swingHighLine)
+        line.delete(swingHighLine)
+        swingHighLine := na
+    if not na(swingLowLine)
+        line.delete(swingLowLine)
+        swingLowLine := na
+
+// ─── Rendering: Break Markers (spec 6.6) ────────────────────────────────────
+//
+// One label per break, so this is inherently rare and does not compete for the
+// max_labels_count budget the way the level lines once did for
+// max_lines_count. Text is chosen from the TWO flags that already exist —
+// never from a second pair of BoS/ChoCh booleans, which is the defect this
+// module's interface exists to prevent.
+
+if breakUp and showStructureBreaks
+    label.new(bar_index, low, structureFlipped ? "ChoCh ▲" : "BoS ▲",
+         style=label.style_label_up, color=color.new(color.green, 30),
+         textcolor=color.white, size=size.normal)
+
+if breakDown and showStructureBreaks
+    label.new(bar_index, high, structureFlipped ? "ChoCh ▼" : "BoS ▼",
+         style=label.style_label_down, color=color.new(color.red, 30),
+         textcolor=color.white, size=size.normal)
+
+// ─── Module Outputs (Signal Engine Interface, spec 6.7) ─────────────────────
+//
+//   breakUp           (bool) crossed above the last confirmed 1H swing high
+//   breakDown         (bool) crossed below the last confirmed 1H swing low
+//   structureFlipped  (bool) that break opposed the structure in force
+//   marketStructure   (int)  1 bullish, -1 bearish, 0 not yet established
+//
+// marketStructure is a var and therefore persists across bars; the other three
+// are recomputed each bar. A consumer that needs "structure turned bullish"
+// tests `breakUp and structureFlipped` — NOT a separate bullishChoCh boolean,
+// which would be true whenever breakUp is true in a downtrend and would
+// double-count the event.
+//
+// Exactly these four. There is no bullishBoS / bullishChoCh pair, for the
+// reason given in the header: ChoCh is a subset of BoS, and exporting both
+// invites the confluence score in spec 7.3 to award 20 + 30 for a single event.

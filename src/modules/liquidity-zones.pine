@@ -259,9 +259,9 @@ if array.size(zones) > 0
 //   nearLiquidityShort  price is near untested supply-side liquidity above it
 //   sweptLong           demand-side liquidity below was swept within sweepWindow
 //   sweptShort          supply-side liquidity above was swept within sweepWindow
-//   nearD1Liquidity     that proximity is to a D1  (tier 1) zone
-//   nearH4Liquidity     that proximity is to a 4H  (tier 2) zone
-//   nearH1Liquidity     that proximity is to a 1H  (tier 3) zone
+//   nearD1LiquidityLong / Short   proximity to a D1 (tier 1) zone, per side
+//   nearH4LiquidityLong / Short   proximity to a 4H (tier 2) zone, per side
+//   nearH1LiquidityLong / Short   proximity to a 1H (tier 3) zone, per side
 //
 // Recomputed from scratch every bar, so no var keyword. All seven are declared
 // before the proximity block that assigns them, and are read by the Signal
@@ -278,13 +278,16 @@ if array.size(zones) > 0
 // taken whether the bar closed up or down; the reversal that may follow is
 // the Structure Break module's concern, not this one's.
 
-bool nearLiquidityLong  = false
-bool nearLiquidityShort = false
-bool sweptLong          = false
-bool sweptShort         = false
-bool nearD1Liquidity    = false
-bool nearH4Liquidity    = false
-bool nearH1Liquidity    = false
+bool nearLiquidityLong   = false
+bool nearLiquidityShort  = false
+bool sweptLong           = false
+bool sweptShort          = false
+bool nearD1LiquidityLong  = false
+bool nearD1LiquidityShort = false
+bool nearH4LiquidityLong  = false
+bool nearH4LiquidityShort = false
+bool nearH1LiquidityLong  = false
+bool nearH1LiquidityShort = false
 
 if array.size(zones) > 0 and not na(atrChart)
     for i = 0 to array.size(zones) - 1
@@ -300,13 +303,19 @@ if array.size(zones) > 0 and not na(atrChart)
                 sweptShort := true
 
         if nearP and not inBodyP
+            // Tier flags are PER SIDE. An earlier draft set them once for both
+            // directions, which made them under-determined: a single D1 flag
+            // cannot say whether the nearby D1 liquidity is demand or supply.
+            // The Signal Engine scores direction, so a LONG setup must not earn
+            // "near D1 liquidity" points because a D1 zone ABOVE price — the
+            // one a short would use — happens to be nearby too.
             if zp.center < close
-                nearLiquidityLong := true
+                nearLiquidityLong  := true
+                nearD1LiquidityLong := nearD1LiquidityLong or zp.tier == 1
+                nearH4LiquidityLong := nearH4LiquidityLong or zp.tier == 2
+                nearH1LiquidityLong := nearH1LiquidityLong or zp.tier == 3
             else
-                nearLiquidityShort := true
-
-            // Tier flags describe the proximity, not the side, so they are set
-            // once for both directions.
-            nearD1Liquidity := nearD1Liquidity or zp.tier == 1
-            nearH4Liquidity := nearH4Liquidity or zp.tier == 2
-            nearH1Liquidity := nearH1Liquidity or zp.tier == 3
+                nearLiquidityShort  := true
+                nearD1LiquidityShort := nearD1LiquidityShort or zp.tier == 1
+                nearH4LiquidityShort := nearH4LiquidityShort or zp.tier == 2
+                nearH1LiquidityShort := nearH1LiquidityShort or zp.tier == 3

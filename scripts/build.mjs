@@ -430,6 +430,100 @@ plot(lzRemovals, title = "LZ DIAG gross removals",               color = color.n
 plot(lzBirths > 0 ? 1 : 0, title = "LZ DIAG VERDICT births (1 = pivots confirmed)", color = color.new(color.lime, 0))
 `;
 
+// Imbalance diagnostics. The load-bearing series is "virgin gaps": the spec's
+// touch test is true by construction on a gap's own creation bar, because the
+// band edges come from that bar's prices. Without the bornBar guard every gap
+// is born touched, nearImbalance* pin at zero forever, and nothing visual
+// reveals it — the gaps draw correctly and simply never report an approach.
+const IMBALANCE_DIAGNOSTIC_OVERLAY = `
+int imbLive      = array.size(imbalances)
+int imbUntouched = 0
+int imbTouched   = 0
+
+if array.size(imbalances) > 0
+    for i = 0 to array.size(imbalances) - 1
+        if na(array.get(imbalances, i).touchedBar)
+            imbUntouched += 1
+        else
+            imbTouched += 1
+
+plot(imbLive,      title = "IMB DIAG live imbalances (expect <= 60)", color = color.new(color.green, 0))
+plot(imbUntouched, title = "IMB DIAG virgin gaps (must be > 0)",       color = color.new(color.green, 0))
+plot(imbTouched,   title = "IMB DIAG filled gaps",                     color = color.new(color.teal, 0))
+plot(nearImbalanceLong  ? 1 : 0, title = "IMB DIAG nearLong reachable",  color = color.new(color.lime, 0))
+plot(nearImbalanceShort ? 1 : 0, title = "IMB DIAG nearShort reachable", color = color.new(color.lime, 0))
+plot(inImbalanceLong    ? 1 : 0, title = "IMB DIAG inLong fired",        color = color.new(color.lime, 0))
+plot(inImbalanceShort   ? 1 : 0, title = "IMB DIAG inShort fired",       color = color.new(color.lime, 0))
+plot(volumeConfirmed    ? 1 : 0, title = "IMB DIAG volumeConfirmed fired", color = color.new(color.lime, 0))
+plot(imbLive <= maxImbalances ? 1 : 0, title = "IMB DIAG VERDICT budget (1 = ok)", color = color.new(color.lime, 0))
+plot(imbUntouched + imbTouched == imbLive ? 1 : 0, title = "IMB DIAG VERDICT counts (1 = ok)", color = color.new(color.lime, 0))
+`;
+
+// Structure Break diagnostics. The load-bearing series is the orphan check:
+// structureFlipped is a PROPERTY of a break, so it must never be true on a bar
+// with no break. If it is, the module has reintroduced the parallel BoS/ChoCh
+// flags, which scored one reversal break as 20 + 30 = 50 in the spec's own
+// confidence table. Cumulative flips must also never exceed cumulative breaks.
+const STRUCTURE_DIAGNOSTIC_OVERLAY = `
+var int sbBreaks = 0
+var int sbFlips = 0
+var int sbOrphanFlips = 0
+
+if breakUp or breakDown
+    sbBreaks += 1
+if structureFlipped
+    sbFlips += 1
+    if not breakUp and not breakDown
+        sbOrphanFlips += 1
+
+plot(marketStructure,  title = "SB DIAG structure (1 / -1 / 0)",  color = color.new(color.aqua, 0))
+plot(sbBreaks,        title = "SB DIAG breaks total (expect > 0)", color = color.new(color.aqua, 0))
+plot(sbFlips,         title = "SB DIAG reversals (<= breaks)",   color = color.new(color.orange, 0))
+plot(sbOrphanFlips,   title = "SB DIAG ORPHAN flips (must be 0)", color = color.new(color.red, 0))
+plot(breakUp         ? 1 : 0, title = "SB DIAG breakUp fired",   color = color.new(color.lime, 0))
+plot(breakDown       ? 1 : 0, title = "SB DIAG breakDown fired", color = color.new(color.lime, 0))
+plot(structureFlipped ? 1 : 0, title = "SB DIAG flipped fired",  color = color.new(color.lime, 0))
+
+plot(sbFlips <= sbBreaks ? 1 : 0, title = "SB DIAG VERDICT flips<=breaks (1 = ok)", color = color.new(color.lime, 0))
+plot(sbOrphanFlips == 0 ? 1 : 0, title = "SB DIAG VERDICT no-orphans (1 = ok)",   color = color.new(color.lime, 0))
+plot(marketStructure >= -1 and marketStructure <= 1 ? 1 : 0, title = "SB DIAG VERDICT domain (1 = ok)", color = color.new(color.lime, 0))
+`;
+
+// Signal Engine diagnostics. This is the root module — nothing consumes its
+// output, so no downstream check exists to catch a mistake in it. These series
+// are that missing check.
+//
+// The load-bearing one is DUAL FIRE. LONG and SHORT are not mutually exclusive
+// by construction: price sandwiched between two H4 zones with untouched gaps on
+// both sides, in the London/NY overlap, on elevated volume, scores 70 on BOTH
+// sides simultaneously. A dual fire means the directional-exclusivity block is
+// absent or ineffective, and the indicator would print a LONG and a SHORT on the
+// same bar.
+const SIGNAL_DIAGNOSTIC_OVERLAY = `
+var int seLongFires      = 0
+var int seShortFires     = 0
+var int seDualFires      = 0
+var int seAmbiguousDrops = 0
+
+if longSignalFired
+    seLongFires += 1
+if shortSignalFired
+    seShortFires += 1
+if longSignalFired and shortSignalFired
+    seDualFires += 1
+if ambiguousTie
+    seAmbiguousDrops += 1
+
+plot(seLongFires,      title = "SE DIAG long fires",             color = color.new(color.green, 0))
+plot(seShortFires,     title = "SE DIAG short fires",            color = color.new(color.red, 0))
+plot(seDualFires,      title = "SE DIAG DUAL fires (must be 0)",  color = color.new(color.maroon, 0))
+plot(seAmbiguousDrops, title = "SE DIAG ambiguous ties dropped",  color = color.new(color.orange, 0))
+plot(longScore,        title = "SE DIAG long score (max 110)",    color = color.new(color.aqua, 0))
+plot(shortScore,       title = "SE DIAG short score (max 110)",   color = color.new(color.aqua, 0))
+plot(seDualFires == 0 ? 1 : 0, title = "SE DIAG VERDICT no-dual (1 = ok)", color = color.new(color.lime, 0))
+plot(longScore <= 110 and shortScore <= 110 ? 1 : 0, title = "SE DIAG VERDICT score domain (1 = ok)", color = color.new(color.lime, 0))
+`;
+
 /**
  * Boosts the production visuals for legibility and appends the overlay.
  * Rewrites the constants already in the assembled text; the module file on
@@ -449,18 +543,36 @@ function applyDiagnostic(assembled) {
   // is only valid once that module has been spliced in. Guarded rather than
   // assumed, so --diagnostic keeps working while modules are still being added.
   const hasZoneModule = /array<LiquidityZone>\s+zones/.test(text);
-  const overlays = hasZoneModule
-    ? `${DIAGNOSTIC_OVERLAY}\n${ZONE_DIAGNOSTIC_OVERLAY}`
-    : DIAGNOSTIC_OVERLAY;
+  const hasImbalanceModule = /array<ImbalanceZone>\s+imbalances/.test(text);
+  const hasStructureModule = /sb_pivotHigh/.test(text);
+  const hasSignalModule = /longSignalFired/.test(text);
+  const overlays = [DIAGNOSTIC_OVERLAY];
+  if (hasZoneModule) overlays.push(ZONE_DIAGNOSTIC_OVERLAY);
+  if (hasImbalanceModule) overlays.push(IMBALANCE_DIAGNOSTIC_OVERLAY);
+  if (hasStructureModule) overlays.push(STRUCTURE_DIAGNOSTIC_OVERLAY);
+  if (hasSignalModule) overlays.push(SIGNAL_DIAGNOSTIC_OVERLAY);
 
   if (hasZoneModule) {
     console.log("");
-    console.log("  Liquidity Zones module present — zone diagnostics appended.");
-    console.log("  Read: LZ DIAG VERDICT budget and LZ DIAG VERDICT counts.");
-    console.log("  Both must be 1. swept zones must be > 0.");
+    console.log("  Liquidity Zones present — read LZ DIAG VERDICT budget and counts.");
+  }
+  if (hasImbalanceModule) {
+    console.log("");
+    console.log("  Imbalance Detector present — read IMB DIAG VERDICT budget and");
+    console.log("  counts, and confirm virgin gaps > 0.");
+  }
+  if (hasStructureModule) {
+    console.log("");
+    console.log("  Structure Break present — read SB DIAG ORPHAN flips, which must");
+    console.log("  be 0, plus the three SB DIAG VERDICT series.");
+  }
+  if (hasSignalModule) {
+    console.log("");
+    console.log("  Signal Engine present — read SE DIAG DUAL fires, which must be 0.");
+    console.log("  A non-zero value means LONG and SHORT fired on the same bar.");
   }
 
-  return `${boosted}\n${overlays}`;
+  return `${boosted}\n${overlays.join("\n")}`;
 }
 
 // ─── Validation ──────────────────────────────────────────────────────────────
