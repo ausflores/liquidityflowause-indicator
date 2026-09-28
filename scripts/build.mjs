@@ -15,9 +15,15 @@
 // for Pine v5. See ORDER below.
 //
 // Usage:
-//   node scripts/build.mjs            # build + validate
-//   node scripts/build.mjs --out X    # custom output path
-//   node scripts/build.mjs --check    # validate only, write nothing
+//   node scripts/build.mjs                 # build + validate
+//   node scripts/build.mjs --out X         # custom output path
+//   node scripts/build.mjs --check         # validate only, write nothing
+//   node scripts/build.mjs --diagnostic    # append every diagnostic overlay
+//   node scripts/build.mjs --diagnostic=a,b  # append only sections a and b
+//
+// Pine caps plot-family calls (plot, bgcolor, alertcondition, ...) at 64 per
+// script. Every build runs a plot-budget preflight and refuses to write a file
+// that would exceed the limit (TradingView reports it as RE10140 on paste).
 // ============================================================================
 
 import { readFile, writeFile, mkdir } from "node:fs/promises";
@@ -57,7 +63,19 @@ const DIAGNOSTIC_OUT = join(ROOT, "dist", "liquidityflowause-diag.pine");
 
 const args = process.argv.slice(2);
 const checkOnly = args.includes("--check");
-const diagnostic = args.includes("--diagnostic");
+
+// --diagnostic is either bare (all sections) or carries a comma-separated
+// section list: --diagnostic=structure-break,signal-engine. Only the raw value
+// is parsed here; the names are resolved later against the section table, so
+// an unknown name can be reported together with the valid list.
+const DIAG_FLAG = "--diagnostic";
+const diagArg = args.find((a) => a === DIAG_FLAG || a.startsWith(`${DIAG_FLAG}=`));
+const diagnostic = diagArg !== undefined;
+const diagnosticValue =
+  diagnostic && diagArg.length > DIAG_FLAG.length
+    ? diagArg.slice(DIAG_FLAG.length + 1)
+    : null;
+
 const outFlag = args.indexOf("--out");
 const outPath = outFlag !== -1 && args[outFlag + 1]
   ? resolve(ROOT, args[outFlag + 1])
@@ -524,12 +542,125 @@ plot(seDualFires == 0 ? 1 : 0, title = "SE DIAG VERDICT no-dual (1 = ok)", color
 plot(longScore <= 110 and shortScore <= 110 ? 1 : 0, title = "SE DIAG VERDICT score domain (1 = ok)", color = color.new(color.lime, 0))
 `;
 
+// ─── Diagnostic Sections ─────────────────────────────────────────────────────
+
+// Canonical section ids, in the order their overlays are appended. These are
+// the names this script already uses for each overlay: the session/timezone
+// overlay (DIAGNOSTIC_OVERLAY), then one per module.
+const DIAG_SECTION_ORDER = [
+  "session",
+  "liquidity-zones",
+  "imbalance-detector",
+  "structure-break",
+  "signal-engine",
+];
+
+// Aliases accepted on the command line. Matching is case-insensitive; only
+// these spellings are valid, anything else is a hard error.
+const DIAG_SECTION_ALIASES = {
+  session: ["session", "session-timezone", "sessions", "timezone"],
+  "liquidity-zones": ["liquidity-zones", "zones", "lz"],
+  "imbalance-detector": ["imbalance-detector", "imbalance", "imb"],
+  "structure-break": ["structure-break", "structure", "sb"],
+  "signal-engine": ["signal-engine", "signal", "se"],
+};
+
+const SECTION_OVERLAY = {
+  session: DIAGNOSTIC_OVERLAY,
+  "liquidity-zones": ZONE_DIAGNOSTIC_OVERLAY,
+  "imbalance-detector": IMBALANCE_DIAGNOSTIC_OVERLAY,
+  "structure-break": STRUCTURE_DIAGNOSTIC_OVERLAY,
+  "signal-engine": SIGNAL_DIAGNOSTIC_OVERLAY,
+};
+
+// What to read in the chart legend, printed only for sections actually built.
+const SECTION_HINT = {
+  "liquidity-zones": [
+    "Liquidity Zones selected — read LZ DIAG VERDICT budget and counts.",
+  ],
+  "imbalance-detector": [
+    "Imbalance Detector selected — read IMB DIAG VERDICT budget and",
+    "counts, and confirm virgin gaps > 0.",
+  ],
+  "structure-break": [
+    "Structure Break selected — read SB DIAG ORPHAN flips, which must",
+    "be 0, plus the three SB DIAG VERDICT series.",
+  ],
+  "signal-engine": [
+    "Signal Engine selected — read SE DIAG DUAL fires, which must be 0.",
+    "A non-zero value means LONG and SHORT fired on the same bar.",
+  ],
+};
+
 /**
- * Boosts the production visuals for legibility and appends the overlay.
+ * Resolves --diagnostic=<comma-separated list> into canonical section ids.
+ *
+ * Unknown names are a hard error: silently ignoring one would build a
+ * diagnostic file that is missing an overlay the user asked for, and the
+ * absence would look like a passing check. Prints the valid names and exits
+ * non-zero instead.
+ *
+ * Returns the selected ids in DIAG_SECTION_ORDER.
+ */
+function resolveDiagnosticSections(rawValue) {
+  const names = rawValue
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+
+  const reportAndExit = (badNames) => {
+    // stdout, not stderr: every other build error in this script is reported
+    // through the stdout report, and a section error must be equally visible.
+    if (badNames.length) {
+      console.log(
+        `build: unknown --diagnostic section${badNames.length > 1 ? "s" : ""}: ` +
+          badNames.join(", "),
+      );
+    } else {
+      console.log("build: --diagnostic= needs at least one section name");
+    }
+    console.log(`build: valid sections: ${DIAG_SECTION_ORDER.join(", ")}`);
+    console.log(
+      "build: aliases: " +
+        DIAG_SECTION_ORDER.map(
+          (id) =>
+            `${id} (${DIAG_SECTION_ALIASES[id].slice(1).join(", ") || "no aliases"})`,
+        ).join("; "),
+    );
+    process.exit(1);
+  };
+
+  if (names.length === 0) reportAndExit([]);
+
+  const selected = [];
+  const unknown = [];
+
+  for (const name of names) {
+    const key = name.toLowerCase();
+    const id = DIAG_SECTION_ORDER.find((candidate) =>
+      DIAG_SECTION_ALIASES[candidate].includes(key),
+    );
+    if (!id) {
+      unknown.push(name);
+    } else if (!selected.includes(id)) {
+      selected.push(id);
+    }
+  }
+
+  if (unknown.length) reportAndExit(unknown);
+
+  return DIAG_SECTION_ORDER.filter((id) => selected.includes(id));
+}
+
+/**
+ * Boosts the production visuals for legibility and appends the overlays.
  * Rewrites the constants already in the assembled text; the module file on
  * disk is never touched.
+ *
+ * `sectionIds` is the resolved subset from --diagnostic=<list>; bare
+ * --diagnostic passes every id.
  */
-function applyDiagnostic(assembled) {
+function applyDiagnostic(assembled, sectionIds) {
   const text = assembled.join("\n");
 
   // Tints: 92-96% transparency is near-invisible on a dark background.
@@ -539,40 +670,143 @@ function applyDiagnostic(assembled) {
     .replace(/width=1\)/g, "width=3)")
     .replace(/style=line\.style_dotted/g, "style=line.style_solid");
 
-  // The zone overlay references the Liquidity Zones module's own globals, so it
-  // is only valid once that module has been spliced in. Guarded rather than
-  // assumed, so --diagnostic keeps working while modules are still being added.
-  const hasZoneModule = /array<LiquidityZone>\s+zones/.test(text);
-  const hasImbalanceModule = /array<ImbalanceZone>\s+imbalances/.test(text);
-  const hasStructureModule = /sb_pivotHigh/.test(text);
-  const hasSignalModule = /longSignalFired/.test(text);
-  const overlays = [DIAGNOSTIC_OVERLAY];
-  if (hasZoneModule) overlays.push(ZONE_DIAGNOSTIC_OVERLAY);
-  if (hasImbalanceModule) overlays.push(IMBALANCE_DIAGNOSTIC_OVERLAY);
-  if (hasStructureModule) overlays.push(STRUCTURE_DIAGNOSTIC_OVERLAY);
-  if (hasSignalModule) overlays.push(SIGNAL_DIAGNOSTIC_OVERLAY);
+  // An overlay references its module's own globals, so it is only valid once
+  // that module has been spliced in. Guarded rather than assumed, so
+  // --diagnostic keeps working while modules are still being added. The
+  // session overlay sits on top of the main file and needs no guard.
+  const present = {
+    session: true,
+    "liquidity-zones": /array<LiquidityZone>\s+zones/.test(text),
+    "imbalance-detector": /array<ImbalanceZone>\s+imbalances/.test(text),
+    "structure-break": /sb_pivotHigh/.test(text),
+    "signal-engine": /longSignalFired/.test(text),
+  };
 
-  if (hasZoneModule) {
-    console.log("");
-    console.log("  Liquidity Zones present — read LZ DIAG VERDICT budget and counts.");
-  }
-  if (hasImbalanceModule) {
-    console.log("");
-    console.log("  Imbalance Detector present — read IMB DIAG VERDICT budget and");
-    console.log("  counts, and confirm virgin gaps > 0.");
-  }
-  if (hasStructureModule) {
-    console.log("");
-    console.log("  Structure Break present — read SB DIAG ORPHAN flips, which must");
-    console.log("  be 0, plus the three SB DIAG VERDICT series.");
-  }
-  if (hasSignalModule) {
-    console.log("");
-    console.log("  Signal Engine present — read SE DIAG DUAL fires, which must be 0.");
-    console.log("  A non-zero value means LONG and SHORT fired on the same bar.");
+  const overlays = [];
+  const included = [];
+
+  // Canonical order regardless of the order the user typed: overlays are
+  // appended at the end of the script and must follow the module order.
+  for (const id of DIAG_SECTION_ORDER) {
+    if (!sectionIds.includes(id)) continue;
+    if (!present[id]) {
+      warn(`diagnostic section skipped, its module is not in the build: ${id}`);
+      continue;
+    }
+    overlays.push(SECTION_OVERLAY[id]);
+    included.push(id);
   }
 
-  return `${boosted}\n${overlays.join("\n")}`;
+  for (const id of included) {
+    for (const line of SECTION_HINT[id] ?? []) {
+      console.log("");
+      console.log(`  ${line}`);
+    }
+  }
+
+  return { text: `${boosted}\n${overlays.join("\n")}`, sections: included };
+}
+
+// ─── Plot Budget ─────────────────────────────────────────────────────────────
+
+// Pine v5 counts EVERY plot-family call against a single per-script limit of
+// 64: plot(), plotshape(), plotchar(), plotcandle(), plotbar(), plotarrow(),
+// hline(), bgcolor(), linefill() and alertcondition(). Exceeding it is not a
+// warning on paste — TradingView rejects the script with RE10140 and nothing
+// runs. Checking here fails the build instead, before a broken file exists.
+const PLOT_LIMIT = 64;
+
+const PLOT_FAMILY = [
+  "plot",
+  "plotshape",
+  "plotchar",
+  "plotcandle",
+  "plotbar",
+  "plotarrow",
+  "hline",
+  "bgcolor",
+  "linefill",
+  "alertcondition",
+];
+
+/**
+ * Removes line comments, string-aware.
+ *
+ * Pine has no block comments, so a line comment starts at the first `//` that
+ * is not inside a string literal. Skipping string literals keeps messages such
+ * as "LiquidityFlowAuse LONG signal on {{ticker}}" (and any future URL in one)
+ * from being truncated mid-message.
+ */
+function stripLineComments(text) {
+  const out = [];
+
+  for (const line of text.split(/\r?\n/)) {
+    let quote = null;
+    let cut = -1;
+
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (quote) {
+        if (ch === "\\") i++;
+        else if (ch === quote) quote = null;
+        continue;
+      }
+      if (ch === '"' || ch === "'") {
+        quote = ch;
+      } else if (ch === "/" && line[i + 1] === "/") {
+        cut = i;
+        break;
+      }
+    }
+
+    out.push(cut === -1 ? line : line.slice(0, cut));
+  }
+
+  return out.join("\n");
+}
+
+/**
+ * Counts plot-family calls in assembled source, ignoring comments.
+ *
+ * The lookbehind `(?<![\w.])` matters: box.set_bgcolor() ends in "bgcolor("
+ * but is not the bgcolor() builtin, and counting it would push an in-budget
+ * script over the limit. Node's RegExp supports lookbehind natively.
+ */
+function countPlotFamily(text) {
+  const code = stripLineComments(text);
+  const perCall = {};
+  let total = 0;
+
+  for (const fn of PLOT_FAMILY) {
+    const matches = code.match(new RegExp(`(?<![\\w.])${fn}\\s*\\(`, "g")) ?? [];
+    perCall[fn] = matches.length;
+    total += matches.length;
+  }
+
+  return { total, perCall };
+}
+
+/**
+ * The plot-budget preflight. Returns nothing on success; on an over-budget
+ * script it records the failure so the shared error path prints it and exits
+ * before any file is written.
+ *
+ * `sections` is what was actually appended ([] for the production build).
+ */
+function checkPlotBudget(assembled, sections) {
+  const { total } = countPlotFamily(assembled.join("\n"));
+  const scope =
+    sections.length > 0 ? sections.join(", ") : "none (production build)";
+
+  if (total > PLOT_LIMIT) {
+    fail(
+      `plot budget exceeded: ${total} plot-family calls (plot/plotshape/` +
+        `plotchar/plotcandle/plotbar/plotarrow/hline/bgcolor/linefill/` +
+        `alertcondition), limit is ${PLOT_LIMIT}; sections included: ${scope}`,
+    );
+  }
+
+  return total;
 }
 
 // ─── Validation ──────────────────────────────────────────────────────────────
@@ -681,9 +915,33 @@ let assembled = parts.map((p) => p.text);
 // in the module, and so the reported line count stays comparable.
 const { lineCount } = validate(assembled);
 
+// Sections actually appended ([] on the production build). Resolved before the
+// overlays go on, so an unknown --diagnostic name exits before any work is
+// reported and before anything is written.
+let diagnosticSections = [];
+
 if (diagnostic) {
-  assembled = [applyDiagnostic(assembled)];
+  if (diagnosticValue === null) {
+    warn(
+      `bare ${DIAG_FLAG} appends every overlay and may exceed Pine's ` +
+        `${PLOT_LIMIT}-plot limit; to build a subset: ` +
+        "node scripts/build.mjs --diagnostic=structure-break,signal-engine,imbalance-detector",
+    );
+  }
+
+  const requested =
+    diagnosticValue === null
+      ? DIAG_SECTION_ORDER
+      : resolveDiagnosticSections(diagnosticValue);
+  const result = applyDiagnostic(assembled, requested);
+  assembled = [result.text];
+  diagnosticSections = result.sections;
 }
+
+// Plot-budget preflight, on the final assembled source and before any file is
+// written. An over-budget script becomes an error, so the shared error path
+// below exits without writing. This guards the production build too.
+const plotCount = checkPlotBudget(assembled, diagnosticSections);
 
 console.log(BANNER);
 console.log("// LiquidityFlowAuse build");
@@ -696,6 +954,7 @@ for (const part of parts) {
 }
 console.log("");
 console.log(`  ${"TOTAL".padEnd(44)} ${String(lineCount).padStart(5)} lines`);
+console.log(`plot budget: ${plotCount} / ${PLOT_LIMIT}`);
 
 if (warnings.length) {
   console.log("");
@@ -726,16 +985,23 @@ if (diagnostic) {
   const n = assembled[0].split(/\r?\n/).length;
   console.log("");
   console.log("  DIAGNOSTIC BUILD — not for distribution.");
-  console.log("  Read the chart legend for the DIAG series. The decisive one is:");
-  console.log("");
-  console.log("    DIAG VERDICT (1 = guard correct)");
-  console.log("");
-  console.log("  1  → edges === 2x lines for every session, so the `and inX` guard");
-  console.log("        is correct and each window draws exactly one boundary line.");
-  console.log("  0  → the guard is wrong; session windows draw a line on close too.");
-  console.log("");
-  console.log("  Read the six DIAG counter series to see which session diverged.");
-  console.log("  Edge labels also name every open and close with its session.");
+  console.log(
+    `  Sections included: ${diagnosticSections.join(", ") || "(none)"}`,
+  );
+
+  if (diagnosticSections.includes("session")) {
+    console.log("");
+    console.log("  Read the chart legend for the DIAG series. The decisive one is:");
+    console.log("");
+    console.log("    DIAG VERDICT (1 = guard correct)");
+    console.log("");
+    console.log("  1  → edges === 2x lines for every session, so the `and inX` guard");
+    console.log("        is correct and each window draws exactly one boundary line.");
+    console.log("  0  → the guard is wrong; session windows draw a line on close too.");
+    console.log("");
+    console.log("  Read the six DIAG counter series to see which session diverged.");
+    console.log("  Edge labels also name every open and close with its session.");
+  }
   console.log("");
 }
 
