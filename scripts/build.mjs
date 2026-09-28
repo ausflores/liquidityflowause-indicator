@@ -489,6 +489,41 @@ plot(sbOrphanFlips == 0 ? 1 : 0, title = "SB DIAG VERDICT no-orphans (1 = ok)", 
 plot(marketStructure >= -1 and marketStructure <= 1 ? 1 : 0, title = "SB DIAG VERDICT domain (1 = ok)", color = color.new(color.lime, 0))
 `;
 
+// Signal Engine diagnostics. This is the root module — nothing consumes its
+// output, so no downstream check exists to catch a mistake in it. These series
+// are that missing check.
+//
+// The load-bearing one is DUAL FIRE. LONG and SHORT are not mutually exclusive
+// by construction: price sandwiched between two H4 zones with untouched gaps on
+// both sides, in the London/NY overlap, on elevated volume, scores 70 on BOTH
+// sides simultaneously. A dual fire means the directional-exclusivity block is
+// absent or ineffective, and the indicator would print a LONG and a SHORT on the
+// same bar.
+const SIGNAL_DIAGNOSTIC_OVERLAY = `
+var int seLongFires      = 0
+var int seShortFires     = 0
+var int seDualFires      = 0
+var int seAmbiguousDrops = 0
+
+if longSignalFired
+    seLongFires += 1
+if shortSignalFired
+    seShortFires += 1
+if longSignalFired and shortSignalFired
+    seDualFires += 1
+if ambiguousTie
+    seAmbiguousDrops += 1
+
+plot(seLongFires,      title = "SE DIAG long fires",             color = color.new(color.green, 0))
+plot(seShortFires,     title = "SE DIAG short fires",            color = color.new(color.red, 0))
+plot(seDualFires,      title = "SE DIAG DUAL fires (must be 0)",  color = color.new(color.maroon, 0))
+plot(seAmbiguousDrops, title = "SE DIAG ambiguous ties dropped",  color = color.new(color.orange, 0))
+plot(longScore,        title = "SE DIAG long score (max 110)",    color = color.new(color.aqua, 0))
+plot(shortScore,       title = "SE DIAG short score (max 110)",   color = color.new(color.aqua, 0))
+plot(seDualFires == 0 ? 1 : 0, title = "SE DIAG VERDICT no-dual (1 = ok)", color = color.new(color.lime, 0))
+plot(longScore <= 110 and shortScore <= 110 ? 1 : 0, title = "SE DIAG VERDICT score domain (1 = ok)", color = color.new(color.lime, 0))
+`;
+
 /**
  * Boosts the production visuals for legibility and appends the overlay.
  * Rewrites the constants already in the assembled text; the module file on
@@ -510,10 +545,12 @@ function applyDiagnostic(assembled) {
   const hasZoneModule = /array<LiquidityZone>\s+zones/.test(text);
   const hasImbalanceModule = /array<ImbalanceZone>\s+imbalances/.test(text);
   const hasStructureModule = /sb_pivotHigh/.test(text);
+  const hasSignalModule = /longSignalFired/.test(text);
   const overlays = [DIAGNOSTIC_OVERLAY];
   if (hasZoneModule) overlays.push(ZONE_DIAGNOSTIC_OVERLAY);
   if (hasImbalanceModule) overlays.push(IMBALANCE_DIAGNOSTIC_OVERLAY);
   if (hasStructureModule) overlays.push(STRUCTURE_DIAGNOSTIC_OVERLAY);
+  if (hasSignalModule) overlays.push(SIGNAL_DIAGNOSTIC_OVERLAY);
 
   if (hasZoneModule) {
     console.log("");
@@ -528,6 +565,11 @@ function applyDiagnostic(assembled) {
     console.log("");
     console.log("  Structure Break present — read SB DIAG ORPHAN flips, which must");
     console.log("  be 0, plus the three SB DIAG VERDICT series.");
+  }
+  if (hasSignalModule) {
+    console.log("");
+    console.log("  Signal Engine present — read SE DIAG DUAL fires, which must be 0.");
+    console.log("  A non-zero value means LONG and SHORT fired on the same bar.");
   }
 
   return `${boosted}\n${overlays.join("\n")}`;

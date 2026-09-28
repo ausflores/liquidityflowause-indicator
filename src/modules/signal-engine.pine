@@ -1,0 +1,349 @@
+// ============================================================================
+// LiquidityFlowAuse — Signal Engine Module
+// ----------------------------------------------------------------------------
+// Module:   Signal Engine
+// Version:  LiquidityFlowAuse v1.0.0
+//
+// Purpose:  Evaluates confluence across the four sibling modules and emits
+//           LONG / SHORT signals. Scores each direction SEPARATELY, gates each
+//           signal with its OWN score, applies a shared cooldown, and renders
+//           the label / alert / alertcondition output.
+//
+// THE CENTRAL INVARIANT: one score per direction, each built only from
+// same-side inputs, each gating only its own signal. An earlier draft computed
+// a SINGLE `confidenceScore` shared by both directions, from inputs that do
+// not know which direction is being scored: a LONG could earn liquidity points
+// for a D1 zone ABOVE price, structure points for a bearish break, and
+// imbalance points for a bearish gap — praising the setup for reasons that
+// contradict the signal it was gating. Two scores, never one.
+//
+// Pine:     Pine Script v5. The //@version=5 directive is declared once in the
+//           main indicator file (src/liquidityflowause.pine); this module MUST
+//           NOT contain an indicator() or study() declaration.
+//
+// Depends:  Everything read below comes from the four sibling modules, all
+//           spliced BEFORE this one by scripts/build.mjs. Nothing is
+//           redeclared here — a second declaration of any of these names would
+//           be a duplicate-declaration compile error, not a warning.
+//
+// Usage:    Designed for file concatenation into the main indicator file.
+//           For a standalone syntax check in the Pine Editor, wrap the
+//           contents of this file in a temporary indicator() declaration.
+// ============================================================================
+
+// ─── User Inputs ─────────────────────────────────────────────────────────────
+//
+// Declared HERE rather than in src/lib/inputs.pine. That file is listed in the
+// build's SOURCES array but does not exist on disk, so the build warns and
+// skips it and an input declared only in the spec would never reach the
+// script. If that file is later written, these three lines must be DELETED from
+// here rather than left in both places.
+//
+// minConfidence maxval is 110, matching the true maximum score, not 100. Only
+// the highest nearby liquidity tier counts (see f_liquidityWeight), so the
+// ceiling is 30 + 25 + 30 + 15 + 10 = 110 and the score is not a percentage.
+
+minConfidence      = input.int(70,  "Minimum Confidence Score", minval=0, maxval=110, group="Signal Engine")
+signalCooldownBars = input.int(10,  "Signal Cooldown (bars)",  minval=1,               group="Signal Engine")
+showSignals        = input.bool(true, "Show Signal Labels",                          group="General")
+
+// ─── Liquidity Tier Weight ───────────────────────────────────────────────────
+//
+// The weight for the highest tier that is nearby: 30 for D1, 20 for 4H, 10 for
+// 1H, otherwise 0. A price sitting between a D1 zone and a 4H zone scores 30,
+// not 50 — only the most significant tier counts.
+//
+// A chain of nested ternaries. `else if` would also be legal here; the ternary
+// is used so "first match wins" is explicit rather than inferred from block
+// indentation.
+//
+// The function is direction-BLIND by design: it knows a tier, not a side. The
+// side is carried by the per-side flags passed in (nearD1LiquidityLong and
+// friends), and choosing which side is the caller's job — see the score block.
+
+f_liquidityWeight(bool d1, bool h4, bool h1) =>
+    int pts = d1 ? 30 : h4 ? 20 : h1 ? 10 : 0
+    pts
+
+// ─── Session Factor ──────────────────────────────────────────────────────────
+//
+// `sessionScore` DOES NOT EXIST. An earlier draft of the spec referenced one and
+// it was never implemented, which is an undefined identifier and a compile
+// error. Session Markers exports `sessionStrength` (int) and `sessionMultiplier`
+// (float); this module reads the former.
+//
+// The gate is a binary test on the strength, not the multiplier: a signal is
+// suppressed outside a tradable session, whereas the multiplier would have
+// scaled it down and let a weak out-of-session setup through at a reduced score.
+// Crypto runs 24/7, so the multiplier is deliberately NOT used here.
+//
+// >= 2 means at least one major session (London or NY) is active. Asia alone
+// scores 1 and does not clear this gate.
+
+bool sessionOK = sessionStrength >= 2
+
+// ─── Confidence Scoring ──────────────────────────────────────────────────────
+//
+// TWO SCORES, ONE PER DIRECTION, each built only from same-side inputs and
+// compared only against its own signal. Every term below is therefore either
+// explicitly per-side or genuinely direction-neutral; nothing that knows a
+// direction is allowed into the other side's score.
+//
+// A score is an int, not a percentage: the maximum is 110, which no percentage
+// can express.
+
+int longScore  = 0
+int shortScore = 0
+
+// Liquidity — per side, from the per-side tier flags. liquidity-zones.pine
+// exports six of them (nearD1/H4/H1 Liquidity Long/Short) precisely so there
+// are no shared tier flags to read here; a shared flag is what let a LONG earn
+// points for a D1 zone above price.
+longScore  += f_liquidityWeight(nearD1LiquidityLong,  nearH4LiquidityLong,  nearH1LiquidityLong)
+shortScore += f_liquidityWeight(nearD1LiquidityShort, nearH4LiquidityShort, nearH1LiquidityShort)
+
+// Session — direction-neutral, so both scores see the same points. A session
+// says nothing about which way price goes, only about whether it is worth
+// trading, so it cannot be attributed to one side. A weaker session scores less
+// for both, which raises the bar for both rather than favouring either.
+int sessionPoints = inOverlap ? 25 : inLondon or inNY ? 15 : inAsia ? 5 : 0
+longScore  += sessionPoints
+shortScore += sessionPoints
+
+// Structure — the reversal weight REPLACES the continuation weight; it does not
+// add to it. An earlier draft awarded +20 for any break and a further +30 for a
+// ChoCh, and since ChoCh is a SUBSET of BoS, every reversal scored 50 points
+// for one event. Parentheses are explicit around the ternary: `x += c ? a : b`
+// relies on precedence that is not worth relying on in the one place a
+// misread would corrupt the score.
+if breakUp
+    longScore += (structureFlipped ? 30 : 20)
+if breakDown
+    shortScore += (structureFlipped ? 30 : 20)
+
+// Imbalance — same side only. `or`, not `+`: approach and fill are mutually
+// exclusive by construction in imbalance-detector.pine (near* requires an
+// untouched gap, in* requires a touched one), so at most one arm is ever true
+// and a sum could only ever count a single gap twice.
+if nearImbalanceLong or inImbalanceLong
+    longScore += 15
+if nearImbalanceShort or inImbalanceShort
+    shortScore += 15
+
+// Volume — confirms activity without implying a direction, so it scores both
+// sides equally. This is the one factor that is neutral for the same structural
+// reason the session points are, not by convenience.
+if volumeConfirmed
+    longScore  += 10
+    shortScore += 10
+
+// ─── Cooldown ────────────────────────────────────────────────────────────────
+//
+// Declared BEFORE the signals. The signals below do not carry the
+// `and not inCooldown` term themselves, but the fired flags computed from them
+// do, and a term referencing inCooldown above its declaration is an undefined
+// identifier — a compile error.
+
+var int lastSignalBar = na
+
+// na until the first signal fires. The na guard is required, not defensive:
+// bar_index - na is na, and na < signalCooldownBars is na, so without the guard
+// inCooldown would be na on every bar before the first signal.
+bool inCooldown = not na(lastSignalBar) and (bar_index - lastSignalBar) < signalCooldownBars
+
+// ─── Signals ─────────────────────────────────────────────────────────────────
+//
+// Each signal is gated by its OWN score. There is no shared confidence number,
+// so a setup can never be admitted by the strength of the opposite direction.
+//
+// `breakUp` is the structure term on its own, not `breakUp or bullishChoCh`:
+// Structure Break exposes one break flag plus structureFlipped precisely so a
+// single structural event cannot satisfy two terms of the same factor. A
+// consumer that wants "structure turned bullish" reads `breakUp and
+// structureFlipped` — which is a stricter test, not a second factor.
+
+bool longSignalRaw  = nearLiquidityLong  and sessionOK and
+                      (breakUp or nearImbalanceLong or inImbalanceLong) and
+                      longScore  >= minConfidence
+
+bool shortSignalRaw = nearLiquidityShort and sessionOK and
+                      (breakDown or nearImbalanceShort or inImbalanceShort) and
+                      shortScore >= minConfidence
+
+// ─── Directional Exclusivity ──────────────────────────────────────────────────
+//
+// LONG and SHORT are NOT mutually exclusive by construction, and this is the
+// fifth module's most dangerous gap. Price sandwiched between an H4 zone below
+// and an H4 zone above, with untouched gaps on both sides, in the London/NY
+// overlap, on elevated volume, scores 20 + 25 + 15 + 10 = 70 on BOTH sides
+// simultaneously. Without this block the indicator would print a LONG label, a
+// SHORT label, two alert() calls and two alertconditions on the same bar.
+//
+// Structure is the tiebreaker, not the score. A sandwiched setup is not
+// genuinely two opportunities — it is one ambiguous one, and the only thing
+// that resolves it is which way structure already leans. `marketStructure` is
+// computed by Structure Break precisely for this, and nothing consumed it before
+// now.
+//
+//   both qualify + structure bullish  → LONG only
+//   both qualify + structure bearish  → SHORT only
+//   both qualify + structure unestablished (0) → NEITHER. A tie with no trend
+//                                    to break it is not a trade.
+//   one qualifies                     → that one, structure irrelevant
+bool longSignal  = longSignalRaw  and not (shortSignalRaw and marketStructure != 1)
+bool shortSignal = shortSignalRaw and not (longSignalRaw  and marketStructure != -1)
+
+// A genuine tie with no structure carries no directional information at all,
+// so it is dropped rather than resolved arbitrarily. A tie WITH structure is
+// already resolved above.
+bool ambiguousTie = longSignalRaw and shortSignalRaw and marketStructure == 0
+
+// The cooldown term lives here rather than in the expressions above, and these
+// are what the label, the alert() call and the alertcondition() all consume.
+// One snapshot of the decision, taken BEFORE lastSignalBar is updated below, so
+// a signal that fires on this bar is still emitted on this bar — gating the
+// emitters inline would evaluate the same expression four times and drift the
+// moment the order changed.
+bool longSignalFired  = longSignal  and not inCooldown
+bool shortSignalFired = shortSignal and not inCooldown
+
+// ─── Cooldown Application ────────────────────────────────────────────────────
+//
+// Applied AFTER the signals are evaluated and BEFORE the visual output, so the
+// label and the alert on this bar correspond to a lastSignalBar that has
+// already been stamped. The two fired flags are snapshots taken above, so
+// writing lastSignalBar here cannot retroactively cancel them.
+//
+// One stamp for both directions: if a bar somehow satisfied both, the cooldown
+// starts once, not twice.
+
+if longSignalFired or shortSignalFired
+    lastSignalBar := bar_index
+
+// ─── Visual Output ───────────────────────────────────────────────────────────
+//
+// yloc.belowbar / yloc.abovebar OVERRIDE the y price argument — Pine places
+// the label a fixed distance beyond the bar and ignores y. The y argument is
+// still required positionally, so `low` / `high` is passed as a placeholder.
+// The spec's `low - atrChart * 0.5` has no effect under yloc, and its stated
+// rationale — an offset expressed in ATRs so the visual distance is scale
+// independent — describes behaviour yloc.belowbar does not have.
+//
+// showSignals gates the DRAWING only. The alert() calls below are not gated by
+// it, so switching labels off silences the chart without blinding an alert
+// configuration that already exists.
+//
+// One label per signal, and a signal is cooldown-gated, so this is inherently
+// rare and is not a consumer of the max_labels_count=500 budget.
+//
+// bar_index, not barIndex: the latter is a TradingView alert-message
+// placeholder variable that does not exist in script scope.
+
+if longSignalFired and showSignals
+    label.new(bar_index, low,
+         "LONG\nScore: " + str.tostring(longScore) + "/110",
+         style=label.style_label_up,
+         color=color.new(color.green, 20),
+         textcolor=color.white,
+         size=size.normal,
+         yloc=yloc.belowbar)
+
+if shortSignalFired and showSignals
+    label.new(bar_index, high,
+         "SHORT\nScore: " + str.tostring(shortScore) + "/110",
+         style=label.style_label_down,
+         color=color.new(color.red, 20),
+         textcolor=color.white,
+         size=size.normal,
+         yloc=yloc.abovebar)
+
+// ─── Alert Output ────────────────────────────────────────────────────────────
+//
+// alert() carries the live score because its message is a SERIES string, built
+// on this bar from longScore / shortScore. The alertcondition() calls below
+// cannot: their message must be a const string, so only TradingView's own
+// {{...}} placeholders interpolate and none of them exposes the score. See the
+// note on that block.
+//
+// These are NOT gated by showSignals — see the note on the visual output.
+
+if longSignalFired
+    alert("LiquidityFlowAuse LONG signal on " + syminfo.ticker + " | Score: " + str.tostring(longScore) + "/110", alert.freq_once_per_bar_close)
+
+if shortSignalFired
+    alert("LiquidityFlowAuse SHORT signal on " + syminfo.ticker + " | Score: " + str.tostring(shortScore) + "/110", alert.freq_once_per_bar_close)
+
+// ─── Alert Conditions (spec 10.2) ────────────────────────────────────────────
+//
+// ALERT NAMES ARE UNCHANGED. They are the user-facing identifiers anyone who
+// has already configured an alert in TradingView is keyed on; only the
+// conditions behind them are defined here.
+//
+// THE TWO SIGNAL ALERTS ARE GATED ON THE FIRED FLAGS, not on raw longSignal /
+// shortSignal. The spec's 10.2 reads the raw signals, which fires an
+// alertcondition on every bar the confluence holds — including every bar inside
+// the cooldown that 7.5 exists to suppress, defeating it entirely. Gating on
+// the fired flags is the only reading consistent with 7.5.
+//
+// THE MESSAGES CARRY NO SCORE. 10.2 writes "Score: {{close}}%", but an
+// alertcondition message must be a const string and {{close}} is a PRICE, not
+// a score, so that placeholder would print a number the alert has nothing to do
+// with. The score-carrying alert for these two events is the alert() call
+// above, which can interpolate it.
+
+// The four structure conditions add structureFlipped rather than relying on a
+// separate bullishChoCh / bearishChoCh flag, so BoS and ChoCh are genuinely
+// distinct conditions instead of four alerts that all fire on the same break.
+
+alertcondition(longSignalFired,  "LF_LongSignal",  "LiquidityFlowAuse LONG signal on {{ticker}}")
+alertcondition(shortSignalFired, "LF_ShortSignal", "LiquidityFlowAuse SHORT signal on {{ticker}}")
+
+alertcondition(breakUp   and not structureFlipped, "LF_BullishBoS",   "Bullish BoS on {{ticker}}")
+alertcondition(breakDown and not structureFlipped, "LF_BearishBoS",   "Bearish BoS on {{ticker}}")
+alertcondition(breakUp   and structureFlipped,     "LF_BullishChoCh", "Bullish ChoCh on {{ticker}}")
+alertcondition(breakDown and structureFlipped,     "LF_BearishChoCh", "Bearish ChoCh on {{ticker}}")
+
+// Liquidity approach and sweep. Both fire on the TRANSITION INTO the state,
+// read through the [1] historical reference, so they report the edge rather
+// than every bar the state holds — a zone can be near for ten bars and that is
+// one event, not ten.
+//
+// On bar 0 the [1] value is na, `not na` is false, and both conditions
+// evaluate false, so there is no bar-0 artifact. The swept* flags are read here
+// and nowhere else in the module: liquidity-zones.pine keeps a swept zone
+// ALIVE precisely so the sweep can be reported, and scoring swept* as a
+// confluence term would double-count the event against near* — they are
+// mutually exclusive by construction in that module.
+
+bool liquidityTestLong   = nearLiquidityLong  and not nearLiquidityLong[1]
+bool liquidityTestShort  = nearLiquidityShort and not nearLiquidityShort[1]
+bool liquiditySweepLong  = sweptLong  and not sweptLong[1]
+bool liquiditySweepShort = sweptShort and not sweptShort[1]
+
+alertcondition(liquidityTestLong,   "LF_LiquidityTest",  "Price approaching LONG liquidity on {{ticker}}")
+alertcondition(liquidityTestShort,  "LF_LiquidityTest",  "Price approaching SHORT liquidity on {{ticker}}")
+alertcondition(liquiditySweepLong,  "LF_LiquiditySweep", "LONG liquidity swept on {{ticker}}")
+alertcondition(liquiditySweepShort, "LF_LiquiditySweep", "SHORT liquidity swept on {{ticker}}")
+
+// Overlap start: the opening edge only, behind the same `and inOverlap` guard
+// the session boundary lines use. ta.change() fires on BOTH edges, so without
+// the conjunct this alerts twice per window — once when the overlap begins and
+// once when it ends, which is the bug that guard exists to prevent in the
+// boundary lines.
+
+alertcondition(ta.change(inOverlap) and inOverlap, "LF_OverlapStart", "London+NY overlap started on {{ticker}}")
+
+// ─── Module Outputs (spec 7.7) ──────────────────────────────────────────────
+//
+//   longSignalFired   (bool) a LONG passed confluence AND was outside cooldown
+//   shortSignalFired  (bool) a SHORT passed confluence AND was outside cooldown
+//   longScore         (int)  this direction's score, 0-110
+//   shortScore        (int)  this direction's score, 0-110
+//
+// longScore / shortScore are recomputed each bar, so no var. lastSignalBar is
+// a var and persists.
+//
+// NOTHING CONSUMES THESE. This is the root module: there is no module after it
+// in the SOURCES array, so no downstream diagnostic will report a wrong
+// identifier, a reversed side or a miscounted weight. Every export is the last
+// thing checked, so it is the thing that has to be checked by reading.

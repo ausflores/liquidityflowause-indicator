@@ -1220,19 +1220,73 @@ if volumeConfirmed
 minConfidence = input.int(70, "Minimum Confidence Score", minval=0, maxval=110, group="Signal Engine")
 
 // LONG: liquidity on the long side, a tradable session, a long-direction
-// confirmation, and the long score above threshold.
-bool longSignal = nearLiquidityLong and sessionOK and
-                  (breakUp or nearImbalanceLong or inImbalanceLong) and
-                  longScore >= minConfidence and not inCooldown
+// confirmation, and the long score above threshold. Cooldown applied in 7.5.
+bool longSignal  = nearLiquidityLong  and sessionOK and
+                   (breakUp or nearImbalanceLong or inImbalanceLong) and
+                   longScore >= minConfidence
 
 // SHORT: the mirror image.
 bool shortSignal = nearLiquidityShort and sessionOK and
                    (breakDown or nearImbalanceShort or inImbalanceShort) and
-                   shortScore >= minConfidence and not inCooldown
+                   shortScore >= minConfidence
 ```
 
 Each score is gated by its own signal, so a setup can never be admitted by the
 strength of the opposite direction.
+
+### 7.4.1 Directional Exclusivity
+
+**LONG and SHORT are not mutually exclusive, and that is a defect to fix rather
+than a property to rely on.** A setup with an H4 zone below *and* an H4 zone
+above, untouched gaps on both sides, in the London/NY overlap, on elevated
+volume, scores `20 + 25 + 15 + 10 = 70` on **both** sides simultaneously — which
+clears the default threshold twice on the same bar. Without an explicit rule the
+indicator would print a LONG label, a SHORT label, two `alert()` calls and two
+`alertcondition()` fires on one bar.
+
+**Structure is the tiebreaker, not the score.** A sandwiched setup is not two
+opportunities, it is one ambiguous one, and the only thing that resolves it is
+which way structure already leans. `marketStructure` exists precisely to answer
+that and nothing consumed it until now.
+
+| Both sides qualify | Emitted |
+|---|---|
+| `marketStructure == 1` (bullish) | LONG only |
+| `marketStructure == -1` (bearish) | SHORT only |
+| `marketStructure == 0` (unestablished) | **Neither** |
+| Only one side qualifies | that side, structure irrelevant |
+
+A tie with no structure carries no directional information at all, so it is
+**dropped rather than resolved arbitrarily**. Forcing a side there would
+manufacture a direction out of nothing, which is precisely what the confluence
+rule exists to prevent.
+
+```pine
+bool longSignalRaw  = nearLiquidityLong  and sessionOK and
+                      (breakUp or nearImbalanceLong or inImbalanceLong) and
+                      longScore  >= minConfidence
+
+bool shortSignalRaw = nearLiquidityShort and sessionOK and
+                      (breakDown or nearImbalanceShort or inImbalanceShort) and
+                      shortScore >= minConfidence
+
+bool longSignal  = longSignalRaw  and not (shortSignalRaw and marketStructure != 1)
+bool shortSignal = shortSignalRaw and not (longSignalRaw  and marketStructure != -1)
+
+// A tie with no structure carries no directional information, so it is dropped.
+bool ambiguousTie = longSignalRaw and shortSignalRaw and marketStructure == 0
+```
+
+This completes the invariant the whole design rests on. Each factor is
+directionally coherent, each signal is scored only by its own inputs, and the two
+signals can never coexist on one bar.
+
+**Ordering note:** the cooldown must be evaluated *before* the signals reference
+it. In 7.4 below the signals are written without the cooldown term, and 7.5
+applies it — so the declaration order in the module is: scores, exclusivity,
+cooldown, then the fired flags. A signal written with `and not inCooldown`
+before `inCooldown` exists is an undefined identifier, and the same is true of
+`lastSignalBar`.
 
 ### 7.5 Signal Cooldown
 
@@ -1370,8 +1424,8 @@ structPivotLen = input.int(5, "Structure Pivot Length", minval=3, group="Structu
 // ═══════════════════════════════════════════════════════════════════════════════
 // GROUP: Signal Engine
 // ═══════════════════════════════════════════════════════════════════════════════
-minConfidence     = input.int(60,  "Minimum Confidence Score", minval=0, maxval=100, group="Signal Engine")
-signalCooldown    = input.int(10,  "Signal Cooldown (bars)",   minval=1,                   group="Signal Engine")
+minConfidence     = input.int(70,  "Minimum Confidence Score", minval=0, maxval=110, group="Signal Engine")
+signalCooldownBars = input.int(10,  "Signal Cooldown (bars)",   minval=1,                   group="Signal Engine")
 enableLongSignals = input.bool(true,  "Enable LONG Signals",    group="Signal Engine")
 enableShortSignals = input.bool(true, "Enable SHORT Signals",   group="Signal Engine")
 
@@ -1438,7 +1492,7 @@ The indicator uses a **dark-theme-optimized** palette with sufficient contrast:
 | Imbalances | `box.new()` | `border_width=1`, tight fit to gap |
 | Structure Lines | `line.new()` | Connect swing points, `width=1` |
 | Signal Labels | `label.new()` | `yloc.belowbar` / `yloc.abovebar` |
-| Confidence Score | Embedded in label text | `"Score: XX%"` |
+| Confidence Score | Embedded in label text | `"Score: XX/110"` |
 
 ### 9.3 Chart Annotations
 
@@ -1448,7 +1502,7 @@ The indicator uses a **dark-theme-optimized** palette with sufficient contrast:
 │                                                                 │
 │         ┌─────────────┐                                        │
 │         │    LONG     │  ← Signal label (green, below bar)    │
-│         │  Score: 75% │                                        │
+│         │  Score: 75/110 │                                        │
 │         └─────────────┘                                        │
 │              ▲                                                 │
 │              │                                                 │
@@ -1482,8 +1536,19 @@ The indicator uses a **dark-theme-optimized** palette with sufficient contrast:
 
 ```pine
 // ─── Alert Conditions ─────────────────────────────────────────────────────────
-alertcondition(longSignal,     "LF_LongSignal",     "LONG signal on {{ticker}} | Score: {{close}}%")
-alertcondition(shortSignal,    "LF_ShortSignal",    "SHORT signal on {{ticker}} | Score: {{close}}%")
+//
+// Gated on the FIRED flags, not on raw longSignal / shortSignal. Raw signals
+// are true on every bar the confluence holds; gating the cooldown at the
+// alertcondition would re-introduce the spam the cooldown exists to prevent.
+//
+// The message CANNOT carry the score. An alertcondition's message must be a
+// const string, and `{{close}}` is a PRICE, not a score — the earlier draft
+// printed the bar close under a label reading "Score". The score is delivered
+// by the `alert()` calls in 7.6, whose message is a series string and can
+// therefore interpolate it. Alert names are unchanged: they are the
+// user-facing identifiers anyone has already configured in TradingView.
+alertcondition(longSignalFired,  "LF_LongSignal",  "LONG signal on {{ticker}}")
+alertcondition(shortSignalFired, "LF_ShortSignal", "SHORT signal on {{ticker}}")
 // Alert names are unchanged — they are the user-facing identifiers anyone
 // already configured in TradingView. Only the conditions change, and the ChoCh
 // variants now add structureFlipped so they are genuinely distinct from BoS.
@@ -1515,7 +1580,7 @@ alertcondition(ta.change(inOverlap) and inOverlap, "LF_OverlapStart", "London+NY
 
 ```
 LiquidityFlowAuse LONG signal on BTCUSDT (Binance)
-Score: 75% | Session: London+NY Overlap | Structure: Bullish ChoCh
+Score: 75/110 | Session: London+NY Overlap | Structure: Bullish ChoCh
 Liquidity: D1 pivot low @ $64,200 | Imbalance: Bullish FVG confirmed
 ```
 
