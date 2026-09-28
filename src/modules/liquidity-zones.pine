@@ -44,9 +44,17 @@ zoneATRMult = input.float(0.5, "Zone Width (x HTF ATR)",  minval=0.1, step=0.1, 
 maxZones = input.int(50, "Max Zones", minval=10, maxval=200, group="Liquidity Zones")
 
 // Cull thresholds.
-maxZoneAgeBars     = input.int(500,   "Max Zone Age (bars)",          minval=50,  group="Liquidity Zones")
-maxZoneDistanceATR = input.float(15.0, "Max Zone Distance (x ATR)",   minval=5.0, group="Liquidity Zones")
-sweptRetainBars    = input.int(100,   "Swept Zone Retention (bars)", minval=10,  group="Liquidity Zones")
+//
+// The distance threshold is measured in 4H ATR, NOT entry-timeframe ATR. On the
+// 5-minute entry timeframe this indicator is designed for, 15 x a 5-minute ATR
+// is a tiny distance: D1 zones are born and culled on the same bar and the tier
+// hierarchy silently collapses. Nothing errors — D1 liquidity just goes missing
+// and reads as normal behaviour. Anchoring to 4H makes "15 ATR of distance"
+// mean the same thing on any chart timeframe, so a D1 zone survives on 5m the
+// way it does on 1h.
+maxZoneAgeBars     = input.int(500,   "Max Zone Age (bars)",          minval=50,   group="Liquidity Zones")
+maxZoneDistanceATR = input.float(15.0, "Max Zone Distance (x 4H ATR)", minval=5.0,  step=1.0, group="Liquidity Zones")
+sweptRetainBars    = input.int(100,   "Swept Zone Retention (bars)", minval=10,   group="Liquidity Zones")
 
 // Evaluation thresholds. Both measure on the ENTRY timeframe, because that is
 // the timeframe on which price is being judged: a D1 ATR here would make a
@@ -220,8 +228,10 @@ if array.size(zones) > 0
 // Three independent rules, any one of which retires a zone:
 //
 //   age    — older than maxZoneAgeBars. Stops unbounded accumulation.
-//   dist   — further than maxZoneDistanceATR chart ATRs from price. A zone that
-//            far away is no longer actionable.
+//   dist   — further than maxZoneDistanceATR x 4H ATR from price. A zone that
+//            far away is no longer actionable. Anchored to 4H rather than the
+//            entry timeframe so the threshold is timeframe-independent; see
+//            the note on the input declaration.
 //   stale  — swept longer ago than sweptRetainBars.
 //
 // Every cull MUST call box.delete() first. Removing the record without it
@@ -236,7 +246,7 @@ if array.size(zones) > 0
         LiquidityZone zc = array.get(zones, i)
 
         bool tooOld = bar_index - zc.bornBar > maxZoneAgeBars
-        bool tooFar = math.abs(close - zc.center) > atrChart * maxZoneDistanceATR
+        bool tooFar = not na(atrH4) and math.abs(close - zc.center) > atrH4 * maxZoneDistanceATR
         bool stale  = not na(zc.sweptBar) and bar_index - zc.sweptBar > sweptRetainBars
 
         if tooOld or tooFar or stale

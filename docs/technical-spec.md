@@ -320,7 +320,7 @@ Zones are **culled** by any of three independent rules:
 | Rule | Threshold | Rationale |
 |------|-----------|-----------|
 | **Age** | older than `maxZoneAgeBars` (default 500 bars) | Stops unbounded accumulation and keeps old structure out of the picture |
-| **Distance** | beyond `maxZoneDistanceATR` (default 15 × ATR) | Far-away zones are no longer actionable |
+| **Distance** | beyond `maxZoneDistanceATR` (default 15 × **4H** ATR) | Far-away zones are no longer actionable |
 | **Swept and aged out** | swept longer ago than `sweptRetainBars` (default 100 bars) | Bounds how long a swept zone lingers |
 
 **A sweep does not remove a zone — it marks it.** The premise of the indicator
@@ -341,11 +341,19 @@ earlier draft.
 
 ```pine
 maxZoneAgeBars     = input.int(500,   "Max Zone Age (bars)",        minval=50, group="Liquidity Zones")
-maxZoneDistanceATR = input.float(15.0, "Max Zone Distance (× ATR)", minval=5.0, group="Liquidity Zones")
+maxZoneDistanceATR = input.float(15.0, "Max Zone Distance (x 4H ATR)", minval=5.0, step=1.0, group="Liquidity Zones")
 sweptRetainBars    = input.int(100,   "Swept Zone Retention (bars)", minval=10, group="Liquidity Zones")
 
-// Proximity and culling thresholds both measure on the entry timeframe, since
-// that is the timeframe on which price is being evaluated.
+// Proximity and culling thresholds measure on the ENTRY timeframe, because that
+// is the timeframe on which price is being evaluated — a D1 ATR in the proximity
+// test would make a 5-minute approach to a zone look like nothing.
+//
+// The distance cull is the ONE exception: it uses the 4H ATR. Anchored to the
+// entry timeframe, 15 x a 5-minute ATR is a tiny distance, so D1 zones are born
+// and culled on the same bar and the tier hierarchy collapses — with no error,
+// D1 liquidity just goes missing. Measured against 4H, the threshold means the
+// same thing on any chart timeframe, and a D1 zone survives on 5m as it does
+// on 1h.
 atrChart = ta.atr(14)
 
 // Runs AFTER zone creation, so a zone that is born and swept on the same bar is

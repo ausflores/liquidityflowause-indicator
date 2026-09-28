@@ -398,6 +398,36 @@ bool lzCountsAddUp = diagTier1 + diagTier2 + diagTier3 == diagZones and
 
 plot(lzUnderBudget ? 1 : 0, title = "LZ DIAG VERDICT budget (1 = ok)", color = color.new(color.lime, 0))
 plot(lzCountsAddUp ? 1 : 0, title = "LZ DIAG VERDICT counts (1 = ok)",  color = color.new(color.lime, 0))
+
+// Gross births and gross removals, tracked from outside the module.
+//
+// This answers the one question that decides whether the distance cull is the
+// problem. If live tier1 is 0, either no D1 pivot is ever confirmed, or D1
+// zones are born and culled on the same bar. Those look identical on the chart
+// but are completely different bugs.
+//
+//   births  > 0 and tier1 = 0  ->  zones ARE created and then culled. Cull too
+//                                  aggressive: the distance threshold.
+//   births  = 0                ->  no pivots confirmed at all. Something earlier
+//                                  in the pipeline: request.security, or a pivot
+//                                  length longer than the visible history.
+//
+// Which individual cull rule fires is NOT observable from here, because the
+// cull blocks live inside the module. Only the module can instrument that.
+var int lzPrevSize = 0
+var int lzBirths   = 0
+var int lzRemovals = 0
+
+int lzSizeNow = array.size(zones)
+if lzSizeNow > lzPrevSize
+    lzBirths += lzSizeNow - lzPrevSize
+else if lzSizeNow < lzPrevSize
+    lzRemovals += lzPrevSize - lzSizeNow
+lzPrevSize := lzSizeNow
+
+plot(lzBirths,   title = "LZ DIAG gross births (must be > 0)",   color = color.new(color.aqua, 0))
+plot(lzRemovals, title = "LZ DIAG gross removals",               color = color.new(color.maroon, 0))
+plot(lzBirths > 0 ? 1 : 0, title = "LZ DIAG VERDICT births (1 = pivots confirmed)", color = color.new(color.lime, 0))
 `;
 
 /**
