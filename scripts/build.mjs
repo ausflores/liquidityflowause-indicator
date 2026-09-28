@@ -257,6 +257,38 @@ if ta.change(diagActive)
 // London balanced at 42/21 on the same chart. Excluding bar 0 removes the
 // artifact without hiding a real defect, because a real guard failure shifts
 // edges and lines together on every window, not on one boundary bar.
+// ─── Timezone Smoke Test ─────────────────────────────────────────────────────
+//
+// The session windows are defined in the SELECTED timezone. Reading a band's
+// position off the chart axis proves nothing on its own, because the chart axis
+// carries its own offset. What is checkable without knowing that offset is
+// where each session's opening bar actually falls in UTC — a value derived from
+// the data rather than read by eye.
+//
+// Expected UTC hours for the default windows (Asia 00:00, London 07:00,
+// NY 13:00), ignoring daylight saving:
+//
+//   timezone          Asia  London  NY      (UTC hour of the opening bar)
+//   UTC                 0      7    13
+//   Asia/Tokyo         15     22     4      (+9, fixed, no DST)
+//   America/New_York    5     12    18      (-5 in winter, -4 in summer)
+//   Europe/London       0      7    13      (GMT is identical to UTC)
+//   exchange           varies with the exchange
+//
+// Europe/London under GMT must reproduce the UTC row exactly. That equality is
+// the cheapest available check that a named zone is being resolved and not
+// silently ignored.
+
+// Same two-argument branch the module uses: time() rejects "exchange" as a
+// timezone argument, so that option must go through the overload.
+int diagAsiaStart   = useExchangeTz ? time(timeframe.period, asiaSession)   : time(timeframe.period, asiaSession,   sessionTimezone)
+int diagLondonStart = useExchangeTz ? time(timeframe.period, londonSession) : time(timeframe.period, londonSession, sessionTimezone)
+int diagNYStart     = useExchangeTz ? time(timeframe.period, nySession)     : time(timeframe.period, nySession,     sessionTimezone)
+
+plot(hour(diagAsiaStart,   "UTC"), title = "DIAG Asia open (UTC h)   UTC=0  Tokyo=15  NY=4/5  London=0", color = color.new(color.purple, 0))
+plot(hour(diagLondonStart, "UTC"), title = "DIAG London open (UTC h) UTC=7  Tokyo=22  NY=11/12  London=7", color = color.new(color.blue, 0))
+plot(hour(diagNYStart,     "UTC"), title = "DIAG NY open (UTC h)     UTC=13 Tokyo=4   NY=17/18  London=13", color = color.new(color.orange, 0))
+
 var int diagAsiaEdges  = 0
 var int diagAsiaLines  = 0
 var int diagLondonEdges = 0
