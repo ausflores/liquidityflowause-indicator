@@ -695,7 +695,7 @@ deletion.
 type ImbalanceZone
     float top
     float bottom
-    bool  bullish
+    bool  isBull       // not `bullish` — that shadows the builtin
     int   bornBar
     int   touchedBar    // bar_index on first entry; na while untouched
     box   zoneBox
@@ -751,9 +751,22 @@ if bearishImbalance and showImbalances
          f_newImbalance(false, low[2], high[0])))
 ```
 
-**Touch** records the first bar whose range reached into the band. The imbalance
-is *not* removed — the Signal Engine needs to know a gap was filled and on what
-side, exactly as it needed `sweptLong` / `sweptShort` from Liquidity Zones.
+**Touch** records the first bar **after creation** whose range reached into the
+band. The imbalance is *not* removed — the Signal Engine needs to know a gap was
+filled and on what side, exactly as it needed `sweptLong` / `sweptShort` from
+Liquidity Zones.
+
+The `bornBar < bar_index` guard is **load-bearing, not defensive.** A gap's own
+edges are derived from the creating bar's own prices — a bullish band runs from
+`high[2]` to `low[0]`, and the pattern guarantees `low[0] > high[2]`. So on the
+creation bar `high >= fi.bottom` is `high[0] >= high[2]`, which holds by
+construction, and `low <= fi.top` is `low[0] <= low[0]`, an identity. Testing
+`reached` alone marks **every** gap as touched the moment it is born, which
+would make `nearImbalanceLong` / `nearImbalanceShort` permanently false and make
+every gap retire `fvgFilledRetainBars` after its birth rather than after a real
+fill.
+
+A newly formed gap is unfilled by definition — that is what a gap *is*.
 
 **Retire** removes it on age, or once touched and left alone for
 `fvgFilledRetainBars`. Every removal deletes the box.
@@ -764,10 +777,11 @@ fvgFilledRetainBars = input.int(50, "Filled Imbalance Retention (bars)", minval=
 if array.size(imbalances) > 0
     for i = 0 to array.size(imbalances) - 1
         ImbalanceZone fi = array.get(imbalances, i)
-        bool reached = high >= fi.bottom and low <= fi.top
-        if reached and na(fi.touchedBar)
+        bool reached  = high >= fi.bottom and low <= fi.top
+        bool canTouch = fi.bornBar < bar_index
+        if reached and canTouch and na(fi.touchedBar)
             array.set(imbalances, i, ImbalanceZone.new(
-                 fi.top, fi.bottom, fi.bullish, fi.bornBar, bar_index, fi.zoneBox))
+                 fi.top, fi.bottom, fi.isBull, fi.bornBar, bar_index, fi.zoneBox))
 
     for i = array.size(imbalances) - 1 to 0
         ImbalanceZone fr = array.get(imbalances, i)
@@ -781,7 +795,9 @@ if array.size(imbalances) > 0
 **Visual distinction.** An untouched imbalance is a faint outline; a touched one
 is filled solid, so the chart shows at a glance which gaps price has already
 reacted to and which are still virgin. Applied with `box.set_bgcolor()` and
-`box.set_border_style()` on the touch bar rather than by creating a second box.
+`box.set_border_color()` on the touch bar rather than by creating a second box.
+The border *style* is unchanged between the two states, so `set_border_style()`
+is not used — it would be a no-op.
 
 ### 5.3.1 Drawing Budget
 
@@ -1491,8 +1507,10 @@ A file under `src/modules/` is a **splice unit**, not a script. It must:
 - expose its outputs as plain module-level variables, since Pine has no `export`
 - declare only `input.*` calls, which is legal once spliced beneath `indicator()`
 
-A module's decorative header banner is stripped during the build; the
-descriptive prose is preserved.
+A module's decorative header banner is stripped during the build. The **whole
+box** is removed, prose included — the module body carries its own section
+comments, and the banner's description duplicates what this document already
+says.
 
 ### 12.4 Versioning
 

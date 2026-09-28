@@ -1,0 +1,311 @@
+// ============================================================================
+// LiquidityFlowAuse — Imbalance Detector Module
+// ----------------------------------------------------------------------------
+// Module:   Imbalance Detector
+// Version:  LiquidityFlowAuse v1.0.0
+//
+// Purpose:  Detects 3-candle fair value gaps on the entry timeframe, stores
+//           each confirmed gap as a persistent band, marks it when price later
+//           returns into it, retires it on age / fill-retention, and exports
+//           approach, fill and volume-confirmation state to the Signal Engine.
+//
+// Measured size and drawn region ARE THE SAME REGION. Both the threshold and
+// the box are the full band between candle 1 and candle 3: low[0]-high[2] for
+// bullish, low[2]-high[0] for bearish. An earlier draft measured only the gap
+// between candle 1 and candle 2 while drawing a box across both gaps plus the
+// isolated middle candle, so the threshold filtered on a different quantity
+// than the one displayed.
+//
+// Storage:  ONE array of a user type, matching Liquidity Zones. A record
+//           carries the band edges, side, age, touch bar and the drawing
+//           handle together, so a gap can never be half-removed and a retire
+//           can always reach its box.
+//
+// Pine:     Pine Script v5. The //@version=5 directive is declared once in
+//           the main indicator file (src/liquidityflowause.pine); this
+//           module MUST NOT contain an indicator() or study() declaration.
+//
+// Depends:  atrChart, declared at module level by liquidity-zones.pine, which
+//           scripts/build.mjs splices BEFORE this file. It is used, not
+//           redeclared: a second `atrChart = ta.atr(14)` here would be a
+//           duplicate-declaration compile error.
+//
+// Usage:    Designed for file concatenation into the main indicator file.
+//           For a standalone syntax check in the Pine Editor, wrap the
+//           contents of this file in a temporary indicator() declaration.
+// ============================================================================
+
+// ─── User Inputs ─────────────────────────────────────────────────────────────
+
+showImbalances = input.bool(true, "Show Imbalances", group="Imbalances")
+
+imbalanceThreshold = input.float(1.0, "Imbalance Min Size (x ATR)", minval=0.1, step=0.1, group="Imbalances")
+
+// Bounded at 60 because the main declaration is max_boxes_count=500 and
+// Liquidity Zones can already occupy up to 200. 200 + 60 = 260 live boxes, so
+// the two modules together cannot exhaust the budget. maxval is 60 rather than
+// the spec snippet's 200 for exactly that reason: the invariant that keeps the
+// drawing budget intact is the cap, and a cap the user can raise past the
+// budget would break it silently.
+maxImbalances = input.int(60,  "Max Imbalances",               minval=10, maxval=60,  group="Imbalances")
+maxFvgAgeBars = input.int(300, "Max Imbalance Age (bars)",     minval=50,            group="Imbalances")
+fvgFilledRetainBars = input.int(50, "Filled Imbalance Retention (bars)", minval=5,   group="Imbalances")
+
+// Evaluation threshold. Measured on the ENTRY timeframe, for the same reason
+// the Liquidity Zones proximity threshold is: a D1 ATR here would make a
+// 5-minute approach to a gap look like nothing.
+imbProxATRMult = input.float(1.5, "Imbalance Proximity (x ATR)", minval=0.5, step=0.1, group="Imbalances")
+
+// Volume confirmation, from spec 8.1. Lookback is the spec's fixed 20 bars.
+volumeThreshold = input.float(1.2, "Volume Confirmation (x SMA)", minval=1.0, step=0.1, group="Imbalances")
+
+// ─── Imbalance Record ────────────────────────────────────────────────────────
+
+type ImbalanceZone
+    float top
+    float bottom
+    bool  isBull
+    int   bornBar
+    int   touchedBar    // bar_index on first entry after birth; na while virgin
+    box   zoneBox
+
+var array<ImbalanceZone> imbalances = array.new<ImbalanceZone>()
+
+// ─── Detection (spec 5.2.1) ──────────────────────────────────────────────────
+//
+// A bullish gap is candle 3's low above candle 1's high; bearish is the mirror.
+// Sizes are the FULL band that gets drawn, not one leg of it.
+
+bool bullishFVG = low[0] > high[2]
+bool bearishFVG = high[0] < low[2]
+
+// Size spans the SAME region that is drawn: the full band between candle 1 and
+// candle 3, not just one leg of it.
+float bullSize = low[0] - high[2]
+float bearSize = low[2] - high[0]
+
+bool validBull = bullSize > atrChart * imbalanceThreshold
+bool validBear = bearSize > atrChart * imbalanceThreshold
+
+bool bullishImbalance = bullishFVG and validBull
+bool bearishImbalance = bearishFVG and validBear
+
+// Module-level, consumed by the Signal Engine's confluence test (spec 7.4) and
+// confidence score (spec 7.3). Not part of the 5.5 interface table, because
+// they report a gap FORMING rather than a gap price is engaging with.
+// Typed explicitly rather than inferred, to match the five outputs in the
+// 5.5 interface table. The SMA is na for the first 20 bars, so this is false
+// during warm-up rather than erroring.
+bool volumeConfirmed = volume > ta.sma(volume, 20) * volumeThreshold
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+//
+// Both helpers are READ-ONLY with respect to `imbalances`. Every mutation —
+// box.delete, array.push, array.set, array.remove — happens in global scope in
+// the blocks below, not inside a function. That is a READABILITY choice, not a
+// language limitation: Pine v5 functions CAN modify the contents of a global
+// array, so array.push()/array.set() on a global array from inside a function
+// is legal and the spec's f_addZone-style chain would have compiled. Keeping the
+// helpers pure means every write to the array is visible in one block instead
+// of spread across a call graph.
+//
+// Visuals. An untouched gap is a faint outline; a touched one is filled
+// solidly, so the chart shows at a glance which gaps price has already reacted
+// to. The state change is applied to the EXISTING box with box.set_bgcolor() and
+// box.set_border_color() rather than by creating a second box — two boxes for
+// one gap would double-count against max_boxes_count for no gain. The spec text
+// names set_border_style() for this; border_style is already solid in both
+// states, so writing it would be a no-op and the distinction is carried by the
+// fill and border colour instead.
+
+// Creates the band for a new gap. Persistent band, not a fixed-size box:
+// xloc = bar_index pins the left edge at the bar where the third candle closed
+// and extend = right stretches the right edge to the current bar, so the band
+// grows as the chart advances and vanishes when the record is retired.
+f_newImbalance(bool isBull, float top, float bottom) =>
+    color border = isBull ? color.new(color.green, 50) : color.new(color.red, 50)
+    color fill   = isBull ? color.new(color.green, 88) : color.new(color.red, 88)
+    box.new(
+         bar_index, top,
+         bar_index, bottom,
+         border_color = border,
+         border_width = 1,
+         border_style = line.style_solid,
+         bgcolor      = fill,
+         xloc         = xloc.bar_index,
+         extend       = extend.right)
+
+// Restyles an existing box as FILLED, once price has returned into the band.
+f_markImbalanceTouched(ImbalanceZone fi) =>
+    color base = fi.isBull ? color.green : color.red
+    box.set_border_color(fi.zoneBox, color.new(base, 25))
+    box.set_bgcolor(fi.zoneBox, color.new(base, 60))
+    fi.zoneBox
+
+// Index of the gap with the lowest bornBar.
+//
+// PRECONDITION: array.size(imbalances) >= 1. The only call site guards on
+// `array.size(imbalances) >= maxImbalances`, and maxImbalances has minval=10,
+// so the array always holds at least ten records here. The loop bound is
+// written `array.size(imbalances) - 1`; with an empty array Pine would count
+// DOWN from 1 to -1 and read index -1, so this precondition must not be
+// relaxed.
+f_oldestImbalanceIndex() =>
+    int oldest = 0
+    for k = 1 to array.size(imbalances) - 1
+        if array.get(imbalances, k).bornBar < array.get(imbalances, oldest).bornBar
+            oldest := k
+    oldest
+
+// ─── Creation (spec 5.3) ─────────────────────────────────────────────────────
+//
+// Creation runs on the bar the third candle closes. The band edges are
+// computed ONCE and used for both the stored record and the drawn box, so the
+// region the threshold filtered on and the region on the chart cannot diverge
+// — the earlier defect in this module, folded out of existence rather than
+// fixed twice.
+//
+// bullishFVG and bearishFVG are mutually exclusive (low[0] > high[2] and
+// high[0] < low[2] cannot both hold), so at most one gap is created per bar and
+// the two directions collapse into one block. Multi-way value selection uses
+// the ternary: Pine v5 has no `else <condition>` form that opens an indented
+// block.
+//
+// When the array is full the OLDEST gap is evicted — box deleted, record
+// removed — and the new gap is added regardless. Dropping the new one, as an
+// earlier `if array.size(imbalances) < maxImbalances` guard did, is backwards:
+// a gap forming now matters more than one that formed hundreds of bars ago.
+// Eviction happens before the push, so the push can never evict the record it
+// just created.
+
+bool creatingBull = bullishImbalance and showImbalances
+bool creatingBear = bearishImbalance and showImbalances
+
+if creatingBull or creatingBear
+    bool  isBull = creatingBull
+    float top    = creatingBull ? low[0] : low[2]
+    float bottom = creatingBull ? high[2] : high[0]
+
+    if array.size(imbalances) >= maxImbalances
+        int evictIdx = f_oldestImbalanceIndex()
+        box.delete(array.get(imbalances, evictIdx).zoneBox)
+        array.remove(imbalances, evictIdx)
+
+    array.push(imbalances, ImbalanceZone.new(top, bottom, isBull, bar_index, na, f_newImbalance(isBull, top, bottom)))
+
+// ─── Touch Marking (spec 5.3) ────────────────────────────────────────────────
+//
+// A touch does NOT remove a gap — it MARKS it. These areas act as magnets that
+// price returns to fill, so the fill is the event of interest, not the end of
+// the gap's life. Removing on first touch would destroy the one fact the Signal
+// Engine most wants: that a gap was filled, on which side, and when. Retention
+// is bounded by fvgFilledRetainBars below.
+//
+// WHY THE bornBar GUARD IS REQUIRED. Without `fi.bornBar < bar_index` every gap
+// is marked on the bar that CREATES it, and always: the bullish band runs from
+// high[2] to low[0], and the creation bar's own range satisfies
+// `high >= high[2]` (true because low[0] > high[2] and high[0] >= low[0]) and
+// `low <= low[0]` (an identity). The bearish case is the mirror. That would make
+// every gap born already-touched, which kills two of the five exports —
+// nearImbalanceLong / nearImbalanceShort require `na(touchedBar)` and could
+// never fire — and would retire every gap fvgFilledRetainBars after its BIRTH
+// rather than after a real fill. The guard encodes what 5.3 actually means:
+// the first bar whose range reached into the band AFTER the gap formed.
+//
+// Fields of a user type are immutable, so setting touchedBar means replacing
+// the whole record and carrying the existing box handle across. Forward
+// iteration is safe: nothing is removed here.
+
+if array.size(imbalances) > 0
+    for i = 0 to array.size(imbalances) - 1
+        ImbalanceZone fi = array.get(imbalances, i)
+
+        bool reached   = high >= fi.bottom and low <= fi.top
+        bool canTouch  = fi.bornBar < bar_index
+
+        if reached and canTouch and na(fi.touchedBar)
+            array.set(imbalances, i, ImbalanceZone.new(fi.top, fi.bottom, fi.isBull, fi.bornBar, bar_index, f_markImbalanceTouched(fi)))
+
+// ─── Retirement (spec 5.3) ───────────────────────────────────────────────────
+//
+// Two independent rules, either of which retires a gap:
+//
+//   age    — older than maxFvgAgeBars. Stops unbounded accumulation.
+//   filled — touched longer ago than fvgFilledRetainBars. A filled gap has a
+//            short useful life, while an untouched one may still be approached,
+//            so this limit is deliberately the shorter of the two.
+//
+// Every retirement MUST call box.delete() first. Removing the record without
+// it leaves a box on the chart that no longer participates in proximity logic: a
+// visual and logical divergence, and the bug present in an earlier draft.
+//
+// BACKWARD iteration is mandatory — array.remove() shifts the tail down, so a
+// forward loop skips the element after each removal.
+
+if array.size(imbalances) > 0
+    for i = array.size(imbalances) - 1 to 0
+        ImbalanceZone fr = array.get(imbalances, i)
+
+        bool tooOld    = bar_index - fr.bornBar > maxFvgAgeBars
+        bool filledOut = not na(fr.touchedBar) and bar_index - fr.touchedBar > fvgFilledRetainBars
+
+        if tooOld or filledOut
+            box.delete(fr.zoneBox)
+            array.remove(imbalances, i)
+
+// ─── Module Outputs (Signal Engine Interface, spec 5.5) ──────────────────────
+//
+//   nearImbalanceLong   approaching an UNTOUCHED bullish gap below price
+//   nearImbalanceShort  approaching an UNTOUCHED bearish gap above price
+//   inImbalanceLong     inside a touched bullish gap
+//   inImbalanceShort    inside a touched bearish gap
+//   volumeConfirmed     volume above its 20-bar average by volumeThreshold
+//
+// Recomputed from scratch every bar, so no var keyword. All five are declared
+// before the proximity block that assigns four of them.
+//
+// EVALUATED OVER THE STORED GAPS, not over the current bar's pattern. An
+// earlier draft tested bullishImbalance — the flag for a gap forming RIGHT NOW
+// — against high[2], two bars stale, so it could only ever report an imbalance
+// on the bar it formed and a stored gap price walked back into forty bars later
+// registered nothing. With the lifecycle above, the stored gaps are available.
+//
+// ENTRY AND FILL ARE SEPARATE SIGNALS. A gap is a fresh entry only while
+// untouched; once price has already been inside it, the same proximity is a
+// fill. Reporting both through near* would let the confluence score count one
+// gap twice. The `else if` is what enforces that — `else if`, not
+// `else <condition>`: the latter cannot open an indented block in Pine v5.
+//
+// A bullish gap sits BELOW price when it forms and price returns upward into
+// it, so nearImbalanceLong reads a gap approached from above. The side comes
+// from the gap's own direction, frozen at creation, which is correct here even
+// though Liquidity Zones derives its side from current position: an imbalance
+// is a directional gap between two specific candles, not a level that price
+// reclassifies by crossing it.
+//
+// A gap the price is inside on this bar was necessarily marked touched earlier
+// in this same bar's touch pass, since that pass applies the identical test —
+// so `inside` implies "touched" without an extra na() check.
+
+bool nearImbalanceLong  = false
+bool nearImbalanceShort = false
+bool inImbalanceLong    = false
+bool inImbalanceShort   = false
+
+if array.size(imbalances) > 0 and not na(atrChart)
+    for i = 0 to array.size(imbalances) - 1
+        ImbalanceZone ip = array.get(imbalances, i)
+
+        bool inside = high >= ip.bottom and low <= ip.top
+        bool nearP  = math.abs(close - math.avg(ip.top, ip.bottom)) <= atrChart * imbProxATRMult
+
+        if inside
+            if ip.isBull
+                inImbalanceLong := true
+            else
+                inImbalanceShort := true
+        else if nearP and na(ip.touchedBar)
+            if ip.isBull
+                nearImbalanceLong := true
+            else
+                nearImbalanceShort := true

@@ -430,6 +430,35 @@ plot(lzRemovals, title = "LZ DIAG gross removals",               color = color.n
 plot(lzBirths > 0 ? 1 : 0, title = "LZ DIAG VERDICT births (1 = pivots confirmed)", color = color.new(color.lime, 0))
 `;
 
+// Imbalance diagnostics. The load-bearing series is "virgin gaps": the spec's
+// touch test is true by construction on a gap's own creation bar, because the
+// band edges come from that bar's prices. Without the bornBar guard every gap
+// is born touched, nearImbalance* pin at zero forever, and nothing visual
+// reveals it — the gaps draw correctly and simply never report an approach.
+const IMBALANCE_DIAGNOSTIC_OVERLAY = `
+int imbLive      = array.size(imbalances)
+int imbUntouched = 0
+int imbTouched   = 0
+
+if array.size(imbalances) > 0
+    for i = 0 to array.size(imbalances) - 1
+        if na(array.get(imbalances, i).touchedBar)
+            imbUntouched += 1
+        else
+            imbTouched += 1
+
+plot(imbLive,      title = "IMB DIAG live imbalances (expect <= 60)", color = color.new(color.green, 0))
+plot(imbUntouched, title = "IMB DIAG virgin gaps (must be > 0)",       color = color.new(color.green, 0))
+plot(imbTouched,   title = "IMB DIAG filled gaps",                     color = color.new(color.teal, 0))
+plot(nearImbalanceLong  ? 1 : 0, title = "IMB DIAG nearLong reachable",  color = color.new(color.lime, 0))
+plot(nearImbalanceShort ? 1 : 0, title = "IMB DIAG nearShort reachable", color = color.new(color.lime, 0))
+plot(inImbalanceLong    ? 1 : 0, title = "IMB DIAG inLong fired",        color = color.new(color.lime, 0))
+plot(inImbalanceShort   ? 1 : 0, title = "IMB DIAG inShort fired",       color = color.new(color.lime, 0))
+plot(volumeConfirmed    ? 1 : 0, title = "IMB DIAG volumeConfirmed fired", color = color.new(color.lime, 0))
+plot(imbLive <= maxImbalances ? 1 : 0, title = "IMB DIAG VERDICT budget (1 = ok)", color = color.new(color.lime, 0))
+plot(imbUntouched + imbTouched == imbLive ? 1 : 0, title = "IMB DIAG VERDICT counts (1 = ok)", color = color.new(color.lime, 0))
+`;
+
 /**
  * Boosts the production visuals for legibility and appends the overlay.
  * Rewrites the constants already in the assembled text; the module file on
@@ -449,18 +478,22 @@ function applyDiagnostic(assembled) {
   // is only valid once that module has been spliced in. Guarded rather than
   // assumed, so --diagnostic keeps working while modules are still being added.
   const hasZoneModule = /array<LiquidityZone>\s+zones/.test(text);
-  const overlays = hasZoneModule
-    ? `${DIAGNOSTIC_OVERLAY}\n${ZONE_DIAGNOSTIC_OVERLAY}`
-    : DIAGNOSTIC_OVERLAY;
+  const hasImbalanceModule = /array<ImbalanceZone>\s+imbalances/.test(text);
+  const overlays = [DIAGNOSTIC_OVERLAY];
+  if (hasZoneModule) overlays.push(ZONE_DIAGNOSTIC_OVERLAY);
+  if (hasImbalanceModule) overlays.push(IMBALANCE_DIAGNOSTIC_OVERLAY);
 
   if (hasZoneModule) {
     console.log("");
-    console.log("  Liquidity Zones module present — zone diagnostics appended.");
-    console.log("  Read: LZ DIAG VERDICT budget and LZ DIAG VERDICT counts.");
-    console.log("  Both must be 1. swept zones must be > 0.");
+    console.log("  Liquidity Zones present — read LZ DIAG VERDICT budget and counts.");
+  }
+  if (hasImbalanceModule) {
+    console.log("");
+    console.log("  Imbalance Detector present — read IMB DIAG VERDICT budget and");
+    console.log("  counts, and confirm virgin gaps > 0.");
   }
 
-  return `${boosted}\n${overlays}`;
+  return `${boosted}\n${overlays.join("\n")}`;
 }
 
 // ─── Validation ──────────────────────────────────────────────────────────────
