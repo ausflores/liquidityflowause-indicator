@@ -1,0 +1,312 @@
+// ============================================================================
+// LiquidityFlowAuse — Liquidity Zones Module
+// ----------------------------------------------------------------------------
+// Module:   Liquidity Zones
+// Version:  LiquidityFlowAuse v1.0.0
+//
+// Purpose:  Builds persistent horizontal liquidity bands around confirmed
+//           swing pivots on D1, 4H and 1H, marks them when price sweeps
+//           through them, culls them by age / distance / swept-retention, and
+//           exports proximity and sweep state to the Signal Engine.
+//
+// Storage:  ONE array of a user type. A record carries price, tier, age, sweep
+//           bar and the drawing handle together, so a zone can never be
+//           half-removed and a cull can always reach its box. Parallel
+//           price/tier arrays cannot express either property.
+//
+// Direction is NOT stored. A pivot low is demand-side until price crosses it,
+// so long/short is derived from the current bar at evaluation time.
+//
+// Pine:     Pine Script v5. The //@version=5 directive is declared once in
+//           the main indicator file (src/liquidityflowause.pine); this
+//           module MUST NOT contain an indicator() or study() declaration.
+//
+// Usage:    Designed for file concatenation into the main indicator file.
+//           For a standalone syntax check in the Pine Editor, wrap the
+//           contents of this file in a temporary indicator() declaration.
+// ============================================================================
+
+// ─── User Inputs ─────────────────────────────────────────────────────────────
+
+showD1Zones = input.bool(true, "Show D1 Liquidity Zones", group="Liquidity Zones")
+showH4Zones = input.bool(true, "Show 4H Liquidity Zones", group="Liquidity Zones")
+showH1Zones = input.bool(true, "Show 1H Liquidity Zones", group="Liquidity Zones")
+
+pivotLenHigh = input.int(10,  "Pivot Length High",        minval=3, group="Liquidity Zones")
+pivotLenLow  = input.int(10,  "Pivot Length Low",         minval=3, group="Liquidity Zones")
+
+// Zone half-width is a fraction of the ATR of the TIMEFRAME THE PIVOT CAME
+// FROM. A D1 zone sized with a 5-minute volatility reading would be a hairline.
+zoneATRMult = input.float(0.5, "Zone Width (x HTF ATR)",  minval=0.1, step=0.1, group="Liquidity Zones")
+
+// Bounded by max_boxes_count=500 in the main declaration, because every cull
+// deletes its box: live boxes can never exceed maxZones.
+maxZones = input.int(50, "Max Zones", minval=10, maxval=200, group="Liquidity Zones")
+
+// Cull thresholds.
+//
+// The distance threshold is measured in 4H ATR, NOT entry-timeframe ATR. On the
+// 5-minute entry timeframe this indicator is designed for, 15 x a 5-minute ATR
+// is a tiny distance: D1 zones are born and culled on the same bar and the tier
+// hierarchy silently collapses. Nothing errors — D1 liquidity just goes missing
+// and reads as normal behaviour. Anchoring to 4H makes "15 ATR of distance"
+// mean the same thing on any chart timeframe, so a D1 zone survives on 5m the
+// way it does on 1h.
+maxZoneAgeBars     = input.int(500,   "Max Zone Age (bars)",          minval=50,   group="Liquidity Zones")
+maxZoneDistanceATR = input.float(15.0, "Max Zone Distance (x 4H ATR)", minval=5.0,  step=1.0, group="Liquidity Zones")
+sweptRetainBars    = input.int(100,   "Swept Zone Retention (bars)", minval=10,   group="Liquidity Zones")
+
+// Evaluation thresholds. Both measure on the ENTRY timeframe, because that is
+// the timeframe on which price is being judged: a D1 ATR here would make a
+// 5-minute approach to a zone look like nothing.
+proxATRMult = input.float(3.0, "Proximity (x ATR)", minval=0.5, step=0.5, group="Liquidity Zones")
+sweepWindow = input.int(10,   "Sweep Signal Window (bars)", minval=1, group="Liquidity Zones")
+
+// ─── Zone Record ─────────────────────────────────────────────────────────────
+
+type LiquidityZone
+    float center
+    float halfWidth
+    int   tier
+    int   bornBar
+    int   sweptBar       // bar_index of the sweep; na while untested
+    box   zoneBox
+
+var array<LiquidityZone> zones = array.new<LiquidityZone>()
+
+// ─── Higher-Timeframe Data ───────────────────────────────────────────────────
+//
+// NO [1] OFFSET ON PIVOTS OR ATR. ta.pivothigh()/ta.pivotlow() are already
+// non-repainting: they return a value only on the bar where the pivot is
+// confirmed and na afterwards. ta.atr() is a confirmed-bar function. With
+// lookahead=barmerge.lookahead_off, request.security() exposes a higher-
+// timeframe value only after that timeframe's bar has closed, so in-progress
+// data cannot leak either. The [1] pattern applies to DIRECT OHLC access,
+// where you explicitly want the previously confirmed bar; adding it here would
+// delay every zone by a full extra higher-timeframe bar for no gain.
+//
+// 1H data is required: without it nearH1Liquidity could never become true,
+// because nothing would ever populate a tier-3 zone.
+
+d1_pivotHigh = request.security(syminfo.tickerid, "D",   ta.pivothigh(high, pivotLenHigh, pivotLenHigh), lookahead=barmerge.lookahead_off)
+d1_pivotLow  = request.security(syminfo.tickerid, "D",   ta.pivotlow(low,  pivotLenLow,  pivotLenLow),  lookahead=barmerge.lookahead_off)
+h4_pivotHigh = request.security(syminfo.tickerid, "240", ta.pivothigh(high, pivotLenHigh, pivotLenHigh), lookahead=barmerge.lookahead_off)
+h4_pivotLow  = request.security(syminfo.tickerid, "240", ta.pivotlow(low,  pivotLenLow,  pivotLenLow),  lookahead=barmerge.lookahead_off)
+h1_pivotHigh = request.security(syminfo.tickerid, "60",  ta.pivothigh(high, pivotLenHigh, pivotLenHigh), lookahead=barmerge.lookahead_off)
+h1_pivotLow  = request.security(syminfo.tickerid, "60",  ta.pivotlow(low,  pivotLenLow,  pivotLenLow),  lookahead=barmerge.lookahead_off)
+
+atrD1 = request.security(syminfo.tickerid, "D",   ta.atr(14), lookahead=barmerge.lookahead_off)
+atrH4 = request.security(syminfo.tickerid, "240", ta.atr(14), lookahead=barmerge.lookahead_off)
+atrH1 = request.security(syminfo.tickerid, "60",  ta.atr(14), lookahead=barmerge.lookahead_off)
+
+atrChart = ta.atr(14)
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+//
+// Both helpers are READ-ONLY with respect to `zones`. Every mutation —
+// box.delete, array.push, array.remove — happens in global scope in the
+// creation block below, not inside a function. See the note on that block for
+// why.
+
+// Creates the band for a new zone. Persistent band, not a fixed-size box:
+// xloc = bar_index pins the left edge at the confirmation bar and
+// extend = right stretches the right edge to the current bar, so the band grows
+// as the chart advances and vanishes when the record is culled. An earlier
+// draft made a 40-bar box reaching 20 bars into the future, which neither
+// persisted nor tracked price.
+//
+// Tier drives visual weight: higher timeframe = more significance = heavier
+// stroke and less transparency.
+f_newZone(int tier, float center, float halfWidth) =>
+    color border = tier == 1 ? color.new(color.red, 60) : tier == 2 ? color.new(color.red, 75) : color.new(color.red, 88)
+    color fill   = tier == 1 ? color.new(color.red, 92) : tier == 2 ? color.new(color.red, 94) : color.new(color.red, 96)
+    int   width  = tier == 1 ? 2 : 1
+    box.new(
+         bar_index, center + halfWidth,
+         bar_index, center - halfWidth,
+         border_color = border,
+         border_width = width,
+         border_style = line.style_dashed,
+         bgcolor      = fill,
+         xloc         = xloc.bar_index,
+         extend       = extend.right)
+
+// Index of the zone with the lowest bornBar.
+//
+// PRECONDITION: array.size(zones) >= 1. The only call site guards on
+// `array.size(zones) >= maxZones`, and maxZones has minval=10, so the array
+// always holds at least ten records here. The loop bound is written
+// `array.size(zones) - 1`; with an empty array Pine would count DOWN from 1 to
+// -1 and read index -1, so this precondition must not be relaxed.
+f_oldestIndex() =>
+    int oldest = 0
+    for k = 1 to array.size(zones) - 1
+        if array.get(zones, k).bornBar < array.get(zones, oldest).bornBar
+            oldest := k
+    oldest
+
+// ─── Zone Creation ───────────────────────────────────────────────────────────
+//
+// Confirmed pivots, in tier order, at most one zone each per bar.
+//
+// A brand-new pivot is always more relevant than a zone hundreds of bars old,
+// so when the array is full the OLDEST zone is evicted — box deleted, record
+// removed — and the new zone is added regardless. The earlier
+// `if array.size(zones) < maxZones` guard silently DROPPED the new zone
+// precisely when the array was full, which is backwards. Eviction is done
+// before the push, so the push can never evict the record it just created.
+//
+// All mutation is at global scope by design. Pine v5 functions CAN modify the
+// contents of a global array — array.set()/array.push() on a global array from
+// inside a function is legal — so the spec's f_addZone -> f_makeRoom chain would
+// have compiled. It is avoided here anyway, for two reasons. First, the helpers
+// stay pure, so every write to `zones` is visible in one block instead of spread
+// across a call graph. Second, the obvious way to keep a mutating f_addZone is
+// to have it RETURN a LiquidityZone, which makes the compiler infer a UDT return
+// type across a conditional — an inference this module otherwise never needs.
+// Inlining the push also collapses six near-identical blocks into one loop,
+// with identical eviction semantics.
+
+// Built with array.new + array.push rather than array.from(). array.from() is
+// documented only with simple values, and these are `series` float — it
+// returns the result of request.security(), which is a series by definition.
+// The qualifier documentation does not state whether array.from() accepts
+// series arguments, and this module cannot be compile-checked locally, so the
+// ambiguity is removed rather than risked. array.new / array.push / array.clear
+// are unambiguously series-safe. Folding the enable toggles in here also
+// removes the tierOn ternary from the loop below.
+var array<float> confirmedPivots = array.new<float>()
+confirmedPivots.clear()
+array.push(confirmedPivots, showD1Zones ? d1_pivotHigh : na)
+array.push(confirmedPivots, showD1Zones ? d1_pivotLow  : na)
+array.push(confirmedPivots, showH4Zones ? h4_pivotHigh : na)
+array.push(confirmedPivots, showH4Zones ? h4_pivotLow  : na)
+array.push(confirmedPivots, showH1Zones ? h1_pivotHigh : na)
+array.push(confirmedPivots, showH1Zones ? h1_pivotLow  : na)
+
+for k = 0 to array.size(confirmedPivots) - 1
+    float pivotPrice = array.get(confirmedPivots, k)
+    int   tierOf     = k < 2 ? 1 : k < 4 ? 2 : 3
+    float atrOfTier  = k < 2 ? atrD1 : k < 4 ? atrH4 : atrH1
+
+    if not na(pivotPrice) and not na(atrOfTier)
+        float halfW = atrOfTier * zoneATRMult
+
+        if array.size(zones) >= maxZones
+            int evictIdx = f_oldestIndex()
+            box.delete(array.get(zones, evictIdx).zoneBox)
+            array.remove(zones, evictIdx)
+
+        array.push(zones, LiquidityZone.new(pivotPrice, halfW, tierOf, bar_index, na, f_newZone(tierOf, pivotPrice, halfW)))
+
+// ─── Sweep Marking ───────────────────────────────────────────────────────────
+//
+// A sweep does NOT remove a zone — it MARKS it. The premise of this indicator
+// is that price travels to hunt liquidity, so the sweep is the event of
+// interest, not the end of the zone's life. Deleting on first touch would
+// destroy the one fact the Signal Engine most wants: that a sweep just
+// happened, and where. Retention is bounded by sweptRetainBars below, which
+// is deliberately shorter than maxZoneAgeBars because a swept zone has a short
+// useful life while an untouched one is still a target that may be approached.
+//
+// Runs AFTER creation, so a zone born and swept on the same bar is marked
+// rather than surviving untouched. Fields of a user type are immutable, so
+// setting sweptBar means replacing the whole record and carrying the existing
+// box handle across. Forward iteration is safe: nothing is removed here.
+
+if array.size(zones) > 0
+    for i = 0 to array.size(zones) - 1
+        LiquidityZone zm = array.get(zones, i)
+
+        bool inBodyM = high >= zm.center - zm.halfWidth and low <= zm.center + zm.halfWidth
+
+        if inBodyM and na(zm.sweptBar)
+            array.set(zones, i, LiquidityZone.new(zm.center, zm.halfWidth, zm.tier, zm.bornBar, bar_index, zm.zoneBox))
+
+// ─── Culling ─────────────────────────────────────────────────────────────────
+//
+// Three independent rules, any one of which retires a zone:
+//
+//   age    — older than maxZoneAgeBars. Stops unbounded accumulation.
+//   dist   — further than maxZoneDistanceATR x 4H ATR from price. A zone that
+//            far away is no longer actionable. Anchored to 4H rather than the
+//            entry timeframe so the threshold is timeframe-independent; see
+//            the note on the input declaration.
+//   stale  — swept longer ago than sweptRetainBars.
+//
+// Every cull MUST call box.delete() first. Removing the record without it
+// leaves a box on the chart that no longer participates in proximity logic: a
+// visual and logical divergence, and the bug present in an earlier draft.
+//
+// BACKWARD iteration is mandatory — array.remove() shifts the tail down, so a
+// forward loop skips the element after each removal.
+
+if array.size(zones) > 0
+    for i = array.size(zones) - 1 to 0
+        LiquidityZone zc = array.get(zones, i)
+
+        bool tooOld = bar_index - zc.bornBar > maxZoneAgeBars
+        bool tooFar = not na(atrH4) and math.abs(close - zc.center) > atrH4 * maxZoneDistanceATR
+        bool stale  = not na(zc.sweptBar) and bar_index - zc.sweptBar > sweptRetainBars
+
+        if tooOld or tooFar or stale
+            box.delete(zc.zoneBox)
+            array.remove(zones, i)
+
+// ─── Module Outputs (Signal Engine Interface) ────────────────────────────────
+//
+//   nearLiquidityLong   price is near untested demand-side liquidity below it
+//   nearLiquidityShort  price is near untested supply-side liquidity above it
+//   sweptLong           demand-side liquidity below was swept within sweepWindow
+//   sweptShort          supply-side liquidity above was swept within sweepWindow
+//   nearD1Liquidity     that proximity is to a D1  (tier 1) zone
+//   nearH4Liquidity     that proximity is to a 4H  (tier 2) zone
+//   nearH1Liquidity     that proximity is to a 1H  (tier 3) zone
+//
+// Recomputed from scratch every bar, so no var keyword. All seven are declared
+// before the proximity block that assigns them, and are read by the Signal
+// Engine after this module is spliced in.
+//
+// PROXIMITY AND SWEEP ARE MUTUALLY EXCLUSIVE on a given bar: proximity
+// requires the bar's range to be OUTSIDE the zone body, so once price reaches
+// the body the zone is swept and reports through swept* instead. That is what
+// stops one event being scored as both "approaching liquidity" and "took
+// liquidity" in the three-factor confluence.
+//
+// SWEEP DIRECTION comes from the zone's position at sweep time, not from the
+// bar's direction. A zone below price that gets swept is demand-side liquidity
+// taken whether the bar closed up or down; the reversal that may follow is
+// the Structure Break module's concern, not this one's.
+
+bool nearLiquidityLong  = false
+bool nearLiquidityShort = false
+bool sweptLong          = false
+bool sweptShort         = false
+bool nearD1Liquidity    = false
+bool nearH4Liquidity    = false
+bool nearH1Liquidity    = false
+
+if array.size(zones) > 0 and not na(atrChart)
+    for i = 0 to array.size(zones) - 1
+        LiquidityZone zp = array.get(zones, i)
+
+        bool inBodyP = high >= zp.center - zp.halfWidth and low <= zp.center + zp.halfWidth
+        bool nearP   = math.abs(close - zp.center) <= atrChart * proxATRMult
+
+        if not na(zp.sweptBar) and bar_index - zp.sweptBar <= sweepWindow
+            if zp.center < close
+                sweptLong := true
+            else
+                sweptShort := true
+
+        if nearP and not inBodyP
+            if zp.center < close
+                nearLiquidityLong := true
+            else
+                nearLiquidityShort := true
+
+            // Tier flags describe the proximity, not the side, so they are set
+            // once for both directions.
+            nearD1Liquidity := nearD1Liquidity or zp.tier == 1
+            nearH4Liquidity := nearH4Liquidity or zp.tier == 2
+            nearH1Liquidity := nearH1Liquidity or zp.tier == 3

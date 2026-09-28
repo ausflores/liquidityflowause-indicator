@@ -1,0 +1,28 @@
+//@version=5
+indicator("LiquidityFlowAuse", overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=500)
+
+// ============================================================================
+// LiquidityFlowAuse — Main Indicator File
+// ----------------------------------------------------------------------------
+// Version:  LiquidityFlowAuse v1.0.0
+// Pine:     Pine Script v5
+//
+// Multi-timeframe confluence indicator for TradingView. Combines liquidity
+// proximity, session alignment, and imbalance/structure-break confirmation
+// into LONG/SHORT entry zones for cryptocurrency markets.
+//
+// This file is the concatenation root: module files from src/modules/ are
+// pasted below their markers to build the production script.
+// ============================================================================
+
+// ─── Module: Session Markers ────────────────────────────────────────────────
+// [CONCATENATION POINT] Paste the full contents of
+// src/modules/session-markers.pine below this comment block to include
+// session detection, session scoring, and session visual rendering
+// (background tints and boundary lines).
+//
+// Module outputs consumed by downstream modules:
+//   inAsia, inLondon, inNY, inOverlap (bool) — session membership flags
+//   sessionStrength   (int, 0-8)     — session conviction score
+//   sessionMultiplier (float, 0.3-1.5) — signal confidence weighting
+// ────────────────────────────────────────────────────────────────────────────

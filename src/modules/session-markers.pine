@@ -1,0 +1,134 @@
+// ============================================================================
+// LiquidityFlowAuse — Session Markers Module
+// ----------------------------------------------------------------------------
+// Module:   Session Markers
+// Version:  LiquidityFlowAuse v1.0.0
+//
+// Purpose:  Detects which traditional market session(s) — Asia, London,
+//           New York, or the London + New York overlap — are active on the
+//           current bar, using configurable session windows and timezone.
+//           Renders visual cues (background tints and boundary lines) and
+//           produces the sessionStrength score and sessionMultiplier for
+//           downstream Signal Engine consumption.
+//
+// Pine:     Pine Script v5. The //@version=5 directive is declared once in
+//           the main indicator file (src/liquidityflowause.pine); this
+//           module MUST NOT contain an indicator() or study() declaration.
+//
+// Usage:    Designed for file concatenation into the main indicator file.
+//           For a standalone syntax check in the Pine Editor, wrap the
+//           contents of this file in a temporary indicator() declaration.
+// ============================================================================
+
+// ─── User Inputs ─────────────────────────────────────────────────────────────
+
+sessionAsiaEnabled   = input.bool(true, "Enable Asia Session", group="Sessions")
+sessionLondonEnabled = input.bool(true, "Enable London Session", group="Sessions")
+sessionNYEnabled     = input.bool(true, "Enable New York Session", group="Sessions")
+showOverlapOnly      = input.bool(false, "Show Overlap Only (Lon+NY)", group="Sessions")
+
+sessionTimezone = input.string("exchange", "Session Timezone", group="Sessions", options=["exchange", "UTC", "America/New_York", "Europe/London", "Asia/Tokyo"])
+
+// Session windows are RECURRING daily boundaries, not absolute instants, so
+// they use input.session() (returns a valid session string such as
+// "0000-0900:1234567") rather than input.time() (returns an absolute UNIX
+// timestamp). input.session() defaults to days 1234567 (Sun-Sat) in Pine v5,
+// which matches 24/7 crypto markets.
+asiaSession   = input.session("0000-0900", "Asia Session", group="Sessions")
+londonSession = input.session("0700-1600", "London Session", group="Sessions")
+nySession     = input.session("1300-2200", "New York Session", group="Sessions")
+
+// ─── Color Constants ─────────────────────────────────────────────────────────
+
+COLOR_ASIA_TINT    = color.new(color.purple, 96)
+COLOR_LONDON_TINT  = color.new(color.blue, 94)
+COLOR_NY_TINT      = color.new(color.orange, 94)
+COLOR_OVERLAP_TINT = color.new(color.yellow, 92)
+
+COLOR_ASIA_LINE    = color.purple
+COLOR_LONDON_LINE  = color.blue
+COLOR_NY_LINE      = color.orange
+
+// ─── Session Membership ──────────────────────────────────────────────────────
+// A bar is inside a session when time() returns a non-na timestamp for that
+// bar, evaluated in the user-selected timezone. The session string itself
+// carries the half-open interval [start, end): start inclusive, end exclusive.
+//
+// TIMEZONE CONSTRAINT: time()'s timezone argument accepts only UTC/GMT
+// notation ("UTC-5", "GMT+0530") or an IANA zone name ("America/New_York").
+// "exchange" is NOT accepted and raises a runtime error on bar 0. The
+// exchange timezone is what time() uses when the argument is omitted, so
+// "exchange" is served through the two-argument overload instead.
+
+bool inAsia   = false
+bool inLondon = false
+bool inNY     = false
+
+bool useExchangeTz = sessionTimezone == "exchange"
+
+if not na(sessionTimezone)
+    inAsia   := sessionAsiaEnabled   and (useExchangeTz ? not na(time(timeframe.period, asiaSession))   : not na(time(timeframe.period, asiaSession,   sessionTimezone)))
+    inLondon := sessionLondonEnabled and (useExchangeTz ? not na(time(timeframe.period, londonSession)) : not na(time(timeframe.period, londonSession, sessionTimezone)))
+    inNY     := sessionNYEnabled     and (useExchangeTz ? not na(time(timeframe.period, nySession))     : not na(time(timeframe.period, nySession,     sessionTimezone)))
+
+// Overlap is a derived state: both constituent sessions enabled AND active.
+bool inOverlap = sessionLondonEnabled and sessionNYEnabled and inLondon and inNY
+
+// ─── Scoring (Signal Engine Interface) ───────────────────────────────────────
+
+// Module-level outputs consumed by the Signal Engine when this module is
+// concatenated. Recomputed from scratch on every bar, so no var keyword: both
+// values are derived entirely from the current bar's membership flags.
+//   sessionStrength   (int,   0-8)     — session conviction score
+//   sessionMultiplier (float, 0.3-1.5) — signal confidence weighting
+
+int sessionStrength = 0
+if inAsia
+    sessionStrength += 1
+if inLondon
+    sessionStrength += 2
+if inNY
+    sessionStrength += 2
+if inOverlap
+    sessionStrength += 3
+
+float sessionMultiplier = 0.3
+if inOverlap
+    sessionMultiplier := 1.5
+else if inLondon or inNY
+    sessionMultiplier := 1.0
+else if inAsia
+    sessionMultiplier := 0.5
+
+// ─── Background Tint ────────────────────────────────────────────────────────
+// One color per bar. Priority chain: Overlap > London/NY > Asia.
+// showOverlapOnly suppresses every tint except the Lon+NY overlap.
+
+// Pine v5 does not allow `else <condition>` to open an indented block, so the
+// terminal Asia case is expressed with the ternary operator rather than a
+// fourth else-branch.
+
+color bgColor = na
+if showOverlapOnly
+    bgColor := inOverlap ? COLOR_OVERLAP_TINT : na
+else
+    bgColor := inOverlap     ? COLOR_OVERLAP_TINT :
+               inLondon      ? COLOR_LONDON_TINT :
+               inNY          ? COLOR_NY_TINT     :
+               inAsia        ? COLOR_ASIA_TINT   : na
+
+bgcolor(bgColor, title="Session Background")
+
+// ─── Session Boundary Lines ──────────────────────────────────────────────────
+// Vertical dotted line on the OPENING bar of each session only. ta.change()
+// fires on BOTH edges, so the `and inX` conjunct is required to suppress the
+// closing-bar line. Unaffected by showOverlapOnly.
+
+if sessionAsiaEnabled and ta.change(inAsia) and inAsia
+    line.new(bar_index, low, bar_index, high, color=COLOR_ASIA_LINE, style=line.style_dotted, width=1)
+
+if sessionLondonEnabled and ta.change(inLondon) and inLondon
+    line.new(bar_index, low, bar_index, high, color=COLOR_LONDON_LINE, style=line.style_dotted, width=1)
+
+if sessionNYEnabled and ta.change(inNY) and inNY
+    line.new(bar_index, low, bar_index, high, color=COLOR_NY_LINE, style=line.style_dotted, width=1)
