@@ -308,13 +308,29 @@ sessionTimezone     = input.string("exchange", "Session Timezone",
                      options=["exchange", "UTC", "America/New_York", "Europe/London", "Asia/Tokyo"], 
                      group="Sessions")
 
-// Session times (in the selected timezone)
-asiaStart     = input.time("00:00", "Asia Start",  group="Sessions")
-asiaEnd       = input.time("09:00", "Asia End",    group="Sessions")
-londonStart   = input.time("07:00", "London Start", group="Sessions")
-londonEnd     = input.time("16:00", "London End",  group="Sessions")
-nyStart       = input.time("13:00", "NY Start",    group="Sessions")
-nyEnd         = input.time("22:00", "NY End",      group="Sessions")
+// Session windows, in the selected timezone.
+// These are RECURRING daily boundaries, not absolute instants, so they use
+// input.session() — whose defval is a session string — not input.time(), whose
+// defval is an int UNIX timestamp. Pine v5 defaults session days to 1234567
+// (Sun-Sat), which matches 24/7 crypto markets.
+asiaSession   = input.session("0000-0900", "Asia Session",  group="Sessions")
+londonSession = input.session("0700-1600", "London Session", group="Sessions")
+nySession     = input.session("1300-2200", "New York Session", group="Sessions")
+```
+
+**Timezone constraint:** `time()`'s timezone argument accepts only UTC/GMT
+notation (`"UTC-5"`, `"GMT+0530"`) or an IANA zone name (`"America/New_York"`).
+`"exchange"` is **not** accepted and raises a runtime error on bar 0, even
+though it compiles. Since `time()` uses the exchange timezone when the argument
+is omitted, `"exchange"` is routed through the two-argument overload:
+
+```pine
+bool useExchangeTz = sessionTimezone == "exchange"
+
+if not na(sessionTimezone)
+    inAsia := sessionAsiaEnabled and (useExchangeTz
+        ? not na(time(timeframe.period, asiaSession))
+        : not na(time(timeframe.period, asiaSession, sessionTimezone)))
 ```
 
 ### 4.4 Session Detection Logic
@@ -359,14 +375,27 @@ else if inAsia
 
 bgcolor(bgColor, title="Session Background")
 
-// Session boundary lines
-if sessionAsiaEnabled and ta.change(inAsia)
+// Session boundary lines — opening bar of each session only.
+// ta.change() fires on BOTH the opening and the closing edge, so the `and inX`
+// conjunct is required. Without it every session window draws two lines instead
+// of one.
+if sessionAsiaEnabled and ta.change(inAsia) and inAsia
     line.new(bar_index, low, bar_index, high, color=color.purple, style=line.style_dotted, width=1)
-if sessionLondonEnabled and ta.change(inLondon)
+if sessionLondonEnabled and ta.change(inLondon) and inLondon
     line.new(bar_index, low, bar_index, high, color=color.blue, style=line.style_dotted, width=1)
-if sessionNYEnabled and ta.change(inNY)
+if sessionNYEnabled and ta.change(inNY) and inNY
     line.new(bar_index, low, bar_index, high, color=color.orange, style=line.style_dotted, width=1)
 ```
+
+**Note on the background tint chain above:** the Asia branch is written as a
+ternary rather than a fourth `else` branch, because Pine v5 has no
+`else <condition>` form that opens an indented block.
+
+**Note on boundary line geometry:** `line.new(bar_index, low, bar_index, high)`
+spans only the opening bar's low-to-high range. These are short vertical
+segments, not full-height dividers. The indicator declares `max_lines_count=500`;
+on low timeframes across long ranges Pine drops the oldest lines, so boundary
+lines become unreliable past roughly 500 session opens.
 
 ### 4.6 Session-Based Signal Weighting
 
@@ -778,12 +807,10 @@ showOverlapOnly      = input.bool(false, "Highlight Overlap Only", group="Sessio
 sessionTimezone      = input.string("exchange", "Session Timezone", 
                      options=["exchange", "UTC", "America/New_York", "Europe/London", "Asia/Tokyo"], 
                      group="Sessions")
-asiaStart   = input.time("00:00", "Asia Start",   group="Sessions")
-asiaEnd     = input.time("09:00", "Asia End",     group="Sessions")
-londonStart = input.time("07:00", "London Start", group="Sessions")
-londonEnd   = input.time("16:00", "London End",   group="Sessions")
-nyStart     = input.time("13:00", "NY Start",     group="Sessions")
-nyEnd       = input.time("22:00", "NY End",       group="Sessions")
+// Session windows use input.session(), not input.time() — see section 4.3.
+asiaSession   = input.session("0000-0900", "Asia Session",   group="Sessions")
+londonSession = input.session("0700-1600", "London Session", group="Sessions")
+nySession     = input.session("1300-2200", "New York Session", group="Sessions")
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // GROUP: Imbalances
