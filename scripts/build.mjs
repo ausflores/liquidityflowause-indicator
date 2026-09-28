@@ -249,6 +249,14 @@ if ta.change(diagActive)
 // (open, close) but should draw exactly one line. The counters are independent
 // of the production guard: "edges" counts bare ta.change() transitions, while
 // "lines" counts only what the guarded condition actually drew.
+//
+// bar_index > 0 EXCLUDES THE FIRST BAR OF THE VISIBLE RANGE. Its previous
+// value is na, so ta.change() reports a transition that never happened. When
+// the chart opens mid-session that inflates the edge count for that one session
+// only — observed as NY reading 43 edges against 21 lines while Asia and
+// London balanced at 42/21 on the same chart. Excluding bar 0 removes the
+// artifact without hiding a real defect, because a real guard failure shifts
+// edges and lines together on every window, not on one boundary bar.
 var int diagAsiaEdges  = 0
 var int diagAsiaLines  = 0
 var int diagLondonEdges = 0
@@ -256,18 +264,19 @@ var int diagLondonLines = 0
 var int diagNYEdges    = 0
 var int diagNYLines    = 0
 
-if sessionAsiaEnabled and ta.change(inAsia)
-    diagAsiaEdges += 1
-    if inAsia
-        diagAsiaLines += 1
-if sessionLondonEnabled and ta.change(inLondon)
-    diagLondonEdges += 1
-    if inLondon
-        diagLondonLines += 1
-if sessionNYEnabled and ta.change(inNY)
-    diagNYEdges += 1
-    if inNY
-        diagNYLines += 1
+if bar_index > 0
+    if sessionAsiaEnabled and ta.change(inAsia)
+        diagAsiaEdges += 1
+        if inAsia
+            diagAsiaLines += 1
+    if sessionLondonEnabled and ta.change(inLondon)
+        diagLondonEdges += 1
+        if inLondon
+            diagLondonLines += 1
+    if sessionNYEnabled and ta.change(inNY)
+        diagNYEdges += 1
+        if inNY
+            diagNYLines += 1
 
 plot(diagAsiaEdges,   title = "DIAG Asia edges (expect 2x lines)", color = color.new(color.purple, 0))
 plot(diagAsiaLines,   title = "DIAG Asia lines (drawn)",            color = color.new(color.purple, 0))
@@ -277,9 +286,12 @@ plot(diagNYEdges,     title = "DIAG NY edges (expect 2x lines)",     color = col
 plot(diagNYLines,     title = "DIAG NY lines (drawn)",               color = color.new(color.orange, 0))
 
 // Single verdict line, so the check does not require reading six numbers.
-bool diagGuardHolds = diagAsiaEdges == diagAsiaLines * 2 and
+// The assertion is edges === 2 x lines: every window has two edges but must
+// draw exactly one line. A broken guard shifts both counters together on every
+// window, which fails this check on all three sessions at once.
+bool diagGuardHolds = diagAsiaEdges   == diagAsiaLines   * 2 and
                       diagLondonEdges == diagLondonLines * 2 and
-                      diagNYEdges == diagNYLines * 2
+                      diagNYEdges     == diagNYLines     * 2
 
 plot(diagGuardHolds ? 1 : 0, title = "DIAG VERDICT (1 = guard correct)", color = color.new(color.lime, 0))
 bgcolor(diagGuardHolds ? color.new(color.lime, 90) : na, title="DIAG verdict tint")
