@@ -99,8 +99,6 @@ indicator("LiquidityFlowAuse", overlay=true, max_labels_count=500, max_lines_cou
 d1_close   = request.security(syminfo.tickerid, "D", close[1],  lookahead=barmerge.lookahead_off)
 d1_high    = request.security(syminfo.tickerid, "D", high[1],   lookahead=barmerge.lookahead_off)
 d1_low     = request.security(syminfo.tickerid, "D", low[1],    lookahead=barmerge.lookahead_off)
-d1_pivotH  = request.security(syminfo.tickerid, "D", pivotHigh, lookahead=barmerge.lookahead_off)
-d1_pivotL  = request.security(syminfo.tickerid, "D", pivotLow,  lookahead=barmerge.lookahead_off)
 
 // 4H data — intermediate context
 h4_close   = request.security(syminfo.tickerid, "240", close[1], lookahead=barmerge.lookahead_off)
@@ -111,20 +109,32 @@ h4_low     = request.security(syminfo.tickerid, "240", low[1],   lookahead=barme
 h1_close   = request.security(syminfo.tickerid, "60", close[1],  lookahead=barmerge.lookahead_off)
 h1_high    = request.security(syminfo.tickerid, "60", high[1],   lookahead=barmerge.lookahead_off)
 h1_low     = request.security(syminfo.tickerid, "60", low[1],    lookahead=barmerge.lookahead_off)
+
+// Pivot values are fetched separately in section 3.2.1, and deliberately
+// without the [1] offset: ta.pivothigh()/ta.pivotlow() are already
+// non-repainting, so lookahead_off alone is sufficient. Referencing bare
+// `pivotHigh` / `pivotLow` identifiers here, as an earlier draft did, resolved
+// to nothing and could not compile.
 ```
 
 **Key design decision:** We use `[1]` offset (previous confirmed bar) to avoid intra-bar repainting. The indicator refreshes on each tick for visual smoothness but only **confirms signals on bar close**.
+
+**Where `[1]` does and does not apply.** The offset is for direct OHLC access,
+where the previously confirmed bar is specifically wanted. It is *not* a blanket
+rule: expressions that are already non-repainting — `ta.pivothigh()`,
+`ta.pivotlow()`, `ta.atr()` — do not need it, and adding one would delay
+detection by a full higher-timeframe bar for no gain. See section 3.2.1.
 
 ### 2.3 State Management
 
 Because Pine Script executes top-to-bottom on each bar, we use `var` to maintain persistent state across bars:
 
 ```pine
-// Persistent state for liquidity zones
-var box[]    liquidityZonesLong  = array.new_box()
-var box[]    liquidityZonesShort = array.new_box()
-var float[]  zonePrices          = array.new_float()
-var int[]    zoneTiers            = array.new_int()  // 1=D1, 2:4H, 3:1H
+// Liquidity zones are held in one array of a user type, declared in section 3.2.2.
+// A single record carries price, tier, age and the drawing handle, so a zone
+// cannot be half-removed and a cull can always delete its box. Parallel
+// price/tier arrays — as in earlier drafts — cannot express that.
+var array<LiquidityZone> zones = array.new<LiquidityZone>()
 
 // Persistent state for structure tracking
 var float swingHighPrice = na
@@ -164,53 +174,122 @@ Price is magnetically drawn to these zones to "sweep" liquidity before reversing
 
 #### 3.2.1 Pivot-Based Detection
 
-We use Pine Script's built-in `ta.pivothigh()` and `ta.pivotlow()` to identify swing points on D1 and 4H:
+We use Pine Script's built-in `ta.pivothigh()` and `ta.pivotlow()` to identify swing
+points on all three higher timeframes.
+
+**Lookahead note.** `ta.pivothigh()` is intrinsically non-repainting: it only
+returns a value on the bar where the pivot is confirmed, and `na` afterwards.
+Combined with `barmerge.lookahead_off` that is sufficient on its own, so **no
+`[1]` offset is applied to the pivot expressions**. The `[1]` pattern documented
+in section 2.2 applies to direct OHLC access, where you explicitly want the
+previously confirmed bar; adding it to a pivot would delay detection by a whole
+extra higher-timeframe bar for no benefit.
+
+The same reasoning applies to the ATR fetches below: with `lookahead_off`,
+`request.security()` only exposes a higher-timeframe value once that timeframe's
+bar has closed, so in-progress data cannot leak and no extra offset is needed.
 
 ```pine
-// Pivot detection parameters
+// Pivot detection parameters — applied consistently to all three timeframes.
 pivotLenHigh = input.int(10, "Pivot Length High", minval=3, group="Liquidity Zones")
 pivotLenLow  = input.int(10, "Pivot Length Low",  minval=3, group="Liquidity Zones")
 
-// On D1 timeframe (fetched via security)
-d1_pivotHigh = request.security(syminfo.tickerid, "D", ta.pivothigh(high, pivotLenHigh, pivotLenHigh), lookahead=barmerge.lookahead_off)
-d1_pivotLow  = request.security(syminfo.tickerid, "D", ta.pivotlow(low, pivotLenLow, pivotLenLow),   lookahead=barmerge.lookahead_off)
+// D1 — major liquidity
+d1_pivotHigh = request.security(syminfo.tickerid, "D",   ta.pivothigh(high, pivotLenHigh, pivotLenHigh), lookahead=barmerge.lookahead_off)
+d1_pivotLow  = request.security(syminfo.tickerid, "D",   ta.pivotlow(low,  pivotLenLow,  pivotLenLow),  lookahead=barmerge.lookahead_off)
 
-// On 4H timeframe
-h4_pivotHigh = request.security(syminfo.tickerid, "240", ta.pivothigh(high, 8, 8), lookahead=barmerge.lookahead_off)
-h4_pivotLow  = request.security(syminfo.tickerid, "240", ta.pivotlow(low, 8, 8),   lookahead=barmerge.lookahead_off)
+// 4H — intermediate liquidity
+h4_pivotHigh = request.security(syminfo.tickerid, "240", ta.pivothigh(high, pivotLenHigh, pivotLenHigh), lookahead=barmerge.lookahead_off)
+h4_pivotLow  = request.security(syminfo.tickerid, "240", ta.pivotlow(low,  pivotLenLow,  pivotLenLow),  lookahead=barmerge.lookahead_off)
+
+// 1H — local liquidity. Required for tier 3; without it nearH1Liquidity can
+// never become true, because nothing ever populates a tier-3 zone.
+h1_pivotHigh = request.security(syminfo.tickerid, "60",  ta.pivothigh(high, pivotLenHigh, pivotLenHigh), lookahead=barmerge.lookahead_off)
+h1_pivotLow  = request.security(syminfo.tickerid, "60",  ta.pivotlow(low,  pivotLenLow,  pivotLenLow),  lookahead=barmerge.lookahead_off)
 ```
 
 #### 3.2.2 Zone Construction
 
-When a pivot is confirmed, we construct a liquidity zone around it:
+When a pivot is confirmed, a liquidity zone is constructed around it.
+
+**Storage.** A single `array<LiquidityZone>` holds every zone, rather than the
+parallel `zonePrices` / `zoneTiers` arrays used in earlier drafts plus separate
+box arrays. Parallel arrays must be mutated in lockstep and offer no way to
+reach the `box` object needed for deletion; a user type keeps price, tier, age
+and drawing handle on one record, so a zone cannot desynchronise and can always
+be removed cleanly.
+
+**One array, not two.** Direction is not baked in at creation. A pivot low sits
+below price until price crosses it, at which point it is no longer demand-side
+liquidity — so demand/supply is derived from the current bar at evaluation time
+(see 3.3) instead of being frozen into the record.
 
 ```pine
-// Zone width as ATR multiple — ATR per timeframe for correct sizing
-zoneATRMult = input.float(0.5, "Zone Width (× ATR)", minval=0.1, step=0.1, group="Liquidity Zones")
-atrCurrent  = ta.atr(14)  // current timeframe ATR
-atrD1       = request.security(syminfo.tickerid, "D", ta.atr(14)[1],  lookahead=barmerge.lookahead_off)
-atrH1       = request.security(syminfo.tickerid, "60", ta.atr(14)[1], lookahead=barmerge.lookahead_off)
+type LiquidityZone
+    float center
+    float halfWidth
+    int   tier
+    int   bornBar
+    int   lastTestedBar
+    box   zoneBox
 
-// Max zones to prevent array overflow
-maxZones = input.int(50, "Max Zones", minval=10, maxval=200, group="Liquidity Zones")
+var array<LiquidityZone> zones = array.new<LiquidityZone>()
 
-// When a new D1 pivot high is confirmed
+// Zone width is sized with the ATR of the timeframe the pivot came from, so a
+// D1 zone is not sized with a 5-minute volatility reading.
+zoneATRMult = input.float(0.5, "Zone Width (× HTF ATR)", minval=0.1, step=0.1, group="Liquidity Zones")
+maxZones    = input.int(50, "Max Zones", minval=10, maxval=200, group="Liquidity Zones")
+
+atrD1 = request.security(syminfo.tickerid, "D",   ta.atr(14), lookahead=barmerge.lookahead_off)
+atrH4 = request.security(syminfo.tickerid, "240", ta.atr(14), lookahead=barmerge.lookahead_off)
+atrH1 = request.security(syminfo.tickerid, "60",  ta.atr(14), lookahead=barmerge.lookahead_off)
+
+// Visual weight by tier. Higher timeframe = more significance = heavier stroke.
+f_newZone(int tier, float center, float halfWidth) =>
+    color border = tier == 1 ? color.new(color.red, 60) : tier == 2 ? color.new(color.red, 75) : color.new(color.red, 88)
+    color fill   = tier == 1 ? color.new(color.red, 92) : tier == 2 ? color.new(color.red, 94) : color.new(color.red, 96)
+    int   width  = tier == 1 ? 2 : 1
+    box.new(
+         bar_index, center + halfWidth,
+         bar_index, center - halfWidth,
+         border_color = border,
+         border_width = width,
+         border_style = line.style_dashed,
+         bgcolor      = fill,
+         xloc         = xloc.bar_index,
+         extend       = extend.right)
+
+// Add a confirmed pivot as a zone, if the tier is enabled and there is room.
+f_addZone(int tier, float pivotPrice, float atr, bool showTier) =>
+    if showTier and not na(pivotPrice) and not na(atr) and array.size(zones) < maxZones
+        array.push(zones, LiquidityZone.new(
+             pivotPrice,
+             atr * zoneATRMult,
+             tier,
+             bar_index,
+             bar_index,
+             f_newZone(tier, pivotPrice, atr * zoneATRMult)))
+
 if not na(d1_pivotHigh)
-    // Use D1 ATR for D1 zone sizing
-    zoneTop    = d1_pivotHigh + atrD1 * zoneATRMult
-    zoneBottom = d1_pivotHigh - atrD1 * zoneATRMult
-    
-    // Only add if under limit
-    if array.size(zonePrices) < maxZones
-        array.push(zonePrices, d1_pivotHigh)
-        array.push(zoneTiers, 1)
-    
-    // Draw the zone box (only if enabled)
-    if showD1Zones
-        box.new(bar_index - 20, zoneTop, bar_index + 20, zoneBottom,
-         border_color=color.new(color.red, 70), bgcolor=color.new(color.red, 90),
-         border_style=line.style_dashed)
+    f_addZone(1, d1_pivotHigh, atrD1, showD1Zones)
+if not na(d1_pivotLow)
+    f_addZone(1, d1_pivotLow,  atrD1, showD1Zones)
+if not na(h4_pivotHigh)
+    f_addZone(2, h4_pivotHigh, atrH4, showH4Zones)
+if not na(h4_pivotLow)
+    f_addZone(2, h4_pivotLow,  atrH4, showH4Zones)
+if not na(h1_pivotHigh)
+    f_addZone(3, h1_pivotHigh, atrH1, showH1Zones)
+if not na(h1_pivotLow)
+    f_addZone(3, h1_pivotLow,  atrH1, showH1Zones)
 ```
+
+**Zone geometry.** Zones are persistent horizontal bands, not fixed-size boxes.
+`xloc = xloc.bar_index` with `extend = extend.right` pins the left edge at the bar
+the pivot was confirmed and stretches the right edge to the current bar, so the
+band grows as the chart advances and disappears when culled. An earlier draft
+created a 40-bar box extending 20 bars into the future, which neither persisted
+nor tracked price.
 
 #### 3.2.3 Zone Hierarchy & Filtering
 
@@ -222,60 +301,106 @@ Not all zones are equal. We tier them by timeframe:
 | 2 | 4H pivots | Medium boxes, 50% opacity | Intermediate — secondary targets |
 | 3 | 1H pivots | Thin boxes, 70% opacity | Local — minor liquidity |
 
-Zones are **culled** when:
-- Price has tested the zone (wick entered the zone body)
-- Zone is older than `maxZoneAgeBars` (default: 500 bars)
-- Zone is too far from current price (beyond `maxZoneDistanceATR`)
+Zones are **culled** by any of three independent rules:
+
+| Rule | Threshold | Rationale |
+|------|-----------|-----------|
+| **Tested** | the bar's high/low entered the zone body | A zone that price has already swept has served its purpose |
+| **Age** | older than `maxZoneAgeBars` (default 500 bars) | Stops unbounded accumulation and keeps old structure out of the picture |
+| **Distance** | beyond `maxZoneDistanceATR` (default 15 × ATR) | Far-away zones are no longer actionable |
+
+Every cull **must delete the drawing**. Removing the record from the array
+without `box.delete()` leaves a zone visible on the chart that no longer
+participates in proximity logic — a visual and logical divergence, which is the
+bug present in the earlier draft.
 
 ```pine
-// Zone lifecycle management
-maxZoneAgeBars      = input.int(500, "Max Zone Age (bars)", minval=50, group="Liquidity Zones")
-maxZoneDistanceATR  = input.float(15.0, "Max Zone Distance (× ATR)", minval=5.0, group="Liquidity Zones")
+maxZoneAgeBars     = input.int(500,   "Max Zone Age (bars)",     minval=50, group="Liquidity Zones")
+maxZoneDistanceATR = input.float(15.0, "Max Zone Distance (× ATR)", minval=5.0, group="Liquidity Zones")
 
-// Remove stale zones
-if array.size(zonePrices) > 0
-    for i = array.size(zonePrices) - 1 to 0
-        zonePrice = array.get(zonePrices, i)
-        if math.abs(close - zonePrice) > atrValue * maxZoneDistanceATR
-            array.remove(zonePrices, i)
-            array.remove(zoneTiers, i)
+// Proximity and culling thresholds both measure on the entry timeframe, since
+// that is the timeframe on which price is being evaluated.
+atrChart = ta.atr(14)
+
+// Iterate backwards so removal does not skip the following element.
+if array.size(zones) > 0
+    for i = array.size(zones) - 1 to 0
+        LiquidityZone z = array.get(zones, i)
+
+        bool tooOld      = bar_index - z.bornBar > maxZoneAgeBars
+        bool tooFar      = math.abs(close - z.center) > atrChart * maxZoneDistanceATR
+        bool testedAbove = high >= z.center + z.halfWidth
+        bool testedBelow = low  <= z.center - z.halfWidth
+        bool wasTested   = testedAbove or testedBelow
+
+        if tooOld or tooFar or wasTested
+            box.delete(z.zoneBox)
+            array.remove(zones, i)
 ```
 
 ### 3.3 Proximity Check (Signal Input)
 
-The signal engine needs to know if price is **near** a liquidity zone:
+The Signal Engine needs to know whether price is **near** a liquidity zone, and
+at which tier. The threshold is measured with the **entry-timeframe** ATR
+(`atrChart`), because that is the timeframe on which price is being evaluated —
+using a D1 ATR here would make a 5-minute approach look like nothing.
+
+Direction is derived, not stored: a zone below price is demand-side, a zone
+above price is supply-side. The same record serves both without reclassification.
+
+`atrChart` is the name used throughout this section. Earlier drafts referenced
+an `atrValue` that was never defined, which does not compile.
 
 ```pine
-// Check if current price is within any liquidity zone
+// Module-level outputs consumed by the Signal Engine.
 bool nearLiquidityLong  = false
 bool nearLiquidityShort = false
 bool nearD1Liquidity    = false
 bool nearH4Liquidity    = false
 bool nearH1Liquidity    = false
 
-if array.size(zonePrices) > 0
-    for i = 0 to array.size(zonePrices) - 1
-        zonePrice = array.get(zonePrices, i)
-        zoneTier = array.get(zoneTiers, i)
-        // LONG liquidity = pivot lows below current price
-        if zonePrice < close and math.abs(close - zonePrice) < atrValue * 3.0
-            nearLiquidityLong := true
-            if zoneTier == 1
-                nearD1Liquidity := true
-            else if zoneTier == 2
-                nearH4Liquidity := true
+proxATRMult = input.float(3.0, "Proximity (× ATR)", minval=0.5, step=0.5, group="Liquidity Zones")
+
+if array.size(zones) > 0 and not na(atrChart)
+    for i = 0 to array.size(zones) - 1
+        LiquidityZone z = array.get(zones, i)
+
+        // Already culled if swept, but a zone can be entered between bars.
+        bool inBody = high >= z.center - z.halfWidth and low <= z.center + z.halfWidth
+        bool near   = math.abs(close - z.center) <= atrChart * proxATRMult
+
+        if near and not inBody
+            // Zone below price = demand-side liquidity
+            if z.center < close
+                nearLiquidityLong := true
+                nearD1Liquidity    := nearD1Liquidity or z.tier == 1
+                nearH4Liquidity    := nearH4Liquidity or z.tier == 2
+                nearH1Liquidity    := nearH1Liquidity or z.tier == 3
+            // Zone above price = supply-side liquidity
             else
-                nearH1Liquidity := true
-        // SHORT liquidity = pivot highs above current price
-        if zonePrice > close and math.abs(close - zonePrice) < atrValue * 3.0
-            nearLiquidityShort := true
-            if zoneTier == 1
-                nearD1Liquidity := true
-            else if zoneTier == 2
-                nearH4Liquidity := true
-            else
-                nearH1Liquidity := true
+                nearLiquidityShort := true
+                nearD1Liquidity    := nearD1Liquidity or z.tier == 1
+                nearH4Liquidity    := nearH4Liquidity or z.tier == 2
+                nearH1Liquidity    := nearH1Liquidity or z.tier == 3
 ```
+
+### 3.4 Module Interface
+
+What this module exports to the Signal Engine:
+
+| Output | Type | Meaning |
+|--------|------|---------|
+| `nearLiquidityLong` | bool | Price is near demand-side liquidity below it |
+| `nearLiquidityShort` | bool | Price is near supply-side liquidity above it |
+| `nearD1Liquidity` | bool | That proximity is to a D1 (tier 1) zone |
+| `nearH4Liquidity` | bool | That proximity is to a 4H (tier 2) zone |
+| `nearH1Liquidity` | bool | That proximity is to a 1H (tier 3) zone |
+
+**`max_boxes_count` constraint.** The main indicator declares
+`max_boxes_count=500`. `maxZones` is capped at 200, and every cull calls
+`box.delete()`, so live boxes stay bounded by `maxZones` and cannot exhaust the
+Pine drawing budget. Raising `maxZones` above 500 would break that invariant and
+require raising the declaration to match.
 
 ---
 
@@ -948,9 +1073,13 @@ alertcondition(bearishBoS,     "LF_BearishBoS",     "Bearish BoS on {{ticker}}")
 alertcondition(bullishChoCh,   "LF_BullishChoCh",   "Bullish ChoCh on {{ticker}}")
 alertcondition(bearishChoCh,   "LF_BearishChoCh",   "Bearish ChoCh on {{ticker}}")
 
-// Liquidity zone test alert
-bool liquidityTestLong  = nearLiquidityLong and ta.crossover(close, array.get(zonePrices, 0))
-bool liquidityTestShort = nearLiquidityShort and ta.crossunder(close, array.get(zonePrices, 0))
+// Liquidity zone approach alert.
+// Fires on the transition INTO proximity, using the module's proximity outputs.
+// An earlier draft read array.get(zonePrices, 0), which is the OLDEST zone in
+// the array — unrelated to whatever price is actually approaching, and an
+// out-of-bounds read whenever the array is empty.
+bool liquidityTestLong  = nearLiquidityLong  and not nearLiquidityLong[1]
+bool liquidityTestShort = nearLiquidityShort and not nearLiquidityShort[1]
 alertcondition(liquidityTestLong,  "LF_LiquidityTest",  "Price testing LONG liquidity on {{ticker}}")
 alertcondition(liquidityTestShort, "LF_LiquidityTest",  "Price testing SHORT liquidity on {{ticker}}")
 
@@ -1231,40 +1360,43 @@ Not all zones are equal. A zone tested 5 minutes ago is more relevant than one t
 
 ```pine
 // ─── Zone Freshness Decay ─────────────────────────────────────────────────────
-zoneDecayFactor = input.float(50.0, "Zone Decay Half-Life (bars)", minval=10.0, group="Liquidity Zones")
+// Exponential decay since the last test, carried on the zone record itself.
+// The earlier draft used a third parallel array (zoneLastTested) alongside
+// zonePrices and zoneTiers, all of which had to be mutated in lockstep, and
+// removed entries without deleting the box — the same divergence between what
+// is drawn and what the logic sees.
 
-// When a zone is tested (price enters it), record the bar
-var int[] zoneLastTested = array.new_int()
+zoneDecayFactor       = input.float(50.0, "Zone Decay Half-Life (bars)", minval=10.0, group="Liquidity Zones")
+zoneStrengthThreshold = input.float(0.1,  "Min Zone Strength", minval=0.01, maxval=1.0, step=0.01, group="Liquidity Zones")
 
-// Initialize zoneLastTested when a new zone is added (push bar_index)
-// This must happen inside the "if not na(pivot)" blocks when array.push(zonePrices, ...) is called
-
-// Zone strength decays exponentially since last test
-float zoneStrength(int barsSinceTest) =>
+f_zoneStrength(int barsSinceTest) =>
     math.exp(-barsSinceTest / zoneDecayFactor)
 
-// Only render zones with strength > threshold
-float zoneStrengthThreshold = input.float(0.1, "Min Zone Strength", minval=0.01, maxval=1.0, group="Liquidity Zones")
+// Record a test, then cull on weakness. Both loops walk backwards or in
+// place so removal never skips an element.
+if array.size(zones) > 0
+    for i = 0 to array.size(zones) - 1
+        LiquidityZone z = array.get(zones, i)
+        if math.abs(close - z.center) < atrChart * zoneATRMult
+            array.set(zones, i, LiquidityZone.new(
+                 z.center, z.halfWidth, z.tier, z.bornBar, bar_index, z.zoneBox))
 
-// Track zone tests: when price enters a zone, update its last-tested bar
-if array.size(zonePrices) > 0
-    for i = 0 to array.size(zonePrices) - 1
-        float zonePrice = array.get(zonePrices, i)
-        // Price is inside the zone (within ATR range)
-        if math.abs(close - zonePrice) < atrCurrent * zoneATRMult
-            array.set(zoneLastTested, i, bar_index)
-
-// Filter: remove weak/stale zones (iterate backwards to safely remove)
-if array.size(zonePrices) > 0
-    for i = array.size(zonePrices) - 1 to 0
-        int barsSince = bar_index - array.get(zoneLastTested, i)
-        if zoneStrength(barsSince) < zoneStrengthThreshold
-            array.remove(zonePrices, i)
-            array.remove(zoneLastTested, i)
-            array.remove(zoneTiers, i)
+    for i = array.size(zones) - 1 to 0
+        LiquidityZone z = array.get(zones, i)
+        if f_zoneStrength(bar_index - z.lastTestedBar) < zoneStrengthThreshold
+            box.delete(z.zoneBox)
+            array.remove(zones, i)
 ```
 
 **Why:** Stale zones clutter the chart and reduce signal quality. Fresh zones attract price; dead zones do not.
+
+**Interaction with section 3.2.3.** This decay is a *fourth* cull rule layered on
+top of the three in 3.2.3, and both operate on the same `zones` array in the same
+bar. Whichever runs first removes elements; the second then operates on an
+already-shortened array. That is safe because both iterate backwards, but it
+means the effective lifetime is `min(age, distance, tested, strength)` — not a
+choice between rules. If the decay rule is enabled, `maxZoneAgeBars` should be
+loosened accordingly, or the two will fight over which zone dies first.
 
 ---
 
