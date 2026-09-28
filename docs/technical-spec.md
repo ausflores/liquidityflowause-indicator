@@ -737,7 +737,6 @@ f_makeFvgRoom() =>
 measured in 5.2.1 — the same region the threshold filtered on:
 
 ```pine
-```pine
 if bullishImbalance and showImbalances
     f_makeFvgRoom()
     array.push(imbalances, ImbalanceZone.new(
@@ -879,10 +878,20 @@ We track swing highs and swing lows on the 1H timeframe using `ta.pivothigh()` a
 ```pine
 // ─── Structure Detection on 1H ─────────────────────────────────────────────────
 structPivotLen = input.int(5, "Structure Pivot Length", minval=3, group="Structure Break")
+showStructureBreaks = input.bool(true, "Show Structure Breaks", group="Structure Break")
+showSwingLevels    = input.bool(true, "Show Swing Levels",     group="Structure Break")
 
-// Fetch 1H pivot data
-h1_pivotHigh = request.security(syminfo.tickerid, "60", ta.pivothigh(high, structPivotLen, structPivotLen), lookahead=barmerge.lookahead_off)
-h1_pivotLow  = request.security(syminfo.tickerid, "60", ta.pivotlow(low, structPivotLen, structPivotLen),   lookahead=barmerge.lookahead_off)
+// Pivot fetch, prefixed sb_ for "structure break".
+//
+// The prefix is mandatory, not cosmetic. Liquidity Zones already declares
+// h1_pivotHigh / h1_pivotLow at module scope, and the modules are concatenated
+// into one script — reusing those names would be a duplicate declaration and a
+// compile error. They could not be shared even if naming allowed it: this
+// module uses structPivotLen (default 5) for structure, while Liquidity Zones
+// uses pivotLenHigh/Low (default 10) for liquidity tiers. Different lengths
+// describe different structure, so they must be different variables.
+sb_pivotHigh = request.security(syminfo.tickerid, "60", ta.pivothigh(high, structPivotLen, structPivotLen), lookahead=barmerge.lookahead_off)
+sb_pivotLow  = request.security(syminfo.tickerid, "60", ta.pivotlow(low,  structPivotLen, structPivotLen),  lookahead=barmerge.lookahead_off)
 ```
 
 ### 6.3 Swing State Management
@@ -912,61 +921,124 @@ if not na(h1_pivotLow)
     lastSwingLowBar := bar_index
 ```
 
-### 6.4 BoS Detection
+### 6.4 Break Detection
+
+A structural break is a **cross** of the most recent opposite swing: the first
+bar whose close is beyond the level, having previously been at or inside it.
+Testing `close` rather than `high` / `low` means a wick through a level does not
+count as a break. That is deliberate — a wick that is immediately rejected is
+liquidity being taken, which is the Liquidity Zones module's job, not a
+structural change. The two modules would otherwise report the same event.
+
+**Breaks are classified, not enumerated.** An earlier draft exposed
+`bullishBoS` and `bullishChoCh` as separate booleans, but ChoCh is BoS *plus* a
+structure precondition — `marketStructure == -1 and close > lastSwingHigh` is
+the BoS condition with one extra clause. They are nested, not independent, so
+exporting both lets the Signal Engine count one break twice and inflate a
+three-factor confluence score on a single factor. This is the same failure mode
+already handled between proximity and sweep in Liquidity Zones, and between
+approach and fill in Imbalance Detector.
+
+The interface therefore exposes **what happened** and **whether it reversed**,
+as two flags that are true together by design rather than two overlapping
+break types:
 
 ```pine
-// Bullish BoS: price breaks above the most recent swing high
-bool bullishBoS = close > lastSwingHigh and close[1] <= lastSwingHigh
+// The break itself, and whether it flipped the structure.
+bool breakUp        = false
+bool breakDown      = false
+bool structureFlipped = false   // true only when the break opposed prior structure
 
-// Bearish BoS: price breaks below the most recent swing low
-bool bearishBoS = close < lastSwingLow and close[1] >= lastSwingLow
+// A break is a cross: beyond the level now, not beyond it a bar ago.
+bool crossedAbove = not na(lastSwingHigh) and close >  lastSwingHigh and close[1] <= lastSwingHigh
+bool crossedBelow = not na(lastSwingLow)  and close <  lastSwingLow  and close[1] >= lastSwingLow
 
-// Update structure state
-if bullishBoS
-    marketStructure := 1  // Bullish structure confirmed
-if bearishBoS
-    marketStructure := -1 // Bearish structure confirmed
-```
-
-### 6.5 ChoCh Detection
-
-```pine
-// Bullish ChoCh: price breaks above a swing high that previously acted as reversal
-// (i.e., price was in a downtrend, then breaks a swing high)
-bool bullishChoCh = marketStructure == -1 and close > lastSwingHigh and close[1] <= lastSwingHigh
-
-// Bearish ChoCh: price breaks below a swing low that previously acted as reversal
-bool bearishChoCh = marketStructure == 1 and close < lastSwingLow and close[1] >= lastSwingLow
-
-// ChoCh overrides structure (it's a reversal signal)
-if bullishChoCh
+// Reversal is decided against the structure in force BEFORE this bar.
+if crossedAbove
+    breakUp := true
+    structureFlipped := marketStructure == -1
     marketStructure := 1
-if bearishChoCh
+if crossedBelow
+    breakDown := true
+    structureFlipped := marketStructure == 1
     marketStructure := -1
 ```
 
+**Neutral structure is not a BoS.** With `marketStructure == 0` — no break seen
+yet — the first break in either direction is a break, but not a *change* of
+character, so `structureFlipped` stays false. A first break is the establishment
+of structure, not a reversal of it.
+
+A bullish and a bearish break cannot occur on the same bar: `crossedAbove` and
+`crossedBelow` require `close` to be simultaneously above the last swing high
+and below the last swing low, which is possible only if the last swing high is
+below the last swing low — malformed structure, not a real ambiguity.
+
 ### 6.6 Rendering Structure Breaks
 
+**Swing levels are persistent `var` lines, not a new line per bar.** An earlier
+draft called `line.new()` whenever the last two swings were both non-na — true
+on nearly every bar after the first two pivots. That draws hundreds of
+overlapping horizontal lines, exhausts the `max_lines_count` budget shared with
+the other modules, and produces a solid bar of colour rather than a readable
+level. The line is created once and its right edge moved.
+
 ```pine
-// Draw BoS/ChoCh markers
-if bullishBoS and showStructureBreaks
-    label.new(bar_index, low, bullishChoCh ? "ChoCh ▲" : "BoS ▲", 
-      style=label.style_label_up, color=color.new(color.green, 30), 
-      textcolor=color.white, size=size.normal)
+var line swingHighLine = na
+var line swingLowLine  = na
 
-if bearishBoS and showStructureBreaks
-    label.new(bar_index, high, bearishChoCh ? "ChoCh ▼" : "BoS ▼", 
-      style=label.style_label_down, color=color.new(color.red, 30), 
-      textcolor=color.white, size=size.normal)
+if not na(lastSwingHigh)
+    if na(swingHighLine)
+        swingHighLine := line.new(lastSwingHighBar, lastSwingHigh, bar_index, lastSwingHigh,
+             color=color.new(color.red, 45), style=line.style_dashed, width=1)
+    else
+        // Level is latched: move only the right edge, never the price.
+        line.set_xy2(swingHighLine, bar_index, lastSwingHigh)
 
-// Draw structure lines connecting swing points
-if not na(lastSwingHigh) and not na(prevSwingHigh)
-    line.new(lastSwingHighBar, lastSwingHigh, bar_index, lastSwingHigh, 
-      color=color.new(color.red, 50), style=line.style_solid, width=1)
-if not na(lastSwingLow) and not na(prevSwingLow)
-    line.new(lastSwingLowBar, lastSwingLow, bar_index, lastSwingLow, 
-      color=color.new(color.green, 50), style=line.style_solid, width=1)
+if not na(lastSwingLow)
+    if na(swingLowLine)
+        swingLowLine := line.new(lastSwingLowBar, lastSwingLow, bar_index, lastSwingLow,
+             color=color.new(color.green, 45), style=line.style_dashed, width=1)
+    else
+        line.set_xy2(swingLowLine, bar_index, lastSwingLow)
 ```
+
+**Break markers** are one label per break, which is inherently rare:
+
+```pine
+if breakUp and showStructureBreaks
+    label.new(bar_index, low, structureFlipped ? "ChoCh ▲" : "BoS ▲",
+         style=label.style_label_up, color=color.new(color.green, 30),
+         textcolor=color.white, size=size.normal)
+
+if breakDown and showStructureBreaks
+    label.new(bar_index, high, structureFlipped ? "ChoCh ▼" : "BoS ▼",
+         style=label.style_label_down, color=color.new(color.red, 30),
+         textcolor=color.white, size=size.normal)
+```
+
+### 6.7 Module Interface
+
+| Output | Type | Meaning |
+|--------|------|---------|
+| `breakUp` | bool | Price crossed above the last confirmed 1H swing high this bar |
+| `breakDown` | bool | Price crossed below the last confirmed 1H swing low this bar |
+| `structureFlipped` | bool | That break opposed the structure in force, so it is a ChoCh rather than a BoS |
+| `marketStructure` | int | `1` bullish, `-1` bearish, `0` not yet established |
+
+`marketStructure` is a `var` and therefore persists across bars; the other three
+are recomputed each bar. A consumer that needs "structure turned bullish" should
+test `breakUp and structureFlipped` — **not** a separate `bullishChoCh` boolean,
+which would be true whenever `breakUp` is true in a downtrend and would
+double-count the event.
+
+### 6.8 Drawing Budget
+
+The main indicator declares `max_lines_count=500`, shared with Session Markers'
+boundary lines. Structure Break draws exactly **two** swing lines for its whole
+lifetime plus one label per break, so it is not a meaningful consumer of the
+budget — provided the lines are `var`-persistent as above. Reverting to
+per-bar `line.new` would make it the largest consumer instead.
 
 ---
 
@@ -978,12 +1050,34 @@ The signal engine is the **confluence evaluator**. It takes outputs from the oth
 
 ### 7.2 Confluence Rules
 
-A signal requires **all three factors to agree**:
+A signal requires **all three factors to agree**. Each factor contributes a
+single boolean, and **no factor may contribute two**.
 
 ```
-LONG Signal = nearLiquidityLong AND sessionAligned AND (bullishImbalance OR bullishBoS OR bullishChoCh)
-SHORT Signal = nearLiquidityShort AND sessionAligned AND (bearishImbalance OR bearishBoS OR bearishChoCh)
+LONG  = nearLiquidityLong AND sessionAligned AND structureUp
+SHORT = nearLiquidityShort AND sessionAligned AND structureDown
 ```
+
+where `structureUp` is `breakUp` — not `breakUp OR bullishChoCh`, because
+Structure Break exposes one break flag plus `structureFlipped` precisely so that
+a single structural event cannot be counted as two confluences. The earlier
+form `(bullishImbalance OR bullishBoS OR bullishChoCh)` was doubly defective:
+`bullishBoS` and `bullishChoCh` are nested rather than independent, so a
+reversal break satisfied two terms of the same factor.
+
+**Each module has already made its own two signals mutually exclusive**, which is
+why the engine can treat them as simple conjunctions:
+
+| Module | Exclusive pair | Why |
+|---|---|---|
+| Liquidity Zones | `nearLiquidity*` vs `swept*` | Proximity requires the bar range outside the zone body |
+| Imbalance Detector | `nearImbalance*` vs `inImbalance*` | A gap is a fresh entry only while untouched |
+| Structure Break | `breakUp`/`breakDown` vs `structureFlipped` | The flip is a property of the break, not a second break |
+
+This is the single most important invariant in the indicator. A confluence
+score that can count one event twice will fire on setups where only one factor
+is present, which is precisely the false-positive class the whole design exists
+to avoid.
 
 ### 7.3 Confidence Scoring
 
@@ -1021,11 +1115,15 @@ else if inLondon or inNY
 else if inAsia
     confidenceScore += 5
 
-// Structure points
-if bullishBoS or bearishBoS
-    confidenceScore += 20
-if bullishChoCh or bearishChoCh
-    confidenceScore += 30
+// Structure points — the reversal weight REPLACES the base, it does not add.
+//
+// An earlier draft awarded +20 for any break and a further +30 for a ChoCh.
+// Since ChoCh is a subset of BoS, every reversal break scored 50 — fifty points
+// more than a continuation break, for what is the same single event. That is
+// the double-count made concrete, and it would have let every reversal signal
+// clear the 60-point threshold on structure alone.
+if breakUp or breakDown
+    confidenceScore += structureFlipped ? 30 : 20
 if bullishImbalance or bearishImbalance
     confidenceScore += 15
 if volumeConfirmed
@@ -1037,14 +1135,17 @@ if volumeConfirmed
 ```pine
 minConfidence = input.int(60, "Minimum Confidence Score", minval=0, maxval=100, group="Signal Engine")
 
-// LONG signal: all factors bullish + score above threshold
-bool longSignal = nearLiquidityLong and sessionScore >= 2 and 
-                  (bullishImbalance or bullishBoS or bullishChoCh) and 
+// LONG signal: all factors bullish + score above threshold.
+// The third factor is a disjunction of long-direction confirmations, never a
+// sum — a break plus a ChoCh is one event, and a fresh gap approach plus a
+// gap fill are two states of one gap.
+bool longSignal = nearLiquidityLong and sessionScore >= 2 and
+                  (breakUp or nearImbalanceLong or inImbalanceLong) and
                   confidenceScore >= minConfidence
 
 // SHORT signal: all factors bearish + score above threshold
-bool shortSignal = nearLiquidityShort and sessionScore >= 2 and 
-                   (bearishImbalance or bearishBoS or bearishChoCh) and 
+bool shortSignal = nearLiquidityShort and sessionScore >= 2 and
+                   (breakDown or nearImbalanceShort or inImbalanceShort) and
                    confidenceScore >= minConfidence
 ```
 
@@ -1291,10 +1392,13 @@ The indicator uses a **dark-theme-optimized** palette with sufficient contrast:
 // ─── Alert Conditions ─────────────────────────────────────────────────────────
 alertcondition(longSignal,     "LF_LongSignal",     "LONG signal on {{ticker}} | Score: {{close}}%")
 alertcondition(shortSignal,    "LF_ShortSignal",    "SHORT signal on {{ticker}} | Score: {{close}}%")
-alertcondition(bullishBoS,     "LF_BullishBoS",     "Bullish BoS on {{ticker}}")
-alertcondition(bearishBoS,     "LF_BearishBoS",     "Bearish BoS on {{ticker}}")
-alertcondition(bullishChoCh,   "LF_BullishChoCh",   "Bullish ChoCh on {{ticker}}")
-alertcondition(bearishChoCh,   "LF_BearishChoCh",   "Bearish ChoCh on {{ticker}}")
+// Alert names are unchanged — they are the user-facing identifiers anyone
+// already configured in TradingView. Only the conditions change, and the ChoCh
+// variants now add structureFlipped so they are genuinely distinct from BoS.
+alertcondition(breakUp and not structureFlipped, "LF_BullishBoS",   "Bullish BoS on {{ticker}}")
+alertcondition(breakDown and not structureFlipped, "LF_BearishBoS", "Bearish BoS on {{ticker}}")
+alertcondition(breakUp and structureFlipped,   "LF_BullishChoCh",   "Bullish ChoCh on {{ticker}}")
+alertcondition(breakDown and structureFlipped, "LF_BearishChoCh",   "Bearish ChoCh on {{ticker}}")
 
 // Liquidity zone approach and sweep alerts.
 // Approach fires on the transition INTO proximity. An earlier draft read
@@ -1333,7 +1437,7 @@ if longSignal
     alertMessage = '{"indicator":"LiquidityFlowAuse","signal":"LONG","symbol":"' + syminfo.ticker + 
                    '","score":' + str.tostring(confidenceScore) + 
                    ',"price":' + str.tostring(close) + 
-                   ',"structure":"' + (bullishChoCh ? "ChoCh" : bullishBoS ? "BoS" : "Imbalance") + '"}'
+                   ',"structure":"' + (breakUp and structureFlipped ? "ChoCh" : breakUp or breakDown ? "BoS" : "Imbalance") + '"}'
     alert(alertMessage, alert.freq_once_per_bar_close)
 ```
 
@@ -1568,16 +1672,15 @@ Replace the 0–100 confidence score with strict boolean flags. A signal either 
 // ─── Binary Confluence Model ──────────────────────────────────────────────────
 bool liquidityOK    = nearLiquidityLong or nearLiquidityShort
 bool sessionOK      = sessionScore >= 2
-bool structureOK    = (bullishImbalance or bullishBoS or bullishChoCh) or 
-                      (bearishImbalance or bearishBoS or bearishChoCh)
+bool structureOK    = breakUp or breakDown or nearImbalanceLong or nearImbalanceShort
 
 // LONG requires ALL three — no partial credit
-bool longSignalStrict  = nearLiquidityLong  and sessionOK and 
-                         (bullishImbalance or bullishBoS or bullishChoCh)
+bool longSignalStrict  = nearLiquidityLong  and sessionOK and
+                         (breakUp or nearImbalanceLong or inImbalanceLong)
 
-// SHORT requires ALL three — no partial credit  
-bool shortSignalStrict = nearLiquidityShort and sessionOK and 
-                         (bearishImbalance or bearishBoS or bearishChoCh)
+// SHORT requires ALL three — no partial credit
+bool shortSignalStrict = nearLiquidityShort and sessionOK and
+                         (breakDown or nearImbalanceShort or inImbalanceShort)
 ```
 
 **Why:** Percentage scores imply that 60% confidence is "good enough." In trading, a missing factor means the setup is incomplete. Binary scoring forces discipline.
@@ -1705,7 +1808,7 @@ if longSignalStrict and not inCooldown
     string alertText = "LONG " + syminfo.ticker + "\n" +
                        "├── Liquidity: " + (nearD1Liquidity ? "D1 zone" : nearH4Liquidity ? "4H zone" : "1H zone") + "\n" +
                        "├── Session: " + (inOverlap ? "Lon+NY Overlap" : inLondon ? "London" : inNY ? "New York" : "Asia") + "\n" +
-                       "├── Structure: " + (bullishChoCh ? "ChoCh" : bullishBoS ? "BoS" : "Imbalance") + "\n" +
+                       "├── Structure: " + (breakUp and structureFlipped ? "ChoCh" : breakUp or breakDown ? "BoS" : "Imbalance") + "\n" +
                        "├── Target: +" + str.tostring(targetPct, "#.##") + "%\n" +
                        "└── Stop: -" + str.tostring(stopPct, "#.##") + "%"
     
@@ -1715,7 +1818,7 @@ if shortSignalStrict and not inCooldown
     string alertText = "SHORT " + syminfo.ticker + "\n" +
                        "├── Liquidity: " + (nearD1Liquidity ? "D1 zone" : nearH4Liquidity ? "4H zone" : "1H zone") + "\n" +
                        "├── Session: " + (inOverlap ? "Lon+NY Overlap" : inLondon ? "London" : inNY ? "New York" : "Asia") + "\n" +
-                       "├── Structure: " + (bearishChoCh ? "ChoCh" : bearishBoS ? "BoS" : "Imbalance") + "\n" +
+                       "├── Structure: " + (breakDown and structureFlipped ? "ChoCh" : breakUp or breakDown ? "BoS" : "Imbalance") + "\n" +
                        "├── Target: +" + str.tostring(targetPct, "#.##") + "%\n" +
                        "└── Stop: -" + str.tostring(stopPct, "#.##") + "%"
     
