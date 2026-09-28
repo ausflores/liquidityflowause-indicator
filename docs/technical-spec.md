@@ -908,18 +908,24 @@ var int   lastSwingLowBar  = na
 // Structure state: 1 = bullish, -1 = bearish, 0 = neutral
 var int marketStructure = 0
 
-// Update swing highs
-if not na(h1_pivotHigh)
+// Update swing highs. sb_ prefix required — see 6.2.
+if not na(sb_pivotHigh)
     prevSwingHigh := lastSwingHigh
-    lastSwingHigh := h1_pivotHigh
+    lastSwingHigh := sb_pivotHigh
     lastSwingHighBar := bar_index
 
 // Update swing lows
-if not na(h1_pivotLow)
+if not na(sb_pivotLow)
     prevSwingLow := lastSwingLow
-    lastSwingLow := h1_pivotLow
+    lastSwingLow := sb_pivotLow
     lastSwingLowBar := bar_index
 ```
+
+**`prevSwingHigh` / `prevSwingLow` are currently dead state.** Nothing in this
+module reads them, and neither does the Signal Engine. They are kept because a
+Fractal-style structure variant would need them, but as written they are four
+lines that do nothing — a reader should not assume they participate in the
+current break logic. Delete them if that variant is not planned.
 
 ### 6.4 Break Detection
 
@@ -974,6 +980,15 @@ A bullish and a bearish break cannot occur on the same bar: `crossedAbove` and
 and below the last swing low, which is possible only if the last swing high is
 below the last swing low — malformed structure, not a real ambiguity.
 
+**Break levels are not reset after a break.** In a continuing trend the next
+confirmed pivot raises the level, but price is already above it, so the cross
+test's `close[1] <= level` arm is false and no further break fires until price
+returns below the new level and crosses again. This is the conservative
+behaviour structure-break detection is normally expected to have: one break per
+swing, not one per bar. It is called out here because the alternative — clearing
+the level after a break — would report a break on every close above a stale
+threshold, and the choice belongs to the maintainer rather than to this module.
+
 ### 6.6 Rendering Structure Breaks
 
 **Swing levels are persistent `var` lines, not a new line per bar.** An earlier
@@ -987,20 +1002,37 @@ level. The line is created once and its right edge moved.
 var line swingHighLine = na
 var line swingLowLine  = na
 
-if not na(lastSwingHigh)
-    if na(swingHighLine)
-        swingHighLine := line.new(lastSwingHighBar, lastSwingHigh, bar_index, lastSwingHigh,
-             color=color.new(color.red, 45), style=line.style_dashed, width=1)
-    else
-        // Level is latched: move only the right edge, never the price.
-        line.set_xy2(swingHighLine, bar_index, lastSwingHigh)
+// The line must be recreated when the LEVEL moves, not merely when its right
+// edge is extended. Latching the price at creation and only extending means
+// that when a new pivot confirms at a different price — the normal case in
+// trending structure — `lastSwingHigh` moves to the new level while the line
+// keeps drawing the old one. The chart would then show structure one level
+// behind where breaks are actually measured, and nothing would reveal it.
+if showSwingLevels
+    if not na(lastSwingHigh)
+        if na(swingHighLine) or lastSwingHigh != line.get_y1(swingHighLine)
+            line.delete(swingHighLine)
+            swingHighLine := line.new(lastSwingHighBar, lastSwingHigh, bar_index, lastSwingHigh,
+                 color=color.new(color.red, 45), style=line.style_dashed, width=1)
+        else
+            line.set_xy2(swingHighLine, bar_index, lastSwingHigh)
 
-if not na(lastSwingLow)
-    if na(swingLowLine)
-        swingLowLine := line.new(lastSwingLowBar, lastSwingLow, bar_index, lastSwingLow,
-             color=color.new(color.green, 45), style=line.style_dashed, width=1)
-    else
-        line.set_xy2(swingLowLine, bar_index, lastSwingLow)
+    if not na(lastSwingLow)
+        if na(swingLowLine) or lastSwingLow != line.get_y1(swingLowLine)
+            line.delete(swingLowLine)
+            swingLowLine := line.new(lastSwingLowBar, lastSwingLow, bar_index, lastSwingLow,
+                 color=color.new(color.green, 45), style=line.style_dashed, width=1)
+        else
+            line.set_xy2(swingLowLine, bar_index, lastSwingLow)
+else
+    // Dropping the handles when the toggle is off means re-enabling starts
+    // clean, and an input wired to nothing would read as a broken script.
+    if not na(swingHighLine)
+        line.delete(swingHighLine)
+        swingHighLine := na
+    if not na(swingLowLine)
+        line.delete(swingLowLine)
+        swingLowLine := na
 ```
 
 **Break markers** are one label per break, which is inherently rare:
@@ -1232,7 +1264,7 @@ showD1Zones      = input.bool(true,  "Show D1 Liquidity Zones",  group="General"
 showH4Zones      = input.bool(true,  "Show 4H Liquidity Zones",  group="General")
 showH1Zones      = input.bool(true,  "Show 1H Liquidity Zones",  group="General")
 showImbalances   = input.bool(true,  "Show Imbalances",          group="General")
-showStructBreaks = input.bool(true,  "Show Structure Breaks",    group="General")
+showStructureBreaks = input.bool(true,  "Show Structure Breaks",    group="Structure Break")
 showSessions     = input.bool(true,  "Show Session Markers",     group="General")
 showSignals      = input.bool(true,  "Show Signal Labels",       group="General")
 
@@ -1272,8 +1304,10 @@ volumeThreshold    = input.float(1.2, "Volume Confirmation (× SMA)", minval=1.0
 // GROUP: Structure Break
 // ═══════════════════════════════════════════════════════════════════════════════
 structPivotLen = input.int(5, "Structure Pivot Length", minval=3, group="Structure Break")
-showChoCh      = input.bool(true, "Show ChoCh Markers",  group="Structure Break")
-showBoS        = input.bool(true, "Show BoS Markers",    group="Structure Break")
+// ChoCh and BoS are NOT separate toggles. They are two states of one event, so
+// separate switches would invite reintroducing the parallel flags the module
+// design exists to prevent. Section 6.2's single `showStructureBreaks` governs
+// both, and the label printed on the marker says which one fired.
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // GROUP: Signal Engine

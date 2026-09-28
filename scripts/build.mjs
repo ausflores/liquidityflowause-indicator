@@ -459,6 +459,36 @@ plot(imbLive <= maxImbalances ? 1 : 0, title = "IMB DIAG VERDICT budget (1 = ok)
 plot(imbUntouched + imbTouched == imbLive ? 1 : 0, title = "IMB DIAG VERDICT counts (1 = ok)", color = color.new(color.lime, 0))
 `;
 
+// Structure Break diagnostics. The load-bearing series is the orphan check:
+// structureFlipped is a PROPERTY of a break, so it must never be true on a bar
+// with no break. If it is, the module has reintroduced the parallel BoS/ChoCh
+// flags, which scored one reversal break as 20 + 30 = 50 in the spec's own
+// confidence table. Cumulative flips must also never exceed cumulative breaks.
+const STRUCTURE_DIAGNOSTIC_OVERLAY = `
+var int sbBreaks = 0
+var int sbFlips = 0
+var int sbOrphanFlips = 0
+
+if breakUp or breakDown
+    sbBreaks += 1
+if structureFlipped
+    sbFlips += 1
+    if not breakUp and not breakDown
+        sbOrphanFlips += 1
+
+plot(marketStructure,  title = "SB DIAG structure (1 / -1 / 0)",  color = color.new(color.aqua, 0))
+plot(sbBreaks,        title = "SB DIAG breaks total (expect > 0)", color = color.new(color.aqua, 0))
+plot(sbFlips,         title = "SB DIAG reversals (<= breaks)",   color = color.new(color.orange, 0))
+plot(sbOrphanFlips,   title = "SB DIAG ORPHAN flips (must be 0)", color = color.new(color.red, 0))
+plot(breakUp         ? 1 : 0, title = "SB DIAG breakUp fired",   color = color.new(color.lime, 0))
+plot(breakDown       ? 1 : 0, title = "SB DIAG breakDown fired", color = color.new(color.lime, 0))
+plot(structureFlipped ? 1 : 0, title = "SB DIAG flipped fired",  color = color.new(color.lime, 0))
+
+plot(sbFlips <= sbBreaks ? 1 : 0, title = "SB DIAG VERDICT flips<=breaks (1 = ok)", color = color.new(color.lime, 0))
+plot(sbOrphanFlips == 0 ? 1 : 0, title = "SB DIAG VERDICT no-orphans (1 = ok)",   color = color.new(color.lime, 0))
+plot(marketStructure >= -1 and marketStructure <= 1 ? 1 : 0, title = "SB DIAG VERDICT domain (1 = ok)", color = color.new(color.lime, 0))
+`;
+
 /**
  * Boosts the production visuals for legibility and appends the overlay.
  * Rewrites the constants already in the assembled text; the module file on
@@ -479,9 +509,11 @@ function applyDiagnostic(assembled) {
   // assumed, so --diagnostic keeps working while modules are still being added.
   const hasZoneModule = /array<LiquidityZone>\s+zones/.test(text);
   const hasImbalanceModule = /array<ImbalanceZone>\s+imbalances/.test(text);
+  const hasStructureModule = /sb_pivotHigh/.test(text);
   const overlays = [DIAGNOSTIC_OVERLAY];
   if (hasZoneModule) overlays.push(ZONE_DIAGNOSTIC_OVERLAY);
   if (hasImbalanceModule) overlays.push(IMBALANCE_DIAGNOSTIC_OVERLAY);
+  if (hasStructureModule) overlays.push(STRUCTURE_DIAGNOSTIC_OVERLAY);
 
   if (hasZoneModule) {
     console.log("");
@@ -491,6 +523,11 @@ function applyDiagnostic(assembled) {
     console.log("");
     console.log("  Imbalance Detector present — read IMB DIAG VERDICT budget and");
     console.log("  counts, and confirm virgin gaps > 0.");
+  }
+  if (hasStructureModule) {
+    console.log("");
+    console.log("  Structure Break present — read SB DIAG ORPHAN flips, which must");
+    console.log("  be 0, plus the three SB DIAG VERDICT series.");
   }
 
   return `${boosted}\n${overlays.join("\n")}`;
