@@ -616,30 +616,45 @@ We detect two types of imbalances:
 
 #### 5.2.1 Candle Body Imbalance (3-Candle Pattern)
 
-A 3-candle imbalance forms when:
-- **Bullish imbalance**: Candle 1 high < Candle 3 low (gap between candles 1 and 3)
-- **Bearish imbalance**: Candle 1 low > Candle 3 high
+A bullish imbalance (fair value gap) forms when candle 3's low sits above
+candle 1's high, leaving an untraded price band between them. Bearish is the
+mirror image.
+
+**The measured size and the drawn region must be the same region.** An earlier
+draft measured `low[1] - high[2]` — only the gap between candle 1 and candle 2 —
+while drawing a box from `high[2]` to `low[0]`, which spans both gaps plus the
+isolated middle candle. The threshold therefore filtered on a quantity different
+from the one displayed, so the visible band could be far smaller than the number
+that admitted it. The size below is measured across the full band that gets
+drawn.
 
 ```pine
 // ─── Imbalance Detection ───────────────────────────────────────────────────────
-imbalanceThreshold = input.float(1.0, "Imbalance Min Size (× ATR)", minval=0.1, group="Imbalances")
+imbalanceThreshold = input.float(1.0, "Imbalance Min Size (× ATR)", minval=0.1, step=0.1, group="Imbalances")
 
-// 3-candle Fair Value Gap (FVG) — corrected pattern
-// Bullish FVG: candle 1 high < candle 3 low (gap between candles 1 and 3, skip middle)
-// This leaves untraded price area that price often returns to fill
-bool bullishFVG = high[2] < low[1] and high[1] < low[0]
-// Bearish FVG: candle 1 low > candle 3 high
-bool bearishFVG = low[2] > high[1] and low[1] > high[0]
+// Bullish FVG: candle 3 low above candle 1 high
+bool bullishFVG = low[0] > high[2]
+// Bearish FVG: candle 3 high below candle 1 low
+bool bearishFVG = high[0] < low[2]
 
-// Filter by minimum size (ATR-based)
-float bullSize = low[1] - high[2]   // gap height for bullish
-float bearSize = low[2] - high[1]   // gap height for bearish
-bool validBull = bullSize > atrValue * imbalanceThreshold
-bool validBear = bearSize > atrValue * imbalanceThreshold
+// Size spans the SAME region that is drawn: the full band between candle 1 and
+// candle 3, not just one leg of it.
+float bullSize = low[0] - high[2]   // bullish band height
+float bearSize = low[2] - high[0]   // bearish band height
+
+bool validBull = bullSize > atrChart * imbalanceThreshold
+bool validBear = bearSize > atrChart * imbalanceThreshold
 
 bool bullishImbalance = bullishFVG and validBull
 bool bearishImbalance = bearishFVG and validBear
 ```
+
+**On the two-gap variant.** An earlier draft required `high[2] < low[1] and
+high[1] < low[0]` — two gaps, with candle 2 fully isolated. That is a stricter
+"complete isolation" definition, not an error, but it is a different signal and
+it is not what the threshold text described. The single-gap form above is used;
+if isolation is wanted later it should be a separate, separately-filtered
+signal rather than a silent change to this one.
 
 #### 5.2.2 Volume Delta Imbalance
 
@@ -659,50 +674,178 @@ bool deltaBearish = candleDelta < 0 and close < close[1]   // Strong selling
 bool volumeConfirmed = volume > ta.sma(volume, 20) * 1.2
 ```
 
-### 5.3 Rendering Imbalances
+### 5.3 Imbalance Lifecycle
 
-Imbalances are drawn as **triangles or shaded rectangles** in the gap zone:
+**An imbalance is a stored zone, not a per-bar marker.** Section 5.1 states that
+these areas act as magnets that price returns to fill. A three-bar marker cannot
+express that premise: the gap forms, the marker expires, and the eventual return
+— the entire reason the concept matters — is never displayed. So each confirmed
+imbalance is stored and drawn as a persistent band, exactly as a liquidity zone
+is, and survives until price fills it.
+
+This is a deliberate departure from treating the entry timeframe as purely
+transient. "Entry only" governs *where* imbalances are detected, not how long
+they remain visible afterwards.
+
+Storage follows the same pattern as Liquidity Zones — one array of a user type —
+so an imbalance cannot be half-removed and its box is always reachable for
+deletion.
 
 ```pine
-// Draw bullish imbalance zone
-if bullishImbalance and showImbalances
-    float imbTop = low[0]   // Current candle low
-    float imbBottom = high[2]  // Candle 1 high (gap start)
-    
-    box.new(bar_index - 2, imbTop, bar_index, imbBottom,
-     border_color=color.new(color.green, 50), bgcolor=color.new(color.green, 85),
-     border_width=1)
-    
-    // Label
-    label.new(bar_index, imbBottom, "BI", style=label.style_label_up, 
-      color=color.new(color.green, 50), textcolor=color.white, size=size.small)
+type ImbalanceZone
+    float top
+    float bottom
+    bool  bullish
+    int   bornBar
+    int   touchedBar    // bar_index on first entry; na while untouched
+    box   zoneBox
 
-// Draw bearish imbalance zone
-if bearishImbalance and showImbalances
-    float imbTop = low[2]     // Candle 1 low
-    float imbBottom = high[0] // Current candle high (gap start)
-    
-    box.new(bar_index - 2, imbTop, bar_index, imbBottom,
-     border_color=color.new(color.red, 50), bgcolor=color.new(color.red, 85),
-     border_width=1)
-    
-    label.new(bar_index, imbTop, "SI", style=label.style_label_down, 
-      color=color.new(color.red, 50), textcolor=color.white, size=size.small)
+var array<ImbalanceZone> imbalances = array.new<ImbalanceZone>()
+
+maxImbalances = input.int(60,  "Max Imbalances",           minval=10, maxval=200, group="Imbalances")
+maxFvgAgeBars = input.int(300, "Max Imbalance Age (bars)", minval=50,  group="Imbalances")
+
+// Persistent band, pinned at the candle that completed the pattern and
+// stretched to the current bar.
+f_newImbalance(bool bullish, float top, float bottom) =>
+    color border = bullish ? color.new(color.green, 50) : color.new(color.red, 50)
+    color fill   = bullish ? color.new(color.green, 85) : color.new(color.red, 85)
+    box.new(
+         bar_index, top,
+         bar_index, bottom,
+         border_color = border,
+         border_width = 1,
+         border_style = line.style_solid,
+         bgcolor      = fill,
+         xloc         = xloc.bar_index,
+         extend       = extend.right)
+
+// Evict the OLDEST imbalance when full. Dropping the new one, as an earlier
+// guard did, is backwards — a gap forming now matters more than one that formed
+// hundreds of bars ago.
+f_makeFvgRoom() =>
+    if array.size(imbalances) >= maxImbalances
+        int oldest = 0
+        for i = 1 to array.size(imbalances) - 1
+            if array.get(imbalances, i).bornBar < array.get(imbalances, oldest).bornBar
+                oldest := i
+        box.delete(array.get(imbalances, oldest).zoneBox)
+        array.remove(imbalances, oldest)
 ```
+
+**Creation** runs on the bar the third candle closes, recording the band edges
+measured in 5.2.1 — the same region the threshold filtered on:
+
+```pine
+```pine
+if bullishImbalance and showImbalances
+    f_makeFvgRoom()
+    array.push(imbalances, ImbalanceZone.new(
+         low[0], high[2], true, bar_index, na,
+         f_newImbalance(true, low[0], high[2])))
+
+if bearishImbalance and showImbalances
+    f_makeFvgRoom()
+    array.push(imbalances, ImbalanceZone.new(
+         low[2], high[0], false, bar_index, na,
+         f_newImbalance(false, low[2], high[0])))
+```
+
+**Touch** records the first bar whose range reached into the band. The imbalance
+is *not* removed — the Signal Engine needs to know a gap was filled and on what
+side, exactly as it needed `sweptLong` / `sweptShort` from Liquidity Zones.
+
+**Retire** removes it on age, or once touched and left alone for
+`fvgFilledRetainBars`. Every removal deletes the box.
+
+```pine
+fvgFilledRetainBars = input.int(50, "Filled Imbalance Retention (bars)", minval=5, group="Imbalances")
+
+if array.size(imbalances) > 0
+    for i = 0 to array.size(imbalances) - 1
+        ImbalanceZone fi = array.get(imbalances, i)
+        bool reached = high >= fi.bottom and low <= fi.top
+        if reached and na(fi.touchedBar)
+            array.set(imbalances, i, ImbalanceZone.new(
+                 fi.top, fi.bottom, fi.bullish, fi.bornBar, bar_index, fi.zoneBox))
+
+    for i = array.size(imbalances) - 1 to 0
+        ImbalanceZone fr = array.get(imbalances, i)
+        bool tooOld    = bar_index - fr.bornBar > maxFvgAgeBars
+        bool filledOut = not na(fr.touchedBar) and bar_index - fr.touchedBar > fvgFilledRetainBars
+        if tooOld or filledOut
+            box.delete(fr.zoneBox)
+            array.remove(imbalances, i)
+```
+
+**Visual distinction.** An untouched imbalance is a faint outline; a touched one
+is filled solid, so the chart shows at a glance which gaps price has already
+reacted to and which are still virgin. Applied with `box.set_bgcolor()` and
+`box.set_border_style()` on the touch bar rather than by creating a second box.
+
+### 5.3.1 Drawing Budget
+
+The main indicator declares `max_boxes_count=500`. Liquidity Zones caps at 200
+and Imbalances at 60, and both delete every box on removal, so live drawings stay
+bounded by the sum of the two caps. The invariant is the deletion, not the cap:
+raising either past its budget would require raising the declaration too.
 
 ### 5.4 Imbalance Proximity for Signal
 
+**Proximity is evaluated over the stored imbalances, not over the current bar's
+pattern.** An earlier draft tested `bullishImbalance` — the flag for a gap
+forming *right now* — against `high[2]`, which is two bars stale. That can only
+ever report an imbalance on the bar it forms, so a stored gap that price walks
+back into forty bars later registers nothing. With the lifecycle in 5.3 the
+stored zones are available, so the Signal Engine is told when price actually
+reaches one.
+
+**Entry and fill are separate signals.** A gap is only a *fresh* entry when
+untouched; once price has already been inside it, the same proximity is a fill,
+not a new setup. Reporting both as `near*` would let the confluence score count
+one gap twice.
+
 ```pine
-// Check if price is near an imbalance (within 1.5 ATR)
-bool nearImbalanceLong  = false
-bool nearImbalanceShort = false
+bool nearImbalanceLong   = false   // approaching an untouched bullish gap below
+bool nearImbalanceShort  = false   // approaching an untouched bearish gap above
+bool inImbalanceLong     = false   // inside a touched bullish gap
+bool inImbalanceShort    = false   // inside a touched bearish gap
 
-if bullishImbalance and math.abs(close - high[2]) < atrValue * 1.5
-    nearImbalanceLong := true
+imbProxATRMult = input.float(1.5, "Imbalance Proximity (x ATR)", minval=0.5, step=0.1, group="Imbalances")
 
-if bearishImbalance and math.abs(close - low[2]) < atrValue * 1.5
-    nearImbalanceShort := true
+if array.size(imbalances) > 0 and not na(atrChart)
+    for i = 0 to array.size(imbalances) - 1
+        ImbalanceZone ip = array.get(imbalances, i)
+
+        bool inside = high >= ip.bottom and low <= ip.top
+        bool near   = math.abs(close - math.avg(ip.top, ip.bottom)) <= atrChart * imbProxATRMult
+
+        if inside
+            if ip.bullish
+                inImbalanceLong := true
+            else
+                inImbalanceShort := true
+        else if near and na(ip.touchedBar)
+            if ip.bullish
+                nearImbalanceLong := true
+            else
+                nearImbalanceShort := true
 ```
+
+### 5.5 Module Interface
+
+| Output | Type | Meaning |
+|--------|------|---------|
+| `nearImbalanceLong` | bool | Price is approaching an **untouched** bullish gap below it |
+| `nearImbalanceShort` | bool | Price is approaching an **untouched** bearish gap above it |
+| `inImbalanceLong` | bool | Price is inside a **touched** bullish gap |
+| `inImbalanceShort` | bool | Price is inside a **touched** bearish gap |
+| `volumeConfirmed` | bool | Current volume exceeds its 20-bar average by 1.2x |
+
+A bullish gap sits *below* price when it forms, and price returns upward into it.
+That is why `nearImbalanceLong` reads a gap the price approaches from above —
+the same demand/supply derivation used in Liquidity Zones, and for the same
+reason: the side is derived from current position, not frozen at creation.
 
 ---
 
