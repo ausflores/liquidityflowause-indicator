@@ -246,6 +246,33 @@ function validate(assembled) {
     }
   });
 
+  // 5. time()'s timezone argument accepts only UTC/GMT notation or an IANA
+  //    zone name. "exchange" is rejected at runtime on bar 0, which compiles
+  //    cleanly and therefore escapes every compile-time check. Validate the
+  //    declared options so an invalid value cannot reach the chart.
+  //    "exchange" is allowed here ONLY because the module routes it through
+  //    the two-argument overload; a build must not accept it silently.
+  const UTC_GMT = /^(?:UTC|GMT)(?:[+-]\d{1,2}(?::?\d{2})?)?$/i;
+  const IANA = /^[A-Z][A-Za-z]*(?:\/[A-Za-z0-9_+\-]+)+$/;
+
+  lines.forEach((l, i) => {
+    const m = /(\w*[Tt]imezone\w*)\s*=\s*input\.string\([^)]*options\s*=\s*\[([^\]]*)\]/.exec(l);
+    if (!m) return;
+
+    const varName = m[1];
+    const values = m[2].match(/"([^"]*)"/g)?.map((s) => s.slice(1, -1)) ?? [];
+
+    for (const v of values) {
+      if (v === "exchange") continue; // routed via the 2-arg overload
+      if (!UTC_GMT.test(v) && !IANA.test(v)) {
+        fail(`line ${i + 1}: '${v}' in ${varName} is not a valid time() ` +
+          'timezone. Use UTC/GMT notation ("UTC-5", "GMT+0530") or an IANA ' +
+          'zone name ("America/New_York"). "exchange" is rejected at runtime ' +
+          "by time() and must go through the two-argument overload.");
+      }
+    }
+  });
+
   return { lineCount: lines.length };
 }
 

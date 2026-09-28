@@ -54,18 +54,22 @@ COLOR_NY_LINE      = color.orange
 // bar, evaluated in the user-selected timezone. The session string itself
 // carries the half-open interval [start, end): start inclusive, end exclusive.
 //
-// Na guard: sessionTimezone is the only input that can be na, because
-// input.session() always yields a validated session string. When the timezone
-// is na every flag stays false, so no runtime error is possible.
+// TIMEZONE CONSTRAINT: time()'s timezone argument accepts only UTC/GMT
+// notation ("UTC-5", "GMT+0530") or an IANA zone name ("America/New_York").
+// "exchange" is NOT accepted and raises a runtime error on bar 0. The
+// exchange timezone is what time() uses when the argument is omitted, so
+// "exchange" is served through the two-argument overload instead.
 
 bool inAsia   = false
 bool inLondon = false
 bool inNY     = false
 
+bool useExchangeTz = sessionTimezone == "exchange"
+
 if not na(sessionTimezone)
-    inAsia   := sessionAsiaEnabled   and not na(time(timeframe.period, asiaSession,   sessionTimezone))
-    inLondon := sessionLondonEnabled and not na(time(timeframe.period, londonSession, sessionTimezone))
-    inNY     := sessionNYEnabled     and not na(time(timeframe.period, nySession,     sessionTimezone))
+    inAsia   := sessionAsiaEnabled   and (useExchangeTz ? not na(time(timeframe.period, asiaSession))   : not na(time(timeframe.period, asiaSession,   sessionTimezone)))
+    inLondon := sessionLondonEnabled and (useExchangeTz ? not na(time(timeframe.period, londonSession)) : not na(time(timeframe.period, londonSession, sessionTimezone)))
+    inNY     := sessionNYEnabled     and (useExchangeTz ? not na(time(timeframe.period, nySession))     : not na(time(timeframe.period, nySession,     sessionTimezone)))
 
 // Overlap is a derived state: both constituent sessions enabled AND active.
 bool inOverlap = sessionLondonEnabled and sessionNYEnabled and inLondon and inNY
