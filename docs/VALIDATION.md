@@ -48,17 +48,43 @@ checking, builtin validation, or runtime analysis.
 | Session tints render | confirmed | bands visible on chart, priority chain observed |
 | Boundary lines, opening bar only | confirmed | Asia 42 edges / 21 lines, London 42/21 — exactly 2:1 |
 | Enable toggles | confirmed | Asia disabled yields only London, overlap, NY |
-| Timezone UTC | confirmed | Asia 0, London 7, NY 13 UTC hours |
-| Timezone Asia/Tokyo | confirmed | 9-hour shift; a fixed offset with no DST |
-| Timezone Europe/London | confirmed | 0/7/13, identical to UTC as GMT requires |
-| Timezone exchange default | confirmed | two-argument `time()` overload path exercised |
-| **Timezone America/New_York** | **unverified** | only path west of UTC never exercised; expect 5/12/18, or 4/11/17 in summer |
-| **DST transitions** | **unverified** | needs chart data spanning a March or November boundary |
+| Timezone UTC | retracted | instrument measured the wrong thing; re-read pending |
+| Timezone Asia/Tokyo | retracted | same instrument defect; the 9-hour fixed offset is unconfirmed |
+| Timezone Europe/London | retracted | same instrument defect; `0/7/13` cannot be a BST reading |
+| Timezone exchange default | confirmed | the default input, so the two-argument `time()` overload runs on every bar and never errors |
+| **Timezone America/New_York** | **unverified** | instrument fixed, not yet read. Expect 5/12/18 (EST) or 4/11/17 (EDT) |
+| **DST transitions** | **unverified** | a range spanning a boundary now steps on the same series |
 | **Weekend spans** | **unverified** | crypto trades 24/7, so this is a data question not a logic one |
 
-DST handling is Pine's own work — the module passes an IANA zone name to
-`time()` and performs no offset arithmetic — so it was not judged worth
-loading a year of chart data to confirm.
+### The instrument was wrong, not the module
+
+The three retracted rows were read off `hour(time(...), "UTC")` plotted
+directly. That does not measure session opening hours. `time()` returns the
+timestamp **of the bar** when that bar falls inside the session and `na`
+otherwise — Pine Script v5, Concepts/Time, "Testing for sessions": *"it
+returns a UNIX timestamp for that bar"*. The session parameter filters which
+bars report a value; it is not a query for a session boundary. The plot was
+therefore a ramp across the session's bars, so the number read depended
+entirely on where the crosshair sat.
+
+Compounding it, the expected values were embedded in the plot titles, so a
+legend read could return the title's number instead of the series value. The
+recorded `0, 7, 13` and `0/7/13` match those titles exactly — and they cannot
+be real measurements either: on 28 Sep 2026 London is on BST, so London 00:00
+falls at 23:00 UTC the *previous* day.
+
+**The module was never affected.** It tests only `not na(time(...))`, which is
+exactly the session-membership pattern the documentation recommends.
+
+The overlay now samples on the session-open edge and holds the value with
+`var`, so the plot is a constant per session, carries no expected value in its
+title, and steps visibly across a DST transition on the same series. UTC,
+Tokyo, London and America/New_York all need re-reading from it.
+
+DST handling remains Pine's own work — the module passes an IANA zone name to
+`time()` and performs no offset arithmetic — but the `var`-held series now
+makes confirming it a matter of scrolling to a boundary rather than loading a
+year of chart data.
 
 ---
 
@@ -184,8 +210,8 @@ no static check can reach:
 
 | Item | Why it matters | Where |
 |---|---|---|
-| `America/New_York` | only untested timezone direction | Session Markers |
-| DST transitions | needs data spanning a boundary | Session Markers |
+| Timezone rows | UTC/Tokyo/London retracted, New_York never read | Session Markers |
+| DST transitions | a range spanning a boundary now steps on the same series | Session Markers |
 | Weekend spans | 24/7 markets, so a data question | Session Markers |
 | `SB DIAG ORPHAN flips` = 0 | `structureFlipped` reachability unconfirmed | Structure Break |
 | `SE DIAG DUAL fires` = 0 | LONG/SHORT exclusivity is unconfirmed | Signal Engine |

@@ -287,19 +287,41 @@ if ta.change(diagActive)
 // where each session's opening bar actually falls in UTC — a value derived from
 // the data rather than read by eye.
 //
-// Expected UTC hours for the default windows (Asia 00:00, London 07:00,
-// NY 13:00), ignoring daylight saving:
+// MEASUREMENT HAZARD, and the reason this samples on an edge: time() does NOT
+// return the session's opening instant. It returns the timestamp OF THE BAR
+// when that bar falls inside the session, and na otherwise (Pine Script v5,
+// Concepts/Time, "Testing for sessions": "it returns a UNIX timestamp for
+// that bar"). The docs describe the session parameter as a FILTER on the bars
+// the function already reports, not as a query for a session boundary.
 //
-//   timezone          Asia  London  NY      (UTC hour of the opening bar)
+// Plotting hour(time(...), "UTC") directly therefore yields a RAMP across the
+// session's bars, never a constant, so the value read depends entirely on
+// where the crosshair sits. Compounding it, the expected values used to be
+// embedded in the plot titles, so a legend read could return the title's
+// number instead of the series value. Both failure modes are removed here:
+// the sample is taken only on the opening edge and held with var, and no
+// expected value appears in any title.
+//
+// Expected UTC hours of the OPENING BAR for the default windows (Asia 00:00,
+// London 07:00, NY 13:00), each expressed in the selected zone's local time:
+//
+//   timezone          Asia  London  NY
 //   UTC                 0      7    13
-//   Asia/Tokyo         15     22     4      (+9, fixed, no DST)
-//   America/New_York    5     12    18      (-5 in winter, -4 in summer)
-//   Europe/London       0      7    13      (GMT is identical to UTC)
+//   Asia/Tokyo         15     22     4      (+9 fixed, no DST)
+//   America/New_York    5     12    18      (-5 EST)
+//                        4     11    17      (-4 EDT, late Mar to early Nov)
+//   Europe/London       0      7    13      (GMT, late Oct to late Mar)
+//                       23      6    12      (BST; 23 is the previous UTC day)
 //   exchange           varies with the exchange
 //
-// Europe/London under GMT must reproduce the UTC row exactly. That equality is
-// the cheapest available check that a named zone is being resolved and not
-// silently ignored.
+// Europe/London under GMT reproduces the UTC row exactly, the cheapest
+// available check that a named zone is being resolved rather than silently
+// ignored. Under BST it deliberately does NOT, and a 23/6/12 reading in
+// summer is correct behaviour rather than a defect.
+//
+// Because the sample is held with var, a chart range spanning a DST
+// transition shows the step on this same series: America/New_York moves
+// 5 -> 4 in March and 4 -> 5 in November. That is the DST check, for free.
 
 // Same two-argument branch the module uses: time() rejects "exchange" as a
 // timezone argument, so that option must go through the overload.
@@ -307,9 +329,29 @@ int diagAsiaStart   = useExchangeTz ? time(timeframe.period, asiaSession)   : ti
 int diagLondonStart = useExchangeTz ? time(timeframe.period, londonSession) : time(timeframe.period, londonSession, sessionTimezone)
 int diagNYStart     = useExchangeTz ? time(timeframe.period, nySession)     : time(timeframe.period, nySession,     sessionTimezone)
 
-plot(hour(diagAsiaStart,   "UTC"), title = "DIAG Asia open (UTC h)   UTC=0  Tokyo=15  NY=4/5  London=0", color = color.new(color.purple, 0))
-plot(hour(diagLondonStart, "UTC"), title = "DIAG London open (UTC h) UTC=7  Tokyo=22  NY=11/12  London=7", color = color.new(color.blue, 0))
-plot(hour(diagNYStart,     "UTC"), title = "DIAG NY open (UTC h)     UTC=13 Tokyo=4   NY=17/18  London=13", color = color.new(color.orange, 0))
+// Sample the opening bar's timestamp ONLY on the edge that opens the session,
+// then hold it. On that bar time() is non-na and its value is that bar's open,
+// which is the session's opening bar. var makes the result a constant per
+// session instead of a ramp.
+//
+// bar_index > 0 carries the same reason as the counters below: the first bar
+// of the visible range has no previous value, so ta.change() reports a
+// transition that never happened and would sample an arbitrary mid-session bar
+// when the chart opens inside a window.
+var int diagAsiaOpenUTC   = na
+var int diagLondonOpenUTC = na
+var int diagNYOpenUTC     = na
+
+if bar_index > 0 and ta.change(inAsia) and inAsia
+    diagAsiaOpenUTC := hour(diagAsiaStart, "UTC")
+if bar_index > 0 and ta.change(inLondon) and inLondon
+    diagLondonOpenUTC := hour(diagLondonStart, "UTC")
+if bar_index > 0 and ta.change(inNY) and inNY
+    diagNYOpenUTC := hour(diagNYStart, "UTC")
+
+plot(diagAsiaOpenUTC,   title = "DIAG Asia open hour (UTC)",   color = color.new(color.purple, 0))
+plot(diagLondonOpenUTC, title = "DIAG London open hour (UTC)", color = color.new(color.blue, 0))
+plot(diagNYOpenUTC,     title = "DIAG NY open hour (UTC)",     color = color.new(color.orange, 0))
 
 var int diagAsiaEdges  = 0
 var int diagAsiaLines  = 0
