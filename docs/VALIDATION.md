@@ -52,8 +52,8 @@ checking, builtin validation, or runtime analysis.
 | Timezone Asia/Tokyo | confirmed | legend reads `15/22/4` — JST is UTC+9, so 0000→15, 0700→22, 1300→04 (next day); `OPEN ASIA` label sits at 09:00 UTC-6 = 15:00 UTC |
 | Timezone Europe/London | confirmed | legend reads `23/6/12` — BST is UTC+1, so 0000→23 (prev day), 0700→06, 1300→12; band boundaries land on 00:00/06:00/09:00 UTC-6 |
 | Timezone exchange default | confirmed | the default input, so the two-argument `time()` overload runs on every bar and never errors |
-| Timezone America/New_York | confirmed | legend reads `4/11/17` — EDT (UTC-4) on 29 Sep 2026, so 0000→04, 0700→11, 1300→17; the EST value 5/12/18 applies only after 1 Nov |
-| **DST transitions** | **unverified** | a range spanning a boundary now steps on the same series |
+| Timezone America/New_York | confirmed | legend reads `4/11/17` — EDT (UTC-4) on 29 Sep 2026, so 0000→04, 0700→11, 1300→17; the EST reading is confirmed under DST transitions below |
+| DST transitions | confirmed | crosshair on 7 Mar 2026 (EST) reads `5/12/18`, on 10 Mar 2026 (EDT) reads `4/11/17` — all three step −1 across the 8 Mar boundary |
 | **Weekend spans** | **unverified** | crypto trades 24/7, so this is a data question not a logic one |
 
 ### The instrument was wrong, not the module
@@ -99,6 +99,38 @@ DST handling remains Pine's own work — the module passes an IANA zone name to
 `time()` and performs no offset arithmetic — but the `var`-held series now
 makes confirming it a matter of scrolling to a boundary rather than loading a
 year of chart data.
+
+### The DST step, measured
+
+The series was read either side of the **8 Mar 2026** boundary — the second
+Sunday in March, when the United States moves EST → EDT. Chart timezone
+`America/New_York`, timeframe 4H, crosshair position taken from the date
+readout under the time axis rather than estimated from the plot:
+
+| Crosshair | Zone | Asia | London | NY |
+|---|---|---|---|---|
+| `sáb 07 Mar '26 — 22:00` | EST (UTC−5) | `5` | `12` | `18` |
+| `mar 10 Mar '26 — 02:00` | EDT (UTC−4) | `4` | `11` | `17` |
+
+All three step by exactly **−1**. The local clock does not move across the
+boundary; the UTC offset does, so 0000 / 0700 / 1300 New York land one hour
+earlier in UTC once EDT begins. The post-step values are the EDT `4/11/17`
+already recorded for 29 Sep 2026, so this boundary test re-confirms the
+America/New_York timezone row as well.
+
+A reading only means something when the crosshair is actually on a bar. With
+the pointer off the chart the legend reports the **last** bar — which on
+29 Sep 2026 is EDT, so it reads `4/11/17` at any historical position. That
+produced two misleading captures before the date readout was checked, and is
+the same class of mistake as the original ramp defect: the number depends on
+where the instrument is pointed, and the pointer has to be visible.
+
+`DIAG VERDICT` on these readings is a range artefact, not a DST signal. On
+the 10 Mar capture Asia reports `1599` edges against `800 × 2 = 1600`,
+because the loaded range opens inside an Asia session and the first bar has
+no predecessor for `ta.change` to fire on; London and NY both match. On the
+7 Mar capture the range opened cleanly and all three read `797 × 2 = 1594`
+for a verdict of `1`.
 
 ---
 
@@ -224,7 +256,6 @@ no static check can reach:
 
 | Item | Why it matters | Where |
 |---|---|---|
-| DST transitions | a range spanning a boundary now steps on the same series | Session Markers |
 | Weekend spans | 24/7 markets, so a data question | Session Markers |
 | `SB DIAG ORPHAN flips` = 0 | `structureFlipped` reachability unconfirmed | Structure Break |
 | `SE DIAG DUAL fires` = 0 | LONG/SHORT exclusivity is unconfirmed | Signal Engine |
