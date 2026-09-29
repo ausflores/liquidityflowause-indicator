@@ -48,17 +48,18 @@ checking, builtin validation, or runtime analysis.
 | Session tints render | confirmed | bands visible on chart, priority chain observed |
 | Boundary lines, opening bar only | confirmed | Asia 42 edges / 21 lines, London 42/21 — exactly 2:1 |
 | Enable toggles | confirmed | Asia disabled yields only London, overlap, NY |
-| Timezone UTC | retracted | instrument measured the wrong thing; re-read pending |
-| Timezone Asia/Tokyo | retracted | same instrument defect; the 9-hour fixed offset is unconfirmed |
-| Timezone Europe/London | retracted | same instrument defect; `0/7/13` cannot be a BST reading |
+| Timezone UTC | confirmed | legend reads `0/7/13` — Asia 0000, London 0700, NY 1300 all in UTC |
+| Timezone Asia/Tokyo | confirmed | legend reads `15/22/4` — JST is UTC+9, so 0000→15, 0700→22, 1300→04 (next day); `OPEN ASIA` label sits at 09:00 UTC-6 = 15:00 UTC |
+| Timezone Europe/London | confirmed | legend reads `23/6/12` — BST is UTC+1, so 0000→23 (prev day), 0700→06, 1300→12; band boundaries land on 00:00/06:00/09:00 UTC-6 |
 | Timezone exchange default | confirmed | the default input, so the two-argument `time()` overload runs on every bar and never errors |
-| **Timezone America/New_York** | **unverified** | instrument fixed, not yet read. Expect 5/12/18 (EST) or 4/11/17 (EDT) |
+| Timezone America/New_York | confirmed | legend reads `4/11/17` — EDT (UTC-4) on 29 Sep 2026, so 0000→04, 0700→11, 1300→17; the EST value 5/12/18 applies only after 1 Nov |
 | **DST transitions** | **unverified** | a range spanning a boundary now steps on the same series |
 | **Weekend spans** | **unverified** | crypto trades 24/7, so this is a data question not a logic one |
 
 ### The instrument was wrong, not the module
 
-The three retracted rows were read off `hour(time(...), "UTC")` plotted
+The three rows that were retracted were read off `hour(time(...), "UTC")`
+plotted
 directly. That does not measure session opening hours. `time()` returns the
 timestamp **of the bar** when that bar falls inside the session and `na`
 otherwise — Pine Script v5, Concepts/Time, "Testing for sessions": *"it
@@ -78,8 +79,21 @@ exactly the session-membership pattern the documentation recommends.
 
 The overlay now samples on the session-open edge and holds the value with
 `var`, so the plot is a constant per session, carries no expected value in its
-title, and steps visibly across a DST transition on the same series. UTC,
-Tokyo, London and America/New_York all need re-reading from it.
+title, and steps visibly across a DST transition on the same series.
+
+All four zones were re-read from that overlay on 29 Sep 2026:
+
+| Zone | Read | Expected | |
+|---|---|---|---|
+| UTC | `0/7/13` | `0/7/13` | ✅ |
+| America/New_York (EDT) | `4/11/17` | `4/11/17` | ✅ |
+| Europe/London (BST) | `23/6/12` | `23/6/12` | ✅ |
+| Asia/Tokyo (JST) | `15/22/4` | `15/22/4` | ✅ |
+
+Each reading was corroborated against the rendered session bands rather than
+taken alone: under `Europe/London` the band boundaries land on 00:00 / 06:00 /
+09:00 UTC-6, and under `Asia/Tokyo` the `OPEN ASIA` label sits at 09:00
+UTC-6 (= 15:00 UTC = 00:00 Tokyo).
 
 DST handling remains Pine's own work — the module passes an IANA zone name to
 `time()` and performs no offset arithmetic — but the `var`-held series now
@@ -210,7 +224,6 @@ no static check can reach:
 
 | Item | Why it matters | Where |
 |---|---|---|
-| Timezone rows | UTC/Tokyo/London retracted, New_York never read | Session Markers |
 | DST transitions | a range spanning a boundary now steps on the same series | Session Markers |
 | Weekend spans | 24/7 markets, so a data question | Session Markers |
 | `SB DIAG ORPHAN flips` = 0 | `structureFlipped` reachability unconfirmed | Structure Break |
