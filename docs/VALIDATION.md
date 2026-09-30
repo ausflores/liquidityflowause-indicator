@@ -54,7 +54,7 @@ checking, builtin validation, or runtime analysis.
 | Timezone exchange default | confirmed | the default input, so the two-argument `time()` overload runs on every bar and never errors |
 | Timezone America/New_York | confirmed | legend reads `4/11/17` — EDT (UTC-4) on 29 Sep 2026, so 0000→04, 0700→11, 1300→17; the EST reading is confirmed under DST transitions below |
 | DST transitions | confirmed | crosshair on 7 Mar 2026 (EST) reads `5/12/18`, on 10 Mar 2026 (EDT) reads `4/11/17` — all three step −1 across the 8 Mar boundary |
-| **Weekend spans** | **unverified** | crypto trades 24/7, so this is a data question not a logic one |
+| Weekend spans | confirmed | crosshair on `sáb 26 Sep '26 — 02:00`: session tints present across Sat 26 and Sun 27 with no untinted strip, candles on both days — Pine v5 defaults omitted session days to `1234567` (Sun–Sat) |
 
 ### The instrument was wrong, not the module
 
@@ -131,6 +131,49 @@ because the loaded range opens inside an Asia session and the first bar has
 no predecessor for `ta.change` to fire on; London and NY both match. On the
 7 Mar capture the range opened cleanly and all three read `797 × 2 = 1594`
 for a verdict of `1`.
+
+### Weekends, measured
+
+The last Session Markers row was never a logic question — it was a
+documentation question that could only be settled on the chart.
+
+`input.session()` and `time()` take an optional day suffix. Without one, the
+answer depends on the language version:
+
+| Pine | Default days |
+|---|---|
+| v4 | `23456` — Monday to Friday |
+| v5 | `1234567` — Sunday to Saturday |
+
+This repo is v5 and supplies no suffix, so sessions should fire seven days a
+week. The v5 migration guide says so explicitly — *"The default session days
+for `time()` and `time_close()` … have been updated from `23456` (Monday to
+Friday) to `1234567` (Sunday to Saturday). This change primarily affects
+symbols traded on weekends"* — but the `time()` API reference still says *"if
+days are omitted, it applies to all weekdays"*. Two official pages, two
+answers. The row exists because that disagreement cannot be resolved by
+reading.
+
+It resolves on the chart. The windows are Asia `0000-0900`, London
+`0700-1600` and NY `1300-2200`, all interpreted in the session timezone, and
+the last of them ends Friday 22:00 New York. Under `23456` **nothing** would
+land on a Saturday or a Sunday, so the two rightmost days of a Fri–Sun range
+would carry no tint at all; under `1234567` they carry the full three-session
+pattern.
+
+Read with the crosshair on `sáb 26 Sep '26 — 02:00`, timeframe 4H, timezone
+`America/New_York`:
+
+- session tints present across Sat 26 and Sun 27, with no untinted strip
+- candles on both days — Bitstamp BTCUSD data covers the weekend
+- legend reads `4/11/17` (EDT, late September)
+
+So the omitted day suffix resolves to `1234567`, sessions fire seven days a
+week, and the 24/7 market is covered.
+
+`DIAG VERDICT` read `0` here for the reason given above: Asia `1999` edges
+against `1000 × 2 = 2000` (the range opens inside an Asia session), London and
+NY both `999 × 2 = 1998`.
 
 ---
 
@@ -256,7 +299,6 @@ no static check can reach:
 
 | Item | Why it matters | Where |
 |---|---|---|
-| Weekend spans | 24/7 markets, so a data question | Session Markers |
 | `SB DIAG ORPHAN flips` = 0 | `structureFlipped` reachability unconfirmed | Structure Break |
 | `SE DIAG DUAL fires` = 0 | LONG/SHORT exclusivity is unconfirmed | Signal Engine |
 | Weight calibration | a trading judgement, not a code property | Signal Engine |
