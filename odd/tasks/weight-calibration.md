@@ -106,7 +106,7 @@ single files. All fall on the delegated side.
 
 ## Tasks
 
-### T1 — Harness scaffolding ✅ (delivered in PR 1)
+### T1 — Harness scaffolding ✅ (delivered in slice 1 · GitHub PR #12)
 
 - [x] Create `backtest/` with a single `run.mjs` entrypoint.
 - [x] No `package.json`, no dependencies — bare `node backtest/run.mjs`.
@@ -117,7 +117,7 @@ The three unimplemented subcommands are **stubs that exit 1 while naming their
 task** (`T8 fidelity gate`, `T10/T11 baselines`, `T12 weight search`) rather
 than exiting 0 — so no future check can read a placeholder as success.
 
-### T2 — Historical data ingest ✅ (delivered in PR 1)
+### T2 — Historical data ingest ✅ (delivered in slice 1 · GitHub PR #12)
 
 - [x] Fetch BTC/USD 5m OHLCV from Bitstamp's public endpoint (no credentials).
 - [x] Paginate backwards; persist raw candles under `backtest/data/` (gitignored).
@@ -145,22 +145,34 @@ un-know) and warns whenever the stored claim disagrees. This is the same
 principle the function already had for `meta.count`; it simply did not extend it
 to the verdict.
 
-### T3 — Port `session-markers.pine`
+### T3 — Port `session-markers.pine` ✅ (delivered in slice 2 · GitHub PR #13)
 
-- [ ] Port UTC session windows, overlap detection, DST handling, and the
+- [x] Port UTC session windows, overlap detection, DST handling, and the
   `sessionStrength` / `sessionMultiplier` exports.
-- [ ] Do **not** port drawing (boundary lines, boxes) — logic only.
-- [ ] Emit the same values the Pine module would on the same bar.
+- [x] Do **not** port drawing (boundary lines, boxes) — logic only.
+- [x] Emit the same values the Pine module would on the same bar — **all five
+  confirmed timezone/DST readings from `docs/VALIDATION.md` reproduced**, plus
+  17 more session checks (22 total, bare Node, zero files written).
 
-### T4 — Port `liquidity-zones.pine`
+### T4 — Port `liquidity-zones.pine` ✅ (delivered in slice 2 · GitHub PR #13)
 
-- [ ] Port pivot detection (§3.2.1), zone construction (§3.2.2), hierarchy and
+- [x] Port pivot detection (§3.2.1), zone construction (§3.2.2), hierarchy and
   filtering (§3.2.3), and proximity check (§3.3).
-- [ ] Respect `maxZones` and the array budget rules.
-- [ ] Do **not** port `box.new` / drawing — logic only.
-- [ ] Array semantics: Pine arrays are 1-indexed and mutated in lockstep across
-  parallel arrays; the spec (D.2) calls that divergence out as a historical bug
-  source. Port carefully and document every index offset decision.
+- [x] Respect `maxZones` and the array budget rules (13 births at
+  `maxZones:10` → max observed count 10, oldest evicted, 31 checks total).
+- [x] Do **not** port `box.new` / drawing — logic only.
+- [x] Array semantics — **this line was wrong until the T4 port caught it.**
+  It originally claimed *"Pine arrays are 1-indexed"*; that is **false**, and
+  applying a −1 base conversion would have shifted every boundary in the
+  module. Evidence: every loop in `liquidity-zones.pine` reaches index 0
+  (`:187`, `:218`, `:245`, `:293` — including `for i = array.size(zones) - 1
+  to 0`), and D.2's own block runs the same down-to-zero form. What D.2
+  actually flags (spec lines 1868–1871) is different: **parallel arrays
+  mutated in lockstep while removals skip `box.delete`**, leaving the drawing
+  and the logic out of sync. The genuine indexing trap is therefore **loop
+  bounds**: Pine's `a to b` is inclusive at *both* ends, unlike JS, so each
+  site needs its own decision (`size-1 to 0` ↔ `i >= 0`, not `i > 0`). The
+  port documents every one of those decisions next to the code.
 
 ### T5 — Port `structure-break.pine`
 
@@ -326,6 +338,13 @@ Forecast per slice is authored lines (additions + deletions). Target ~400 per
 slice; the per-task 400-line figure remains an advisory planning heuristic, not
 an acceptance criterion.
 
+**Numbering:** "PR *N*" in this document means **slice *N*** of the stacked
+chain — it is *not* the repository's GitHub PR number, which GitHub assigns
+independently. Real numbers are recorded in *Progress* as each slice lands:
+slice 1 shipped as GitHub PR **#12**. Without this note the T1 and T2 headings
+above and the progression notes below would read as though the slices were
+numbered by GitHub.
+
 | PR | Tasks | Contents | Forecast |
 |---|---|---|---|
 | 1 | T1 + T2 | Harness scaffolding + Bitstamp 5m ingest | ~300 |
@@ -346,7 +365,7 @@ ports whose correctness is established by the gate itself.
 ### Route amendment
 
 - **T1** was originally declared `inline`. It is executed **together with T2
-  inside one delegated writer**, because both land in PR 1, the runner's
+  inside one delegated writer**, because both land in slice 1, the runner's
   subcommand surface is what T2 implements, and splitting them would have the
   parent author a file's skeleton that the writer then completes. Recorded
   here so the skipped inline route stays observable instead of silent.
@@ -357,28 +376,49 @@ ports whose correctness is established by the gate itself.
 
 - [x] Task document created (this file)
 - [x] Delivery strategy selected: `stacked-to-main`, 6 slices
-- [x] **T1 + T2 — delivered in PR 1** (harness scaffolding + Bitstamp 5m ingest)
 - [x] Fidelity-gate feasibility check (found and fixed the T2 range target and
       the T8 scope defect *before* any porting)
-- [ ] T3–T7 — module ports (PRs 2–4)
+- [x] **T1 + T2 — slice 1 delivered** (harness scaffolding + Bitstamp 5m
+      ingest) → shipped as **GitHub PR #12** (merge commit `f21edda`, two
+      commits, zero labels, branch deleted)
+- [x] RDD set **clone-local off** at the user's explicit request, after
+      OpenCode proved unable to complete an immutable receipt review; global
+      untouched. Delivery now follows ordinary repository policy.
+- [x] **T3 + T4 — slice 2 delivered** (port session-markers + liquidity-zones)
+      → shipped as **GitHub PR #13**. 807 ported lines (899 authored in the
+      PR), 53 smoke checks passing, production SHA byte-identical, `src/`
+      untouched. The writer also caught a **factual error in this document's
+      T4**: Pine arrays are 0-indexed, not 1-indexed — corrected above and in
+      the PR description.
+- [ ] T5–T7 — module ports (slices 3–4)
 - [ ] T8 — fidelity gate
 - [ ] T9–T12 — labelling, baselines, search
 - [ ] T13 — findings report
 - [ ] Findings reported
 
-### Forecast variance — PR 1
+### Forecast variance
 
-| | Forecast | Actual |
-|---|---|---|
-| PR 1 authored lines | ~300 | **~620** (`run.mjs` 617 + `.gitignore` 3) |
+| Slice | PR | Forecast | Actual |
+|---|---|---|---|
+| 1 | #12 | ~300 | **~620** (`run.mjs` 617 + `.gitignore` 3) |
+| 2 | #13 | ~410 | **~899** (307 + 500 ported lines + 92 doc) |
 
-Roughly double the estimate. The excess is the resumable/idempotent pagination,
-the dataset quality analysis, the report formatter, and the stale-verdict repair
-— all load-bearing rather than padding: the pagination logic is what makes a
+Both landed at roughly double their slice forecast.
+
+**Slice 1** — the excess is the resumable/idempotent pagination, the dataset
+quality analysis, the report formatter, and the stale-verdict repair, all
+load-bearing rather than padding: the pagination logic is what makes a
 215-day fetch re-runnable for free, and the verdict repair is what prevented a
-false `target MET`. The per-slice ~400 figure is an advisory planning heuristic
-stated as such in this document, not an acceptance criterion, so this variance
-records the deviation rather than forcing a cosmetic split.
+false `target MET`.
+
+**Slice 2** — the excess is the loop-bound documentation that followed the T4
+array-semantics correction, plus the port prose explaining each index decision.
+A shorter port would be unreviewable: the off-by-one risk here is *silent*, so
+the reasoning has to live beside the code it affects.
+
+The per-slice ~400 figure is an advisory planning heuristic stated as such in
+this document, not an acceptance criterion, so both variances are recorded
+rather than forcing a cosmetic split.
 
 ## Rationale
 
