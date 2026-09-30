@@ -132,6 +132,12 @@ no predecessor for `ta.change` to fire on; London and NY both match. On the
 7 Mar capture the range opened cleanly and all three read `797 × 2 = 1594`
 for a verdict of `1`.
 
+The `0` was a range-boundary artefact, not a defect in the module or the
+guard. The verifier now tolerates a single unmatched edge at the range
+boundary, so these same captures would report a verdict of `1`; the underlying
+edge and line counts themselves are unchanged (the tolerance changed, the
+readings did not — they were not re-measured).
+
 ### Weekends, measured
 
 The last Session Markers row was never a logic question — it was a
@@ -173,7 +179,10 @@ week, and the 24/7 market is covered.
 
 `DIAG VERDICT` read `0` here for the reason given above: Asia `1999` edges
 against `1000 × 2 = 2000` (the range opens inside an Asia session), London and
-NY both `999 × 2 = 1998`.
+NY both `999 × 2 = 1998`. That `0` was a range-boundary artefact, not a defect
+in the module or the guard: the verifier now tolerates a single unmatched edge
+at the range boundary, so these same counts — unchanged, not re-measured —
+would report `1`.
 
 ---
 

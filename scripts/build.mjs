@@ -382,12 +382,18 @@ plot(diagNYEdges,     title = "DIAG NY edges (expect 2x lines)",     color = col
 plot(diagNYLines,     title = "DIAG NY lines (drawn)",               color = color.new(color.orange, 0))
 
 // Single verdict line, so the check does not require reading six numbers.
-// The assertion is edges === 2 x lines: every window has two edges but must
-// draw exactly one line. A broken guard shifts both counters together on every
-// window, which fails this check on all three sessions at once.
-bool diagGuardHolds = diagAsiaEdges   == diagAsiaLines   * 2 and
-                      diagLondonEdges == diagLondonLines * 2 and
-                      diagNYEdges     == diagNYLines     * 2
+// The identity edges === 2 x lines holds only when the loaded range contains
+// as many session enters as exits: a closed window has two edges and draws
+// exactly one line. A range that opens or closes mid-session leaves exactly
+// one window unclosed and shifts the identity by exactly 1 — observed as 1599
+// edges against 800 x 2 = 1600, and 1999 against 1000 x 2 = 2000, both on
+// healthy charts. Tolerating a single unmatched edge is therefore safe: a
+// genuinely broken guard shifts both counters together on every window, so its
+// discrepancy grows with the number of windows and is never 1. Such a guard
+// still fails this check on all three sessions at once.
+bool diagGuardHolds = math.abs(diagAsiaEdges   - diagAsiaLines   * 2) <= 1 and
+                      math.abs(diagLondonEdges - diagLondonLines * 2) <= 1 and
+                      math.abs(diagNYEdges     - diagNYLines     * 2) <= 1
 
 plot(diagGuardHolds ? 1 : 0, title = "DIAG VERDICT (1 = guard correct)", color = color.new(color.lime, 0))
 bgcolor(diagGuardHolds ? color.new(color.lime, 90) : na, title="DIAG verdict tint")
@@ -1037,8 +1043,10 @@ if (diagnostic) {
     console.log("");
     console.log("    DIAG VERDICT (1 = guard correct)");
     console.log("");
-    console.log("  1  → edges === 2x lines for every session, so the `and inX` guard");
-    console.log("        is correct and each window draws exactly one boundary line.");
+    console.log("  1  → edges is within 1 of 2x lines for every session, so the `and inX` guard");
+    console.log("        is correct and each window draws exactly one boundary line. The");
+    console.log("        1-point tolerance covers a range that opens or closes mid-session,");
+    console.log("        which leaves a single window unclosed on the chart boundary.");
     console.log("  0  → the guard is wrong; session windows draw a line on close too.");
     console.log("");
     console.log("  Read the six DIAG counter series to see which session diverged.");
