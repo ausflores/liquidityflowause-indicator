@@ -598,7 +598,10 @@ lines become unreliable past roughly 500 session opens.
 
 ### 4.6 Session-Based Signal Weighting
 
-The signal engine uses session context to weight signal confidence (multiplier, not binary gate — crypto trades 24/7):
+The signal engine uses session context as a **binary gate, not a multiplier**.
+Crypto trades 24/7, so scaling confidence by session would suppress signals
+outside traditional hours for no market reason. The pseudo-code below records
+the original design intent; see the note after the block:
 
 ```pine
 // Session acts as a confidence multiplier, not a blocker
@@ -613,6 +616,17 @@ else if inAsia
 else
     sessionMultiplier := 0.3  // Weekend/dead zone — reduced but possible
 ```
+
+**Note — `sessionMultiplier` is exported but deliberately not applied.** The
+pseudo-code above records design intent, not runtime behaviour. Session Markers
+does compute and export `sessionMultiplier` with exactly those values (see
+`src/modules/session-markers.pine`), but Signal Engine intentionally ignores it:
+crypto trades 24/7, so a session multiplier would scale down signals outside
+traditional hours for no market reason. Signal Engine gates on the binary
+`sessionStrength` test instead — a signal outside a tradable session is
+suppressed outright rather than scored down. The choice is written up in the
+session-factor comment above `bool sessionOK` in
+`src/modules/signal-engine.pine`.
 
 ## 5. Module: Imbalance Detector
 
