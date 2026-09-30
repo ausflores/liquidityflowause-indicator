@@ -174,18 +174,33 @@ to the verdict.
   site needs its own decision (`size-1 to 0` ↔ `i >= 0`, not `i > 0`). The
   port documents every one of those decisions next to the code.
 
-### T5 — Port `structure-break.pine`
+### T5 — Port `structure-break.pine` ✅ (delivered in slice 3 · GitHub PR #14)
 
-- [ ] Port swing point tracking (§6.2), swing state management (§6.3), break
+- [x] Port swing point tracking (§6.2), swing state management (§6.3), break
   detection (§6.4), and the break/reversal/orphan-flip outputs.
-- [ ] Do **not** port line/label drawing.
+- [x] Do **not** port line/label drawing — logic only.
+- [x] **Origin corrected during implementation:** those diagnostic counters are
+  *not* module outputs. They live in `scripts/build.mjs` as
+  `STRUCTURE_DIAGNOSTIC_OVERLAY` (lines 533–556), appended only under
+  `--diagnostic`. Ported from the overlay; the file header states this.
 
-### T6 — Port `imbalance-detector.pine`
+### T6 — Port `imbalance-detector.pine` ✅ (delivered in slice 3 · GitHub PR #14)
 
-- [ ] Port candle body imbalance (§5.2.1), volume delta imbalance (§5.2.2), and
+- [x] Port candle body imbalance (§5.2.1), the volume-confirmation signal, and
   the lifecycle (§5.3) including `imbUntouched + imbTouched == imbLive`.
-- [ ] Preserve the counts tautology as an internal assertion — it is the cheap
-  correctness probe that already caught one transcription error.
+- [x] Preserve the counts tautology as an internal assertion — it is the cheap
+  correctness probe that already caught one transcription error. Now an
+  **always-on `throw` on every bar** (`imbalance-detector.mjs:422`), not a
+  plotted value.
+- [x] **Scope correction — this line was wrong until the T6 port checked it.**
+  It originally said *"volume delta imbalance (§5.2.2)"*. The delta flags
+  (`candleDelta`, `avgDelta`, `deltaBullish`, `deltaBearish`) exist **only in
+  the spec**: a grep for `delta` under `src/` returns no matches, and
+  `signal-engine.pine:136` consumes only `volumeConfirmed`. Porting them would
+  have given the harness a signal the shipped indicator never emits — a
+  backtest of a feature that does not exist. **Not ported, deliberately.**
+  Same class of error as the T4 "1-indexed" claim: spec prose is not a
+  substitute for reading the source.
 
 ### T7 — Port `signal-engine.pine`
 
@@ -390,7 +405,15 @@ ports whose correctness is established by the gate itself.
       untouched. The writer also caught a **factual error in this document's
       T4**: Pine arrays are 0-indexed, not 1-indexed — corrected above and in
       the PR description.
-- [ ] T5–T7 — module ports (slices 3–4)
+- [x] **T5 + T6 — slice 3 delivered** (port structure-break +
+      imbalance-detector) → shipped as **GitHub PR #14**. 772 authored module
+      lines, **715 smoke checks** passing (96 + 619), production SHA
+      byte-identical, `src/` untouched. Second false premise caught by a
+      writer: T6's *"volume delta imbalance (§5.2.2)"* does not exist in
+      `src/` — corrected above, same class of error as T4's *"1-indexed"*.
+      A rule is now established: **if the brief and the shipped Pine source
+      disagree, the source wins and the disagreement gets reported.**
+- [ ] T7 — port signal-engine (slice 4, paired with the T8 fidelity gate)
 - [ ] T8 — fidelity gate
 - [ ] T9–T12 — labelling, baselines, search
 - [ ] T13 — findings report
@@ -402,8 +425,9 @@ ports whose correctness is established by the gate itself.
 |---|---|---|---|
 | 1 | #12 | ~300 | **~620** (`run.mjs` 617 + `.gitignore` 3) |
 | 2 | #13 | ~410 | **~899** (307 + 500 ported lines + 92 doc) |
+| 3 | #14 | ~410 | **~814** (316 + 456 ported lines + 42 doc) |
 
-Both landed at roughly double their slice forecast.
+All three landed at roughly double their slice forecast.
 
 **Slice 1** — the excess is the resumable/idempotent pagination, the dataset
 quality analysis, the report formatter, and the stale-verdict repair, all
