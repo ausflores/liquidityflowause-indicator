@@ -596,7 +596,7 @@ segments, not full-height dividers. The indicator declares `max_lines_count=500`
 on low timeframes across long ranges Pine drops the oldest lines, so boundary
 lines become unreliable past roughly 500 session opens.
 
-### 4.6 Session-Based Signal Weighting
+### 4.6 Session-Based Signal Weighting (superseded)
 
 The signal engine uses session context as a **binary gate, not a multiplier**.
 Crypto trades 24/7, so scaling confidence by session would suppress signals
