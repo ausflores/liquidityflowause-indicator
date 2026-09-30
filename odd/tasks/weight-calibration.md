@@ -38,8 +38,9 @@ The user chose Route B explicitly after seeing the tradeoff:
 candidate configuration. Route B searches; Route A confirms.
 
 The fidelity risk is controlled by an existing asset: `docs/VALIDATION.md`
-holds ~30 confirmed readings with exact dates, crosshair positions, and legend
-values. A port that reproduces those is evidence of fidelity, not an assumption.
+holds 35 confirmed readings, 8 of them bar-scoped with exact dates, crosshair
+positions, and legend values. A port that reproduces those is evidence of
+fidelity, not an assumption.
 
 ## Scope
 
@@ -253,12 +254,12 @@ is not recorded as established.
 > **⚠️ Redesign required — the checklist above as originally worded is
 > unsatisfiable, and was caught before any porting began.**
 >
-> A feasibility check against `docs/VALIDATION.md` found its 31 `confirmed`
+> A feasibility check against `docs/VALIDATION.md` found its 35 `confirmed`
 > rows are **not one gate** but three different classes:
 >
 > | Class | Examples | Replayable locally? |
 > |---|---|---|
-> | **Bar-scoped** — crosshair position determines the value | timezone legends `0/7/13` `15/22/4` `23/6/12` `4/11/17`; DST `5/12/18` → `4/11/17` on 7/10 Mar 2026; weekend `sáb 26 Sep '26 - 02:00` (4H); `volumeConfirmed` = 1 at 30 Sep 10:05 | ✅ **this is the gate** |
+> | **Bar-scoped** — crosshair position determines the value | timezone legends `0/7/13` `15/22/4` `23/6/12` `4/11/17`; DST `5/12/18` → `4/11/17` on 7/10 Mar 2026; weekend `sáb 26 Sep '26 - 02:00`; `volumeConfirmed` = 1 at 30 Sep 10:05 | ✅ **this is the gate** |
 > | **Range-scoped** — depends on how much history TradingView had loaded | `Asia 42 edges / 21 lines`, `24 live D1 zones`, `IMB DIAG virgin gaps = 2`, `budget = 1` | ❌ the load window is recorded nowhere and cannot be derived from our dataset |
 > | **Static / visual** | `Compiles` ×5, `Renders alongside`, identifier sweeps, `sb_ prefix avoids collision` | ❌ no local Pine compiler exists |
 >
@@ -271,13 +272,20 @@ is not recorded as established.
 >
 > Additional requirements the checklist above did not carry:
 >
-> - **Timeframe:** the weekend reading was taken at **4H** while the dataset is
->   5m — the harness must aggregate 5m → 4H (48 bars), plus D1 (288) and 1H (12)
->   which the Signal Engine already needs.
+> - **Timeframe:** the weekend reading was labelled **4H**, and the gate
+>   proved that label impossible (*Finding D1* — the legend samples the first
+>   bar inside the session, so it needs a grid no coarser than 1H). The harness
+>   still aggregates 5m → 4H (48 bars), because the weekend tint claim is a
+>   bar-set claim at that scale, plus D1 (288) and 1H (12) which the Signal
+>   Engine already needs.
 > - **Timezone:** readings are written in *exchange*-local time
->   (`sáb 07 Mar '26 - 22:00`). Bar *boundaries* are already proven UTC from
->   Bitstamp's native daily bars, but the *display* clock is not yet confirmed —
->   T8 must confirm it or every bar-scoped comparison is off by hours.
+>   (`sáb 07 Mar '26 - 22:00`). Bar *boundaries* are proven UTC from
+>   Bitstamp's native daily bars; the *display* clock was confirmed by the
+>   maintainer's chart screenshot as **UTC-6** on 2026-09-30, cross-checked
+>   against two known UTC merge instants. Rows that name `America/New_York`
+>   used that zone instead, so the gate resolves each reading with the zone its
+>   own row records — and prints both candidates for the one row (`:224`) that
+>   records none.
 > - **Data-free assertion:** `Score arithmetic` (row at line 307 — all 192
 >   combinations, max 110, every tier reaches 70) is pure arithmetic over the
 >   weight table and needs no candles. It was previously unused and is the
@@ -493,7 +501,7 @@ smoke suite is 957 lines because it replaced an ad-hoc one living in `Temp\`
 that would have evaporated with the temp directory.
 
 The per-slice ~400 figure is an advisory planning heuristic stated as such in
-this document, not an acceptance criterion, so both variances are recorded
+this document, not an acceptance criterion, so every variance is recorded
 rather than forcing a cosmetic split.
 
 ## Rationale
