@@ -6,3 +6,6 @@ dist/
 
 # Engram local config — machine-specific, regenerated per checkout.
 .engram/
+
+# Backtest market data — fetched by `node backtest/run.mjs fetch`, never committed.
+backtest/data/
