@@ -234,9 +234,9 @@ before investigating further.
 |---|---|---|
 | Compiles | confirmed | Pine Editor, no errors |
 | `sb_` prefix avoids collision | confirmed | compiles alongside Liquidity Zones in one script |
-| **ORPHAN flips** | **unverified** | must be 0; not yet read from the legend |
-| **flips ≤ breaks** | **unverified** | same |
-| **Structure domain** | **unverified** | `marketStructure` must stay in {-1, 0, 1} |
+| **ORPHAN flips** | **confirmed** | `SB DIAG ORPHAN flips` = 0; `SB DIAG VERDICT no-orphans` = 1 |
+| **flips ≤ breaks** | **confirmed** | `SB DIAG reversals` 19 ≤ `SB DIAG breaks total` 119; verdict = 1 |
+| **Structure domain** | **confirmed** | `SB DIAG structure` = 1; `SB DIAG VERDICT domain` = 1 |
 
 The orphan check is the one that matters. `structureFlipped` is a *property of
 a break*, so it can never be true on a bar with no break. If it is, the parallel
@@ -244,6 +244,22 @@ a break*, so it can never be true on a bar with no break. If it is, the parallel
 confidence table awarded +20 for any break plus a further +30 for a ChoCh, so
 every reversal break scored 50 for one event, enough to clear the 60-point
 threshold on structure alone.
+
+Measured 30 Sep 2026 with `node scripts/build.mjs --diagnostic=structure-break`,
+pasted into the Pine Editor on BTC/USD 5m. The legend reported, in plot order:
+
+```
+  1   119    19    0    0    0    0    1    1    1
+```
+
+- `marketStructure` = **1**, inside the {-1, 0, 1} domain, and
+  `SB DIAG VERDICT domain` = 1.
+- `sbBreaks` = **119** against `sbFlips` = **19** — cumulative reversals stay
+  well below cumulative breaks, so the reversal path never runs ahead of the
+  break path. `SB DIAG VERDICT flips<=breaks` = 1.
+- `sbOrphanFlips` = **0**, with `SB DIAG VERDICT no-orphans` = 1. Across 119
+  breaks and 19 reversals, `structureFlipped` was never true on a bar without a
+  break — the parallel-flag defect is not present.
 
 ---
 
@@ -259,7 +275,7 @@ threshold on structure alone.
 | Unresolved identifier sweep | confirmed | all 67 bare identifiers resolved against every declaration, parameter, UDT field, builtin and named argument in the spliced file |
 | Duplicate top-level declarations | confirmed | 125 zero-indent declarations scanned, none duplicated |
 | Score arithmetic | confirmed | all 192 reachable combinations enumerated: max 110, every tier reaches the 70 threshold including 1H-only |
-| **LONG/SHORT exclusivity** | **unverified** | `SE DIAG DUAL fires` not read from the legend |
+| **LONG/SHORT exclusivity** | **confirmed** | `SE DIAG DUAL fires` = 0; `SE DIAG VERDICT no-dual` = 1 |
 | **Weights calibrated** | **not attempted** | a trading judgement, not a code property |
 
 **The exclusivity check is the one that matters.** LONG and SHORT are not
@@ -269,6 +285,17 @@ volume, scores 70 on both sides and clears the threshold twice on one bar. The
 implementation resolves it with `marketStructure` as tiebreaker and drops the
 signal entirely when structure is unestablished. `SE DIAG DUAL fires` must be 0;
 a non-zero value means that block is absent or ineffective.
+
+Measured 30 Sep 2026 with `node scripts/build.mjs --diagnostic=signal-engine`,
+pasted into the Pine Editor on BTC/USD 5m. The legend reported
+`SE DIAG DUAL fires` = **0**, corroborated by `SE DIAG VERDICT no-dual` = 1 and
+by `SE DIAG VERDICT score domain` = 1. No bar in the loaded range carried both
+signals.
+
+This is a negative assertion: it establishes that no bar produced both signals,
+not that the tiebreaker branch holds under a deliberately constructed
+double-sided setup. That branch is still covered by the code reading above
+rather than by this run.
 
 **The weights are deliberately uncalibrated.** D1 30, 4H 20, 1H 10, overlap 25,
 London/NY 15, Asia 5, reversal 30 versus continuation 20, imbalance 15, volume
@@ -299,8 +326,6 @@ no static check can reach:
 
 | Item | Why it matters | Where |
 |---|---|---|
-| `SB DIAG ORPHAN flips` = 0 | `structureFlipped` reachability unconfirmed | Structure Break |
-| `SE DIAG DUAL fires` = 0 | LONG/SHORT exclusivity is unconfirmed | Signal Engine |
 | Weight calibration | a trading judgement, not a code property | Signal Engine |
 | Box liveness | not assertable from outside a module | Liquidity Zones |
 | `src/lib/inputs.pine` | does not exist yet | shared inputs |
