@@ -212,7 +212,7 @@ the only way to see more history.
 | Array within `maxImbalances` | confirmed | `IMB DIAG VERDICT budget` = 1 |
 | Touched plus virgin equals live | confirmed | `IMB DIAG VERDICT counts` = 1 |
 | **Gaps are born unfilled** | confirmed | `IMB DIAG virgin gaps` = 2, non-zero |
-| Volume confirmation reachable | unverified | `volumeConfirmed` did not fire in the observed run |
+| Volume confirmation reachable | confirmed | `IMB DIAG volumeConfirmed fired` = 1 at the crosshair bar (30 Sep 2026, 10:05) |
 
 The virgin-gap count is the load-bearing check here. The corrected spec's own
 touch pseudocode was true by construction on a gap's creation bar — a gap's
@@ -225,6 +225,27 @@ Observed: only 2 live imbalances at `imbalanceThreshold` 1.0. Most likely the
 threshold is too strict for a 1H chart rather than a detection fault, since a
 1x-ATR gap is a much larger absolute move on 1H than on 5m. Worth testing at 0.5
 before investigating further.
+
+Measured 30 Sep 2026 with `node scripts/build.mjs --diagnostic=imbalance-detector`
+on BTC/USD 5m. The legend reported, in plot order:
+
+```
+  4    1    3    0    0    1    0    1    1    1
+```
+
+- `imbLive` = 4 = `imbUntouched` 1 + `imbTouched` 3, so `IMB DIAG VERDICT
+  counts` = 1. That tautology pins the first three values exactly, and ten
+  tokens for ten `plot()` calls pins the rest, so the reading has no positional
+  ambiguity.
+- `volumeConfirmed` = **1**: on that bar `volume > ta.sma(volume, 20) *
+  volumeThreshold`, i.e. volume ran 20% above its 20-bar average. The factor is
+  reachable at the default threshold of 1.2; it simply did not happen to fire
+  during the earlier observation run.
+
+The two runs do not disagree. The earlier one was 1H, where a 1x-ATR gap is a
+much larger absolute move and only 2 live imbalances appeared. On 5m the array
+holds 4 with 1 virgin gap, still non-zero, so the `bornBar < bar_index` guard is
+doing its job on this timeframe as well.
 
 ---
 
