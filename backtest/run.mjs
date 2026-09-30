@@ -13,7 +13,7 @@
 //
 // Usage:
 //   node backtest/run.mjs fetch      download BTC/USD 5m OHLCV from Bitstamp
-//   node backtest/run.mjs validate   T8 fidelity gate (not implemented yet)
+//   node backtest/run.mjs validate   T8 fidelity gate (backtest/gate.mjs)
 //   node backtest/run.mjs baseline   T10/T11 baselines (not implemented yet)
 //   node backtest/run.mjs search     T12 weight search (not implemented yet)
 //
@@ -24,6 +24,8 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { runGate } from "./gate.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -66,7 +68,16 @@ const MARKET = "btcusd";
 const SYMBOL = "BTC/USD";
 const TIMEFRAME = "5m";
 const TIMEZONE = "UTC";
-const CHART_TIMEZONE = "exchange";
+
+// The chart's DISPLAY timezone was never recorded in docs/VALIDATION.md as a
+// single value: the DST and weekend readings name `America/New_York` (:107,
+// :171), while other positions are annotated in UTC-6 (:52, :53, :94-:96).
+// "exchange" used to be written here — but that is the indicator's
+// sessionTimezone INPUT default (src/modules/session-markers.pine), not
+// something read off the chart, so asserting it in the metadata claimed a
+// measurement that was never made. Null means "not recorded"; what IS
+// measured is the bar-boundary timezone, TIMEZONE (UTC), below.
+const CHART_TIMEZONE = null;
 
 const OHLC_URL = `https://www.bitstamp.net/api/v2/ohlc/${MARKET}/`;
 const STEP_SEC = 300;
@@ -194,6 +205,12 @@ function buildMeta(candles, status, requestsTotal, duplicates) {
       "Bitstamp native daily bars start at exact UTC midnights, so bar " +
       "boundaries are UTC; timestamps are epoch milliseconds (absolute).",
     chartTimezone: CHART_TIMEZONE,
+    chartTimezoneNote:
+      "Not recorded: docs/VALIDATION.md names America/New_York as the chart timezone " +
+      "for the DST and weekend readings (:107, :171) but annotates other chart " +
+      "positions in UTC-6 (:52, :53, :94-:96). The indicator's sessionTimezone input " +
+      "default is \"exchange\" — an input default, never measured off the chart. " +
+      "Bar boundaries are UTC (timezone field above), which is measured.",
     timeUnit: "epoch_ms",
     count: candles.length,
     firstTimestampMs: firstMs,
@@ -410,7 +427,10 @@ function printReport(meta, requestsThisRun, headline) {
   console.log(`fetch:   symbol            ${SYMBOL} (${MARKET})`);
   console.log(`fetch:   timeframe         ${TIMEFRAME} (${STEP_SEC}s)`);
   console.log(`fetch:   timezone          ${TIMEZONE} (epoch milliseconds)`);
-  console.log(`fetch:   chart timezone    "${CHART_TIMEZONE}" (validation chart) resolves to ${TIMEZONE} bar boundaries`);
+  console.log(
+    `fetch:   chart timezone    not recorded — docs/VALIDATION.md names America/New_York for ` +
+      `the DST/weekend readings and annotates others in UTC-6 (bar boundaries: ${TIMEZONE})`,
+  );
   console.log(`fetch:   status            ${meta.status}`);
   console.log(`fetch:   first timestamp   ${meta.firstTimestampIso}  (${meta.firstTimestampMs} ms)`);
   console.log(`fetch:   last timestamp    ${meta.lastTimestampIso}  (${meta.lastTimestampMs} ms)`);
@@ -600,7 +620,7 @@ if (subcommand === undefined || !SUBCOMMANDS.includes(subcommand)) {
     if (subcommand === "fetch") {
       process.exitCode = await cmdFetch();
     } else if (subcommand === "validate") {
-      stub("T8 fidelity gate");
+      process.exitCode = await runGate();
     } else if (subcommand === "baseline") {
       stub("T10/T11 baselines");
     } else if (subcommand === "search") {
@@ -608,10 +628,12 @@ if (subcommand === undefined || !SUBCOMMANDS.includes(subcommand)) {
     }
   } catch (err) {
     console.log("");
-    console.log(`fetch: FAILED - ${err.message}`);
-    console.log("");
-    console.log("fetch: partial data, if any, is on disk marked as partial.");
-    console.log("fetch: re-run `node backtest/run.mjs fetch` to resume.");
+    console.log(`${subcommand}: FAILED - ${err.message}`);
+    if (subcommand === "fetch") {
+      console.log("");
+      console.log("fetch: partial data, if any, is on disk marked as partial.");
+      console.log("fetch: re-run `node backtest/run.mjs fetch` to resume.");
+    }
     process.exitCode = 1;
   }
 }

@@ -202,25 +202,53 @@ to the verdict.
   Same class of error as the T4 "1-indexed" claim: spec prose is not a
   substitute for reading the source.
 
-### T7 — Port `signal-engine.pine`
+### T7 — Port `signal-engine.pine` ✅ (delivered in slice 4 · GitHub PR #15)
 
-- [ ] Port the 10 weights, the factor set, the `sessionOK` gate, and score
+- [x] Port the 10 weights, the factor set, the `sessionOK` gate, and score
   arithmetic (max 110, threshold 70).
-- [ ] Make the weight vector and threshold **parameters of the harness**, not
-  constants — this is the entire point of the feature.
-- [ ] Emit the per-factor contributions so results are explainable, not opaque.
+- [x] Make the weight vector and threshold **parameters of the harness**, not
+  constants — this is the entire point of the feature. Flat
+  `SIGNAL_ENGINE_DEFAULTS` plus exported `SIGNAL_ENGINE_WEIGHT_KEYS` in Pine
+  order for T12's search; `maxScore` is derived from the configured vector.
+- [x] Emit the per-factor contributions so results are explainable, not opaque
+  — `longFactors` / `shortFactors`, each `{ liquidity, session, structure,
+  imbalance, volume }`, with `sumFactors(...) === score` enforced.
 
-### T8 — Fidelity gate (HARD STOP)
+### T8 — Fidelity gate (HARD STOP) ✅ (ran in slice 4 · PASS 9/9)
 
-- [ ] Extract every confirmed reading from `docs/VALIDATION.md` that has an
-  exact date, crosshair position, and legend value.
-- [ ] Replay the port over the matching bars and compare field by field.
-- [ ] **Any mismatch stops the feature.** Fix the port and re-run; do not
-  proceed to T10–T12 on a partially matching port.
-- [ ] Record pass/fail per reading. The gate result is reported verbatim —
-  no summary that hides a failure.
-- [ ] Note honestly what the gate does **not** prove: it samples readings that
-  were chosen to be legible, not a random sample of all bars.
+- [x] Extract every confirmed reading from `docs/VALIDATION.md` that has an
+  exact date, crosshair position, and legend value — **8 of the 35 `confirmed`
+  rows are bar-scoped and replayable**; the class B/C split is printed by the
+  gate on every run.
+- [x] Replay the port over the matching bars and compare field by field —
+  `node backtest/run.mjs validate` → **`GATE RESULT: PASS — 9/9 Class A
+  readings reproduced`**, exit 0. Re-run independently by the orchestrator,
+  same result.
+- [x] **Any mismatch stops the feature.** None occurred.
+- [x] Record pass/fail per reading; the gate prints the full table, every
+  assumption (A1–A7), every excluded row with its reason, and every
+  brief-vs-source disagreement (D1–D5). Nothing is summarized away.
+- [x] Note honestly what the gate does **not** prove: 8 of 35 confirmed rows,
+  chosen for legibility rather than sampled at random; it never executes Pine;
+  it says nothing about the weights as trading parameters (`:309`, not
+  attempted by design).
+
+**Finding D1 — a real defect in `docs/VALIDATION.md`, now corrected there.**
+The DST and weekend captures were labelled `timeframe 4H`, but the diagnostic
+legend samples **the first bar inside the session** (`scripts/build.mjs:345`,
+`ta.change(inX) and inX`, held with `var`), so it is grid-dependent. The three
+session opens sit on three different residues mod 4 — on a 4H grid the tuples
+would read `0/8/16`, `16/0/4`, `0/8/12`, `4/12/20`, `8/12/20`, never the
+recorded `0/7/13`, `15/22/4`, `23/6/12`, `4/11/17`, `5/12/18`. **The label was
+wrong, not the values.** Both labels changed to `1H or finer`, with the proof
+written into `docs/VALIDATION.md` as *Correction: the `4H` label*.
+
+**Finding D2 was downgraded by the orchestrator, not accepted.** The worker
+argued the crosshair times (`22:00`, `02:00`) prove the display was UTC-6.
+That arithmetic only holds **given a 4H grid** — once D1 removes the 4H label,
+those times are equally valid bar times under `America/New_York` on a finer
+grid. D2 is a consequence of the same mislabel, not independent evidence, and
+is not recorded as established.
 
 > **⚠️ Redesign required — the checklist above as originally worded is
 > unsatisfiable, and was caught before any porting began.**
@@ -413,8 +441,22 @@ ports whose correctness is established by the gate itself.
       `src/` — corrected above, same class of error as T4's *"1-indexed"*.
       A rule is now established: **if the brief and the shipped Pine source
       disagree, the source wins and the disagreement gets reported.**
-- [ ] T7 — port signal-engine (slice 4, paired with the T8 fidelity gate)
-- [ ] T8 — fidelity gate
+- [x] **T7 + T8 — slice 4 delivered** (port signal-engine + fidelity gate)
+      → shipped as **GitHub PR #15**. **T8 verdict: `GATE RESULT: PASS — 9/9
+      Class A readings reproduced`**, independently re-run by the orchestrator
+      with the same result (smoke 1153/0, production SHA byte-identical,
+      `src/` untouched). 1,389 lines of module and gate code (597 signal-engine
+      + 835 gate), 957-line smoke suite moved from `Temp\` into the repo so it
+      survives a clean checkout, `CHART_TIMEZONE` constant corrected.
+      **Fourth brief-vs-source disagreement, this time against the
+      orchestrator's own brief**: it said the engine consumed session
+      *multipliers*; `signal-engine.pine:83` gates on
+      `sessionOK = sessionStrength >= 2` and the source comment states the
+      multiplier is deliberately unused — scaling a weak setup down is not the
+      same as suppressing it. Ported the source. **Two documentation defects
+      found**: the `4H` label in `docs/VALIDATION.md` (corrected with proof) and
+      `backtest/run.mjs:69`'s `CHART_TIMEZONE = "exchange"` presented as a
+      chart observation when it is the indicator's input default.
 - [ ] T9–T12 — labelling, baselines, search
 - [ ] T13 — findings report
 - [ ] Findings reported
@@ -426,8 +468,9 @@ ports whose correctness is established by the gate itself.
 | 1 | #12 | ~300 | **~620** (`run.mjs` 617 + `.gitignore` 3) |
 | 2 | #13 | ~410 | **~899** (307 + 500 ported lines + 92 doc) |
 | 3 | #14 | ~410 | **~814** (316 + 456 ported lines + 42 doc) |
+| 4 | #15 | ~380 | **~2556** (597 signal-engine + 835 gate + 957 smoke + 38 run.mjs + 129 doc) |
 
-All three landed at roughly double their slice forecast.
+Every slice landed over its forecast.
 
 **Slice 1** — the excess is the resumable/idempotent pagination, the dataset
 quality analysis, the report formatter, and the stale-verdict repair, all
@@ -439,6 +482,15 @@ false `target MET`.
 array-semantics correction, plus the port prose explaining each index decision.
 A shorter port would be unreviewable: the off-by-one risk here is *silent*, so
 the reasoning has to live beside the code it affects.
+
+**Slice 4** — nearly seven times its forecast, and the forecast is what failed,
+not the work. The ~380 figure costed the 597-line engine port and nothing else:
+the gate runner (835) and the smoke suite (957) were not costed at all. The
+gate is long for the same reason the ports are long — it prints every
+assumption, every excluded row with its reason, and both timezone candidates
+for each ambiguous reading, which is the only way a `PASS` means anything. The
+smoke suite is 957 lines because it replaced an ad-hoc one living in `Temp\`
+that would have evaporated with the temp directory.
 
 The per-slice ~400 figure is an advisory planning heuristic stated as such in
 this document, not an acceptance criterion, so both variances are recorded

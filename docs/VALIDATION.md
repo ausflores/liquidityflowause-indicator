@@ -104,8 +104,9 @@ year of chart data.
 
 The series was read either side of the **8 Mar 2026** boundary — the second
 Sunday in March, when the United States moves EST → EDT. Chart timezone
-`America/New_York`, timeframe 4H, crosshair position taken from the date
-readout under the time axis rather than estimated from the plot:
+`America/New_York`, timeframe 1H or finer (see *Correction: the `4H` label*
+below), crosshair position taken from the date readout under the time axis
+rather than estimated from the plot:
 
 | Crosshair | Zone | Asia | London | NY |
 |---|---|---|---|---|
@@ -117,6 +118,35 @@ boundary; the UTC offset does, so 0000 / 0700 / 1300 New York land one hour
 earlier in UTC once EDT begins. The post-step values are the EDT `4/11/17`
 already recorded for 29 Sep 2026, so this boundary test re-confirms the
 America/New_York timezone row as well.
+
+#### Correction: the `4H` label
+
+The DST and weekend captures above were originally recorded as
+`timeframe 4H`. That label is inconsistent with the values recorded beside it
+and has been changed to `1H or finer`. **The values are unchanged** — they are
+what the T8 fidelity gate in `backtest/gate.mjs` replays and reproduces.
+
+The diagnostic series in `scripts/build.mjs` samples **the first bar that falls
+inside the session** (`ta.change(inX) and inX`, held with `var`), so the legend
+reports the hour of the *opening bar*, not the hour of the session window. It
+is therefore grid-dependent. The windows open on whole hours in every zone
+below, so a 1H or finer grid lands on all three; a 4H grid does not:
+
+| `sessionTimezone` | zone | recorded | on a 4H grid |
+|---|---|---|---|
+| UTC | — | `0/7/13` | `0/8/16` |
+| Asia/Tokyo | JST | `15/22/4` | `16/0/4` |
+| Europe/London | BST | `23/6/12` | `0/8/12` |
+| America/New_York | EDT | `4/11/17` | `4/12/20` |
+| America/New_York | EST | `5/12/18` | `8/12/20` |
+
+The three session opens sit on three different residues mod 4, so no 4H grid
+can contain all three. The recorded tuples are reachable only on a grid no
+coarser than 1H, which is why the label was corrected and not the values.
+
+The weekend reading is unaffected apart from its own label: the tint claims
+are bar-set claims and hold on any grid — 6/6 4H bars per day and 288/288 5m
+bars per day, both days fully tinted.
 
 A reading only means something when the crosshair is actually on a bar. With
 the pointer off the chart the legend reports the **last** bar — which on
@@ -167,7 +197,8 @@ land on a Saturday or a Sunday, so the two rightmost days of a Fri–Sun range
 would carry no tint at all; under `1234567` they carry the full three-session
 pattern.
 
-Read with the crosshair on `sáb 26 Sep '26 — 02:00`, timeframe 4H, timezone
+Read with the crosshair on `sáb 26 Sep '26 — 02:00`, timeframe 1H or finer
+(see *Correction: the `4H` label* in the DST section above), timezone
 `America/New_York`:
 
 - session tints present across Sat 26 and Sun 27, with no untinted strip
