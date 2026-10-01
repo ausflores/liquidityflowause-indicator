@@ -44,6 +44,16 @@ import {
   BINARY_INPUT_CONTRACT,
   BINARY_MODEL_DEFAULTS,
 } from "./modules/binary.mjs";
+import {
+  newNearTally,
+  newSplit,
+  newTally,
+  phaseOf,
+  qualifyingTier,
+  recordNear,
+  recordSplit,
+  recordTier,
+} from "./tier-diagnostic.mjs";
 
 const counts = {};
 let section = "untitled";
@@ -1644,6 +1654,219 @@ sec("baseline-wiring");
   );
 }
 
+// ─── 9. tier diagnostic helpers (weight-calibration) ─────────────────────────
+//
+// The diagnostic's own PURE helpers, on synthetic, DATA-FREE input. The
+// dataset-driven half of tier-diagnostic.mjs is deliberately not exercised
+// here: this suite must stay runnable with backtest/data/ absent.
+//
+// What is covered:
+//   * the tier rule itself, against a KNOWN ZONE SET built by hand;
+//   * the highest-tier-wins reduction, including that tiers never add up;
+//   * the in-body exclusion — the mechanism behind the whole diagnostic, and
+//     the thing a reader must not mistake for a defect;
+//   * the before/after warm-up split logic.
+
+sec("tier-diagnostic");
+{
+  // ── The tier rule, given a known zone set ────────────────────────────────
+  // A D1 pivot at 100, an H4 pivot at 101, an H1 pivot at 102, all below a
+  // close of 106.5. atrChart 3 gives a proximity band of 3 x 3 = 9, so all
+  // three are within it, and all three are on the LONG side (center < close).
+  const lzTier = createLiquidityZones();
+  const b0 = lzTier.evaluate({
+    barIndex: 0,
+    high: 107,
+    low: 106,
+    close: 106.5,
+    atrChart: 3,
+    atrH4: 8,
+    atrD1: 10,
+    atrH1: 4,
+    pivots: { d1High: 100, h4High: 101, h1High: 102 },
+  });
+  check(
+    b0.zones.map((z) => z.tier).join(",") === "1,2,3",
+    `zone set carries tiers 1/2/3 in slot order (got ${b0.zones.map((z) => z.tier).join(",")})`,
+  );
+  check(
+    b0.nearD1LiquidityLong && b0.nearH4LiquidityLong && b0.nearH1LiquidityLong,
+    "all three tier flags coexist — the module emits six booleans, not one tier",
+  );
+  check(
+    qualifyingTier({
+      d1: b0.nearD1LiquidityLong,
+      h4: b0.nearH4LiquidityLong,
+      h1: b0.nearH1LiquidityLong,
+    }) === "D1",
+    "with all three zones near, the qualifying tier is D1 (highest wins)",
+  );
+
+  // The reduction is direction-blind and highest-first. Tiers NEVER add up.
+  check(qualifyingTier({ d1: true, h4: true, h1: true }) === "D1", "D1 beats H4 and H1");
+  check(qualifyingTier({ d1: false, h4: true, h1: true }) === "H4", "H4 beats H1");
+  check(qualifyingTier({ d1: false, h4: false, h1: true }) === "H1", "H1 alone qualifies");
+  check(qualifyingTier({ d1: false, h4: false, h1: false }) === null, "no tier -> null");
+  check(
+    SIGNAL_ENGINE_DEFAULTS.liquidityD1 > SIGNAL_ENGINE_DEFAULTS.liquidityH4 &&
+      SIGNAL_ENGINE_DEFAULTS.liquidityH4 > SIGNAL_ENGINE_DEFAULTS.liquidityH1,
+    "shipped weights are ordered to match the reduction's precedence",
+  );
+
+  // ── The in-body exclusion (the mechanism, and the trap) ───────────────────
+  // A D1 zone at 100 with atrD1 10 has halfWidth 5, so its body spans 95-105.
+  // Proximity band is 9 (3 x atrChart 3). With the body wider than the band, a
+  // close can be "near" the zone and inside its body at the same time.
+  const inBody = lzTier.evaluate({
+    barIndex: 1,
+    high: 104.5,
+    low: 103.5,
+    close: 104,
+    atrChart: 3,
+    atrH4: 8,
+    atrD1: 10,
+    atrH1: 4,
+    pivots: {},
+  });
+  const dist = Math.abs(104 - 100);
+  check(
+    dist <= 3 * 3,
+    `the close is inside the proximity band (${dist} <= 9)`,
+  );
+  check(
+    inBody.nearD1LiquidityLong === false,
+    "but the bar is inside the zone BODY, so the tier flag is withheld by design",
+  );
+  check(inBody.sweptLong === true, "an in-body D1 zone reports through sweptLong instead");
+
+  // The same zone from OUTSIDE its body does fire the flag — so the withheld
+  // flag above is the in-body rule, not a broken tier assignment.
+  const outside = lzTier.evaluate({
+    barIndex: 2,
+    high: 108.5,
+    low: 108,
+    close: 108,
+    atrChart: 3,
+    atrH4: 8,
+    atrD1: 10,
+    atrH1: 4,
+    pivots: {},
+  });
+  check(
+    outside.nearD1LiquidityLong === true,
+    "the same D1 zone fires nearD1 from outside its body — tier assignment works",
+  );
+  check(
+    qualifyingTier({
+      d1: outside.nearD1LiquidityLong,
+      h4: outside.nearH4LiquidityLong,
+      h1: outside.nearH1LiquidityLong,
+    }) === "D1",
+    "and it still outranks the H4 and H1 zones on the same bar",
+  );
+
+  // ── recordTier: the two structural contradictions ─────────────────────────
+  const t0 = newTally();
+  check(
+    t0.bars === 0 && t0.anyFlag === 0 && t0.D1 === 0 && t0.flagWithoutTier === 0,
+    "newTally starts zeroed on every key",
+  );
+  recordTier(t0, { anyFlag: true, d1: false, h4: true, h1: true });
+  recordTier(t0, { anyFlag: true, d1: false, h4: false, h1: true });
+  recordTier(t0, { anyFlag: false, d1: false, h4: false, h1: false });
+  check(t0.bars === 3 && t0.anyFlag === 2 && t0.none === 1, "bars / anyFlag / none tallied");
+  // The tally counts the QUALIFYING tier, so an observation with H4 and H1 both
+  // set lands on H4 only. Raw per-tier presence is counted separately by
+  // recordNear — conflating the two is how a reader would misread section B.
+  check(
+    t0.H4 === 1 && t0.H1 === 1 && t0.D1 === 0,
+    "the tally records the QUALIFYING tier only — H4 beats H1, it is not double-counted",
+  );
+  check(
+    t0.flagWithoutTier === 0 && t0.tierWithoutFlag === 0,
+    "a consistent observation raises neither contradiction counter",
+  );
+  // Both contradictions are structurally impossible in a correct port, so the
+  // counters must be able to detect them.
+  const tBad = newTally();
+  recordTier(tBad, { anyFlag: true, d1: false, h4: false, h1: false });
+  recordTier(tBad, { anyFlag: false, d1: true, h4: false, h1: false });
+  check(tBad.flagWithoutTier === 1, "side flag set with no tier is counted, not ignored");
+  check(tBad.tierWithoutFlag === 1, "tier set with no side flag is counted, not ignored");
+
+  // ── recordNear: proximity isolated from the other gates ───────────────────
+  const n0 = newNearTally();
+  recordNear(n0, { d1: true, h4: false, h1: true });
+  recordNear(n0, { d1: false, h4: false, h1: false });
+  check(n0.bars === 2 && n0.D1 === 1 && n0.H4 === 0 && n0.H1 === 1, "per-tier near tallies");
+  check(n0.any === 1 && n0.none === 1, "any/near-none tallies");
+
+  // ── The before/after warm-up split ───────────────────────────────────────
+  check(phaseOf(0, 5) === "pre-warmup", "bar before the boundary is pre-warmup");
+  check(phaseOf(4, 5) === "pre-warmup", "the bar immediately before is pre-warmup");
+  check(phaseOf(5, 5) === "post-warmup", "the boundary bar ITSELF is post-warmup");
+  check(phaseOf(99, 5) === "post-warmup", "a bar after the boundary is post-warmup");
+  check(
+    phaseOf(0, null) === "pre-warmup" && phaseOf(999, null) === "pre-warmup",
+    "a null boundary (no D1 zone ever) puts every bar pre-warmup",
+  );
+
+  const split = newSplit();
+  const longSide = (d1, h4, h1) => ({ long: { anyFlag: true, d1, h4, h1 }, short: { anyFlag: false, d1: false, h4: false, h1: false } });
+  for (let barIndex = 0; barIndex < 10; barIndex++) {
+    // D1 appears from bar 6 onward; the boundary is bar 5.
+    recordSplit(split, barIndex, 5, longSide(barIndex >= 6, false, true));
+  }
+  check(
+    split["pre-warmup"].long.D1 === 0 && split["post-warmup"].long.D1 === 4,
+    `the split attributes D1 bars to the right phase (pre ${split["pre-warmup"].long.D1}, post ${split["post-warmup"].long.D1})`,
+  );
+  check(
+    split["pre-warmup"].long.bars === 5 && split["post-warmup"].long.bars === 5,
+    "every bar lands in exactly one phase — 5 pre, 5 post",
+  );
+  // H1 coexists with D1 on bars 6-9, but the tally is qualifying-tier-only, so
+  // those four land on D1 and H1 is counted once (bar 5, where D1 is absent).
+  check(
+    split["pre-warmup"].long.H1 === 5 && split["post-warmup"].long.H1 === 1,
+    "a coexisting H1 is outranked by D1 in the tally — the split keeps the same rule",
+  );
+  const splitNull = newSplit();
+  recordSplit(splitNull, 0, null, longSide(true, false, false));
+  check(
+    splitNull["pre-warmup"].long.D1 === 1 && splitNull["post-warmup"].long.D1 === 0,
+    "a null boundary keeps the post phase empty rather than inventing one",
+  );
+
+  // ── Wiring: the diagnostic is dispatched, isolated and T12 is intact ──────
+  const runSrc = readFileSync(new URL("./run.mjs", import.meta.url), "utf8");
+  const diagSrc = readFileSync(new URL("./tier-diagnostic.mjs", import.meta.url), "utf8");
+
+  check(
+    runSrc.includes('import { runTierDiagnostic } from "./tier-diagnostic.mjs"'),
+    "run.mjs imports the tier diagnostic",
+  );
+  check(
+    /subcommand === "diagnose"[\s\S]{0,160}runTierDiagnostic\(\{ json: process\.argv\.includes\("--json"\) \}\)/.test(
+      runSrc,
+    ),
+    "diagnose dispatch runs the diagnostic with the --json flag",
+  );
+  check(
+    runSrc.includes('SUBCOMMANDS = ["fetch", "validate", "baseline", "diagnose", "search"]'),
+    "diagnose is registered in SUBCOMMANDS",
+  );
+  check(runSrc.includes('stub("T12 weight search")'), "T12 search still stubbed — out of scope");
+  check(
+    diagSrc.includes("readFile(DATASET_PATH") && diagSrc.includes("runTierDiagnostic"),
+    "the diagnostic is a data-reading subcommand, not a stub",
+  );
+  check(
+    !diagSrc.includes('from "./baseline.mjs"') && !diagSrc.includes("runComparison"),
+    "the diagnostic does NOT import baseline.mjs — it cannot perturb the comparison",
+  );
+}
+
 // ─── Report ─────────────────────────────────────────────────────────────────
 
 const ORDER = [
@@ -1655,6 +1878,7 @@ const ORDER = [
   "outcome-labels",
   "binary-model",
   "baseline-wiring",
+  "tier-diagnostic",
 ];
 console.log("section            checks");
 for (const name of ORDER) {
