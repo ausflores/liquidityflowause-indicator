@@ -86,9 +86,13 @@
 // ============================================================================
 
 import { readFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 
+import {
+  DEFAULT_TIMEFRAME,
+  getTimeframe,
+  htfAvailability,
+  nativeBarsForDays,
+} from "./timeframes.mjs";
 import { createSessionMarkers } from "./modules/session-markers.mjs";
 import {
   createAtr,
@@ -111,17 +115,43 @@ import {
   labelSignalsForwardReturn,
 } from "./modules/label.mjs";
 
-const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const DATASET_REL = "backtest/data/btcusd-5m.json";
-const DATASET_PATH = join(ROOT, "backtest", "data", "btcusd-5m.json");
-const META_PATH = join(ROOT, "backtest", "data", "btcusd-5m.meta.json");
-
 const SCHEMA_VERSION = 1;
 
-const MS_5M = 300000;
 const MS_1H = 3600000;
 const MS_4H = 14400000;
 const MS_1D = 86400000;
+
+// ─── Timeframe ───────────────────────────────────────────────────────────────
+//
+// `tf` is threaded through everything below rather than read from a module
+// constant, so two timeframes can never be mixed inside one run. It defaults to
+// 5m: every pre-slice-7 caller (and every documented command line) is unchanged.
+//
+// The NATIVE grid changes with it, and that is the point rather than a
+// nuisance. On 1h, `atrChart` is ATR(14) of HOUR bars — fourteen hours, not
+// fourteen times five minutes — and the H4/D1 tiers aggregate on a different
+// grid. That is what TradingView computes on a 1h chart, so the run is
+// comparable TO Pine on that chart; it is NOT the 5m run with more history, and
+// nothing in this report lets a reader assume otherwise (caveat [C0], and the
+// `[C0]` banners under sections 2 and 4).
+
+const DEFAULT_TF = getTimeframe(DEFAULT_TIMEFRAME);
+
+/**
+ * Higher-timeframe contexts are only built when the dataset can produce them.
+ *
+ * Pine's `request.security(syminfo.tickerid, "60", ...)` returns 1h bars even on
+ * a 4h chart, because Pine asks the exchange for 1h data regardless of the
+ * chart's own resolution. This harness cannot: it aggregates the one dataset it
+ * was handed. So on a 4h dataset the 1H context is NOT synthesised — it is
+ * reported as unavailable, and the report says so. Reporting an empty H1 tier as
+ * if it were a finding would read as "the H1 tier produced nothing" when the
+ * truth is "a 4h dataset contains no 1h candles".
+ */
+function htfContexts(tf) {
+  const { available, unavailable } = htfAvailability(tf.stepMs);
+  return { available, unavailable };
+}
 
 const out = (s = "") => console.log(`baseline: ${s}`);
 
@@ -134,6 +164,21 @@ const sgn = (v) => (v > 0 ? "+" : "") + Number(v).toLocaleString("en-US");
 const round = (v, dp) => (v === null || v === undefined ? null : Number(v.toFixed(dp)));
 const padL = (s, w) => String(s).padEnd(w);
 const padR = (s, w) => String(s).padStart(w);
+
+/**
+ * Horizon label. The horizon is a BAR COUNT, so its wall-clock length depends on
+ * the native grid: "6 (30m)" on 5m, "6 (6h)" on 1h.
+ *
+ * 5m is special-cased to MINUTES because that is what this report has always
+ * printed, and the 5m output is contractually byte-identical. The coarser grids
+ * get hours, where "12 (1h)" is what a reader expects on an hourly chart.
+ */
+function horizonLabel(h, tf) {
+  const totalMinutes = h * tf.minutesPerBar;
+  if (tf.id === "5m" || totalMinutes < 60) return `${h} (${totalMinutes}m)`;
+  if (totalMinutes % 60 === 0) return `${h} (${totalMinutes / 60}h)`;
+  return `${h} (${Math.floor(totalMinutes / 60)}h${totalMinutes % 60}m)`;
+}
 
 function meanOf(values) {
   if (values.length === 0) return null;
@@ -190,38 +235,48 @@ function bump(map, key) {
 
 // ─── Dataset ────────────────────────────────────────────────────────────────
 
-async function loadDataset() {
+async function loadDataset(tf) {
   let candles;
   try {
-    candles = JSON.parse(await readFile(DATASET_PATH, "utf8")).candles;
+    candles = JSON.parse(await readFile(tf.datasetPath, "utf8")).candles;
   } catch (err) {
     throw new Error(
-      `dataset unavailable (${err.message}) at ${DATASET_REL} — backtest/data/ is ` +
-        "gitignored; run `node backtest/run.mjs fetch` first",
+      `dataset unavailable (${err.message}) at ${tf.datasetRel} — backtest/data/ is ` +
+        `gitignored; run \`node backtest/run.mjs fetch --timeframe ${tf.id}\` first`,
     );
   }
   if (!Array.isArray(candles) || candles.length === 0) {
-    throw new Error(`dataset at ${DATASET_REL} has no candles`);
+    throw new Error(`dataset at ${tf.datasetRel} has no candles`);
   }
 
   let meta = null;
   try {
-    meta = JSON.parse(await readFile(META_PATH, "utf8"));
+    meta = JSON.parse(await readFile(tf.metaPath, "utf8"));
   } catch {
     meta = null; // header degrades to nulls; nothing downstream needs it
   }
   return { candles, meta };
 }
 
-// ─── HTF aggregation (5m → 1H/4H/D1), lookahead-off semantics ───────────────
+// ─── HTF aggregation (native → 1H/4H/D1), lookahead-off semantics ───────────
 //
-// Returns the COMPLETED HTF bar on the chart bar where its last 5m candle
+// Returns the COMPLETED HTF bar on the chart bar where its last NATIVE candle
 // closes, else null. A bucket that changes without ever completing (a data
 // gap) is counted in `droppedBuckets` and reported — never silently smoothed
 // over, because a half-formed HTF bar would feed a wrong pivot/ATR to the
 // zone engine.
 //
-function createHtfSeries(tfMs) {
+// `nativeStepMs` is the DATASET's step, and the completion test depends on it:
+// on 5m a D1 bucket completes when a candle lands on the last 5m slot of the
+// day, and on 4h when one lands on the last 4h slot. Hard-coding 300000 here
+// would make a 4h dataset complete no bucket at all, which would silently
+// empty the D1 tier — the precise failure this slice has to avoid.
+//
+// A tier FINER than the native grid cannot be aggregated at all (see
+// htfContexts above). Such a series is returned as unavailable and never fed;
+// the report prints the omission instead of an empty result.
+//
+function createHtfSeries(tfMs, nativeStepMs) {
   let bucket = null;
   let acc = null;
   let droppedBuckets = 0;
@@ -242,7 +297,7 @@ function createHtfSeries(tfMs) {
         acc.c = c.c;
         acc.v += c.v;
       }
-      if (c.t + MS_5M === bucket + tfMs) {
+      if (c.t + nativeStepMs === bucket + tfMs) {
         const done = acc;
         bucket = null;
         acc = null;
@@ -253,10 +308,16 @@ function createHtfSeries(tfMs) {
   };
 }
 
-/** One HTF context: the aggregator, its ATR(14), its liquidity pivot pair. */
-function createHtfContext(tfMs) {
+/**
+ * One HTF context: the aggregator, its ATR(14), its liquidity pivot pair.
+ * `available: false` means the dataset cannot produce this timeframe at all —
+ * distinct from "produced nothing", and reported differently.
+ */
+function createHtfContext(tfMs, tf, available) {
   return {
-    series: createHtfSeries(tfMs),
+    available,
+    tfMs,
+    series: available ? createHtfSeries(tfMs, tf.stepMs) : null,
     atr: createAtr({ length: 14 }),
     atrValue: null,
     // Pivot lengths are the Pine INPUT defaults (liquidity-zones.pine:35-36),
@@ -382,8 +443,9 @@ function sharedDeltas(a, b, prefix = "", into = []) {
 
 // ─── The comparison ─────────────────────────────────────────────────────────
 
-function runComparison(candles, meta) {
+function runComparison(candles, meta, tf) {
   const n = candles.length;
+  const barsPerDay = MS_1D / tf.stepMs;
   // label.mjs reads { high, low, close }; the dataset holds { t, o, h, l, c, v }.
   // Established mapping (backtest/gate.mjs:332-338, label.mjs header).
   const labelCandles = candles.map((c) => ({ high: c.h, low: c.l, close: c.c }));
@@ -392,10 +454,11 @@ function runComparison(candles, meta) {
   // configuration, so no factory call here passes an override) ──────────────
   const session = createSessionMarkers();
   const chartAtr = createAtr({ length: 14 });
+  const avail = htfAvailability(tf.stepMs);
   const ctx = {
-    h1: createHtfContext(MS_1H),
-    h4: createHtfContext(MS_4H),
-    d1: createHtfContext(MS_1D),
+    h1: createHtfContext(MS_1H, tf, avail.available.h1),
+    h4: createHtfContext(MS_4H, tf, avail.available.h4),
+    d1: createHtfContext(MS_1D, tf, avail.available.d1),
   };
   // Structure Break's OWN 1H pivot detector, length structPivotLen (default 5).
   // Deliberately a second instance on the 1H series: it must not be shared
@@ -464,7 +527,7 @@ function runComparison(candles, meta) {
     noteFirst("atrChart", atrChart, i);
 
     // ── HTF completions (lookahead_off: visible on the closing chart bar) ───
-    const h1Bar = ctx.h1.series.feed(c);
+    const h1Bar = ctx.h1.available ? ctx.h1.series.feed(c) : null;
     if (h1Bar) {
       const p = ctx.h1.liqPivot.update({ high: h1Bar.h, low: h1Bar.l });
       ctx.h1.liq = { high: p.pivotHigh, low: p.pivotLow };
@@ -475,7 +538,7 @@ function runComparison(candles, meta) {
       structPivots = { high: sp.pivotHigh, low: sp.pivotLow };
       notePivot("structPivotH1", structPivots, i);
     }
-    const h4Bar = ctx.h4.series.feed(c);
+    const h4Bar = ctx.h4.available ? ctx.h4.series.feed(c) : null;
     if (h4Bar) {
       const p = ctx.h4.liqPivot.update({ high: h4Bar.h, low: h4Bar.l });
       ctx.h4.liq = { high: p.pivotHigh, low: p.pivotLow };
@@ -483,7 +546,7 @@ function runComparison(candles, meta) {
       ctx.h4.atrValue = ctx.h4.atr.update({ high: h4Bar.h, low: h4Bar.l, close: h4Bar.c });
       noteFirst("atrH4", ctx.h4.atrValue, i);
     }
-    const d1Bar = ctx.d1.series.feed(c);
+    const d1Bar = ctx.d1.available ? ctx.d1.series.feed(c) : null;
     if (d1Bar) {
       const p = ctx.d1.liqPivot.update({ high: d1Bar.h, low: d1Bar.l });
       ctx.d1.liq = { high: p.pivotHigh, low: p.pivotLow };
@@ -739,8 +802,28 @@ function runComparison(candles, meta) {
   // FIRST, before the headline numbers it scopes. The eight caveats below
   // keep their exact previous labels: they shift one index up and lose the
   // +1 in the label formula, which cancels out ([C1]..[C8] unchanged).
-  const caveats = [
-    "EVERY NUMBER IS SCOPED TO 5-MINUTE DATA. The dataset is 62,000 5m candles; the " +
+  // Caveat [C0] is TIMEFRAME-SPECIFIC by construction: it states what this
+  // particular grid can and cannot produce, with the numbers measured above.
+  // On 5m it reproduces slice 6's finding verbatim. On 1h and 4h it states what
+  // THIS grid actually produced instead — same shape, measured values, no
+  // carried-over 5m numbers. A caveat that quoted 5m figures under a 1h header
+  // would be the exact copy-paste failure the slice forbids.
+  const firstD1PivotBar = warmup.liqPivotD1?.barIndex ?? null;
+  const candLong = condCount.long;
+  const candShort = condCount.short;
+  const tierD1Long = condTier.long.get("D1") ?? 0;
+  const tierD1Short = condTier.short.get("D1") ?? 0;
+  const tierH4Long = condTier.long.get("H4") ?? 0;
+  const tierH4Short = condTier.short.get("H4") ?? 0;
+  const candLongMax = scoreCandidate.long.length ? Math.max(...scoreCandidate.long) : null;
+  const candShortMax = scoreCandidate.short.length ? Math.max(...scoreCandidate.short) : null;
+  const obsCeiling = Math.max(
+    scoreAll.long.length ? Math.max(...scoreAll.long) : 0,
+    scoreAll.short.length ? Math.max(...scoreAll.short) : 0,
+  );
+
+  const scopeCaveat = tf.id === "5m"
+    ? "EVERY NUMBER IS SCOPED TO 5-MINUTE DATA. The dataset is 62,000 5m candles; the " +
       "weights were not evaluated on the timeframes the indicator is normally read on. " +
       "This matters concretely here rather than in principle: the multi-timeframe " +
       "liquidity tiering that produces the score's largest single component is barely " +
@@ -752,7 +835,27 @@ function runComparison(candles, meta) {
       "is therefore a property of this timeframe as much as of these weights and must not " +
       "be read as a verdict about the weight vector on its intended timeframe. " +
       "Establishing that would require replaying on higher-timeframe data, which is out " +
-      "of scope for this feature (`odd/tasks/weight-calibration.md`, \"Out of scope\").",
+      "of scope for this feature (`odd/tasks/weight-calibration.md`, \"Out of scope\")."
+    : `EVERY NUMBER IS SCOPED TO ${tf.scopeWord} DATA, AND THE NATIVE GRID IS ` +
+      `${tf.id} — NOT A 5-MINUTE CHART WITH MORE HISTORY. On this run atrChart is ` +
+      `ta.atr(14) OF ${tf.id.toUpperCase()} BARS (${int(barsPerDay * 1)} bars per day, ` +
+      `${int(barsPerDay)} bars per D1 bar), so the proximity band is ` +
+      `3 x a ${tf.id} ATR, and the H4/D1 tiers aggregate on a different grid than the 5m ` +
+      `run they are compared against. That is what TradingView computes on a ${tf.id} ` +
+      `chart, which is why this run is comparable TO PINE on that chart — but the three ` +
+      `timeframes are three DIFFERENT MEASUREMENTS of one weight vector, not three ` +
+      `samples of one measurement. What this grid actually produced, measured here and ` +
+      `not carried over from 5m: D1 tier qualifies ${int(tierD1Long)}/${int(candLong)} ` +
+      `long and ${int(tierD1Short)}/${int(candShort)} short candidates, H4 ` +
+      `${int(tierH4Long)}/${int(candLong)} and ${int(tierH4Short)}/${int(candShort)}; ` +
+      `the observed score ceiling across all bars is ${obsCeiling} against a configured ` +
+      `\`maxScore\` of ${weighted.maxScore}` +
+      (candLongMax === null ? "." : `, and candidate scores reach ${candLongMax} long / ${candShortMax} short.`) +
+      " Compare those with the 5m run (D1 0/192 and 0/201, ceiling 80) before drawing any " +
+      "conclusion about the weights.";
+
+  const caveats = [
+    scopeCaveat,
     "OVERLAPPING WINDOWS, NOT A PORTFOLIO SIMULATION: labels are independent forward " +
       "windows over one shared candle series — no position accounting, no cash or equity " +
       "curve, no compounding, no sizing, no interaction between signals. Two signals 6 " +
@@ -792,6 +895,29 @@ function runComparison(candles, meta) {
       "printed in the header; a hole in the history would silently bias every number below.",
   ];
 
+  // The cross-timeframe caveat is appended ONLY for a non-default timeframe.
+  //
+  // It is a caveat about reading SEVERAL OF THESE REPORTS SIDE BY SIDE, so it is
+  // printed where a comparison is actually in prospect, and it is withheld from
+  // the 5m run because the 5m report's output is contractually byte-identical to
+  // slice 6 and a reader comparing runs will read it there anyway. This is a real
+  // trade-off, made deliberately: the byte-identity guarantee is explicit, and
+  // appending a line to the 5m report would break it to serve a caveat that the
+  // 5m report alone cannot violate.
+  if (tf.id !== "5m") {
+    caveats.push(
+      "MULTIPLE TIMEFRAMES ARE NOT MULTIPLE INDEPENDENT SAMPLES: the 5m, 1h and 4h runs " +
+        "overlap in wall-clock time and describe the SAME BTC/USD price action at " +
+        "different resolutions. Agreement between them is NOT corroboration — it is the " +
+        "same evidence counted twice, and their errors are strongly correlated. " +
+        "Disagreement between them is mostly about SEMANTICS (a different atrChart, a " +
+        "different HTF grid, a different warm-up), not about which timeframe is right. " +
+        "Nothing here supports a confidence interval, a p-value, or any 'N = 3 " +
+        "independent tests' framing: if a weight vector wins on all three, treat that " +
+        "as one observation reported three ways.",
+    );
+  }
+
   const observations = [
     "D.1 DEAD DECLARATION: `liquidityOK` and `structureOK` (docs/technical-spec.md:1844, " +
       ":1846) are declared but never used by the strict expressions, which re-derive the " +
@@ -816,7 +942,7 @@ function runComparison(candles, meta) {
     ok: true,
     generatedBy: "backtest/baseline.mjs (T10/T11)",
     dataset: {
-      path: DATASET_REL,
+      path: tf.datasetRel,
       bars: n,
       firstIso: iso(candles[0].t),
       lastIso: iso(candles[n - 1].t),
@@ -825,6 +951,25 @@ function runComparison(candles, meta) {
       missingBars: meta?.missingBars ?? null,
       offGridBars: meta?.offGridBars ?? null,
       duplicatesDropped: meta?.duplicatesDropped ?? null,
+    },
+    timeframe: {
+      id: tf.id,
+      label: tf.id,
+      // "5-MINUTE" / "1-HOUR" / "4-HOUR" — the spelling used in caveat text and
+      // the [C0] banners.
+      scopeWord: tf.scopeWord,
+      nativeStepMs: tf.stepMs,
+      minutesPerBar: tf.minutesPerBar,
+      barsPerDailyBar: barsPerDay,
+      // Recomputed per grid, NOT copied from the 5m run. A D1 liquidity pivot
+      // needs 21 completed daily bars; how many native bars that is depends
+      // entirely on the native step.
+      d1PivotWarmupNativeBars: nativeBarsForDays(21, tf.stepMs),
+      d1AtrWarmupNativeBars: nativeBarsForDays(14, tf.stepMs),
+      unavailableHtf: avail.unavailable.map((t) => t.name),
+      note:
+        `atrChart is ATR(14) of ${tf.id} bars. Changing this changes the MEASUREMENT, ` +
+        "not just the label.",
     },
     config: {
       minConfidence: weighted.defaults.minConfidence,
@@ -858,11 +1003,23 @@ function runComparison(candles, meta) {
     warmup,
     htf: {
       droppedBuckets: {
-        h1: ctx.h1.series.droppedBuckets,
-        h4: ctx.h4.series.droppedBuckets,
-        d1: ctx.d1.series.droppedBuckets,
+        h1: ctx.h1.available ? ctx.h1.series.droppedBuckets : null,
+        h4: ctx.h4.available ? ctx.h4.series.droppedBuckets : null,
+        d1: ctx.d1.available ? ctx.d1.series.droppedBuckets : null,
       },
-      note: "completed 1H/4H/D1 bars fed to ATR + pivot detectors (lookahead_off)",
+      available: {
+        h1: ctx.h1.available,
+        h4: ctx.h4.available,
+        d1: ctx.d1.available,
+      },
+      // Which tiers this native grid can produce AT ALL. On 4h the 1H tier has
+      // no candles to aggregate: Pine would request 1h data from the exchange
+      // even on a 4h chart, and this harness cannot. The omission is stated in
+      // the report rather than shown as a thinner tier mix.
+      unavailable: avail.unavailable.map((t) => t.name),
+      note:
+        "completed 1H/4H/D1 bars fed to ATR + pivot detectors (lookahead_off); " +
+        `aggregated from the native ${tf.id} grid at ${barsPerDay} bars per D1 bar`,
     },
     caveats,
     observations,
@@ -888,8 +1045,30 @@ function printReport(r) {
       `${r.config.signalCooldownBars}, maxScore ${r.config.maxScore}, exit target ` +
       `${r.config.exitTargetPct}% / stop ${r.config.exitStopPct}% @ ` +
       `${r.config.exitHorizonBars} bars, horizons ` +
-      `${r.config.forwardHorizons.join("/") } (5m bars)`,
+      `${r.config.forwardHorizons.join("/") } (${r.timeframe.id} bars)`,
   );
+  // The semantic point, in the header, before any number a reader could quote.
+  // Printed only for a NON-default timeframe: the 5m report's output is
+  // contractually byte-identical to slice 6, and on 5m the filename already
+  // states the grid unambiguously. Where it matters — a run whose numbers will
+  // be read next to another timeframe's — it is said out loud.
+  if (r.timeframe.id !== "5m") {
+    out(
+      `grid     NATIVE ${r.timeframe.id} — atrChart is ATR(14) of ${r.timeframe.id} ` +
+        `bars, ${int(r.timeframe.barsPerDailyBar)} bars per D1 bar, D1 pivot warm-up ` +
+        `${int(r.timeframe.d1PivotWarmupNativeBars)} native bars. This is a DIFFERENT ` +
+        "MEASUREMENT from the 5m run, not more of the same one.",
+    );
+  }
+  if (r.timeframe.unavailableHtf.length > 0) {
+    out(
+      `grid     UNAVAILABLE ON ${r.timeframe.id}: ` +
+        `${r.timeframe.unavailableHtf.join(", ")} — finer than the native grid, so it ` +
+        "cannot be aggregated. Pine's request.security would still fetch it from the " +
+        "exchange on a coarser chart; this harness cannot. Tiers absent from the mix " +
+        "below are a LIMITATION OF THE DATA, not a finding.",
+    );
+  }
   out(
     `labels   population = FIRED signals only — weighted ` +
       `${int(r.models.weighted.definitionA.signals)} / binary ` +
@@ -951,9 +1130,9 @@ function printReport(r) {
       `${r.config.exitStopPct}%, ${r.config.exitHorizonBars}-bar horizon), over FIRED signals`,
   );
   out(
-    "  [C0] SCOPED TO 5-MINUTE DATA — these hit rates and the delta are properties of " +
-      "this timeframe as much as of the weights; read caveat [C0] in section 8 before " +
-      "quoting them.",
+    `  [C0] SCOPED TO ${r.timeframe.scopeWord} DATA — these hit rates and the ` +
+      "delta are properties of this timeframe as much as of the weights; read caveat " +
+      "[C0] in section 8 before quoting them.",
   );
   out("");
   out(
@@ -1031,7 +1210,7 @@ function printReport(r) {
     out(`  ${name}:`);
     out(bHead);
     for (const h of r.config.forwardHorizons) {
-      bRow(`${h} (${h * 5}m)`, r.models[name].definitionB.horizons[String(h)], "plain");
+      bRow(horizonLabel(h, r.timeframe), r.models[name].definitionB.horizons[String(h)], "plain");
     }
     out("");
   }
@@ -1046,7 +1225,7 @@ function printReport(r) {
       return `${d > 0 ? "+" : ""}${d.toFixed(dp)}${pp ? " pp" : ""}`;
     };
     out(
-      `    ${padL(`${h} (${h * 5}m)`, 12)}` +
+      `    ${padL(horizonLabel(h, r.timeframe), 12)}` +
         `${padR(f(wv.meanPercent, bv.meanPercent, 4), 10)}` +
         `${padR(f(wv.medianPercent, bv.medianPercent, 4), 10)}` +
         `${padR(f(wv.positiveSharePercent, bv.positiveSharePercent, 2, true), 9)}` +
@@ -1067,8 +1246,9 @@ function printReport(r) {
       "fabrication.",
   );
   out(
-    "  [C0] SCOPED TO 5-MINUTE DATA — the score ceiling and the clustering below are a " +
-      "property of this timeframe, not of the weight vector; read caveat [C0] in section 8.",
+    `  [C0] SCOPED TO ${r.timeframe.scopeWord} DATA — the score ceiling and the ` +
+      "clustering below are a property of this timeframe, not of the weight vector; read " +
+      "caveat [C0] in section 8.",
   );
   out("");
   out(
@@ -1141,8 +1321,9 @@ function printReport(r) {
   // ── 7. Warm-up ────────────────────────────────────────────────────────────
   out("7. HIGHER-TIMEFRAME WARM-UP — cold start, reported so nobody mistakes it for fidelity");
   out("");
+  const native = r.timeframe.id;
   const warmOrder = [
-    ["atrChart", "5m ATR(14)"],
+    ["atrChart", `${native} ATR(14)`],
     ["atrH1", "1H ATR(14)"],
     ["liqPivotH1", "1H liquidity pivots (len 10)"],
     ["structPivotH1", "1H structure pivots (len 5)"],
@@ -1154,14 +1335,35 @@ function printReport(r) {
   out(`    ${padL("series", 34)}${padR("first value at bar", 20)}  timestamp`);
   for (const [key, label] of warmOrder) {
     const w = r.warmup[key];
+    // "unavailable" is distinct from "never": a series this grid cannot produce
+    // at all is a limitation of the data chosen, and must not read as a finding.
+    const tierKey = { atrH1: "h1", liqPivotH1: "h1", structPivotH1: "h1", atrH4: "h4", liqPivotH4: "h4", atrD1: "d1", liqPivotD1: "d1" }[key];
+    const unavailable = tierKey !== undefined && r.htf.available[tierKey] === false;
+    const cell = w
+      ? padR(int(w.barIndex), 20)
+      : unavailable
+        ? padR("unavailable", 20)
+        : padR("never", 20);
     out(
-      `    ${padL(label, 34)}${w ? padR(int(w.barIndex), 20) : padR("never", 20)}  ` +
-        `${w ? w.iso : "-"}`,
+      `    ${padL(label, 34)}${cell}  ` + `${w ? w.iso : "-"}`,
     );
   }
+  // Withheld on 5m: the 5m report is contractually byte-identical to slice 6, and
+  // its D1 pivot warm-up figure is already in the table above. Printed on the
+  // coarser grids because the whole risk this slice guards against is quoting a
+  // 5m warm-up number under a 1h header.
+  if (r.timeframe.id !== "5m") {
+    out(
+      `  expected D1 pivot warm-up: 21 daily bars = ` +
+        `${int(r.timeframe.d1PivotWarmupNativeBars)} native ${r.timeframe.id} bars ` +
+        `(${int(r.timeframe.barsPerDailyBar)} per day). Measured above, not copied ` +
+        "from the 5m run.",
+    );
+  }
+  const db = (v) => (v === null ? "unavailable (finer than native)" : int(v));
   out(
-    `  dropped incomplete HTF buckets: 1H ${r.htf.droppedBuckets.h1}, ` +
-      `4H ${r.htf.droppedBuckets.h4}, D1 ${r.htf.droppedBuckets.d1} ` +
+    `  dropped incomplete HTF buckets: 1H ${db(r.htf.droppedBuckets.h1)}, ` +
+      `4H ${db(r.htf.droppedBuckets.h4)}, D1 ${db(r.htf.droppedBuckets.d1)} ` +
       "(a non-zero value means the data has a hole inside an HTF bucket)",
   );
   out("");
@@ -1179,18 +1381,21 @@ function printReport(r) {
 // ─── Entry point ────────────────────────────────────────────────────────────
 
 /**
- * Runs both baselines and prints the requested format.
+ * Runs both baselines on ONE timeframe and prints the requested format.
  *
- * @param {{json?: boolean}} options
+ * @param {{json?: boolean, tf?: object}} options `tf` is a resolved entry of
+ *   backtest/timeframes.mjs; it defaults to 5m so every pre-slice-7 caller is
+ *   unchanged.
  * @returns {Promise<number>} process exit code (0 ok, 1 failed).
  */
 export async function runBaseline(options = {}) {
   const json = Boolean(options.json);
+  const tf = options.tf ?? DEFAULT_TF;
   const started = Date.now();
 
   try {
-    const { candles, meta } = await loadDataset();
-    const result = runComparison(candles, meta);
+    const { candles, meta } = await loadDataset(tf);
+    const result = runComparison(candles, meta, tf);
     result.runtimeMs = Date.now() - started;
 
     if (json) {
