@@ -54,6 +54,21 @@ import {
   recordSplit,
   recordTier,
 } from "./tier-diagnostic.mjs";
+import {
+  DEFAULT_TIMEFRAME,
+  MS_1H,
+  MS_4H,
+  MS_5M,
+  TIMEFRAMES,
+  TimeframeError,
+  barsPerDailyBar,
+  getTimeframe,
+  htfAvailability,
+  nativeBarsForDays,
+  parseTimeframeFlag,
+  resolveStatus,
+  targetVerdict,
+} from "./timeframes.mjs";
 
 const counts = {};
 let section = "untitled";
@@ -1625,8 +1640,8 @@ sec("baseline-wiring");
     "run.mjs imports the baseline runner",
   );
   check(
-    /subcommand === "baseline"[\s\S]{0,200}runBaseline\(\{ json: process\.argv\.includes\("--json"\) \}\)/.test(runSrc),
-    "baseline dispatch runs runBaseline with the --json flag",
+    /subcommand === "baseline"[\s\S]{0,240}runBaseline\(\{\s*json: process\.argv\.includes\("--json"\),\s*tf,?\s*\}\)/.test(runSrc),
+    "baseline dispatch runs runBaseline with --json AND the resolved timeframe",
   );
   check(!runSrc.includes('stub("T10/T11 baselines")'), "T10/T11 no longer a stub");
   check(runSrc.includes('stub("T12 weight search")'), "T12 search still stubbed — out of scope");
@@ -1847,10 +1862,10 @@ sec("tier-diagnostic");
     "run.mjs imports the tier diagnostic",
   );
   check(
-    /subcommand === "diagnose"[\s\S]{0,160}runTierDiagnostic\(\{ json: process\.argv\.includes\("--json"\) \}\)/.test(
+    /subcommand === "diagnose"[\s\S]{0,240}runTierDiagnostic\(\{\s*json: process\.argv\.includes\("--json"\),\s*tf,?\s*\}\)/.test(
       runSrc,
     ),
-    "diagnose dispatch runs the diagnostic with the --json flag",
+    "diagnose dispatch runs the diagnostic with --json AND the resolved timeframe",
   );
   check(
     runSrc.includes('SUBCOMMANDS = ["fetch", "validate", "baseline", "diagnose", "search"]'),
@@ -1858,12 +1873,295 @@ sec("tier-diagnostic");
   );
   check(runSrc.includes('stub("T12 weight search")'), "T12 search still stubbed — out of scope");
   check(
-    diagSrc.includes("readFile(DATASET_PATH") && diagSrc.includes("runTierDiagnostic"),
+    diagSrc.includes("readFile(tf.datasetPath") && diagSrc.includes("runTierDiagnostic"),
     "the diagnostic is a data-reading subcommand, not a stub",
   );
   check(
     !diagSrc.includes('from "./baseline.mjs"') && !diagSrc.includes("runComparison"),
     "the diagnostic does NOT import baseline.mjs — it cannot perturb the comparison",
+  );
+}
+
+// ─── 10. timeframe table (weight-calibration, slice 7) ──────────────────────
+//
+// The per-timeframe contract, DATA-FREE: flag parsing, the per-timeframe
+// coverage verdict, tier availability, and the warm-up arithmetic. Nothing here
+// touches backtest/data/ or the network — the point is that the invariants that
+// would be expensive to check on real data (a completed 5m fetch marking a 1h
+// fetch complete; a 5m D1 warm-up quoted under a 1h header) are checkable on
+// pure functions.
+
+sec("timeframe-table");
+{
+  // ── Flag parsing ──────────────────────────────────────────────────────────
+  check(
+    parseTimeframeFlag(["node", "run.mjs", "baseline"]).id === "5m",
+    "no --timeframe flag means 5m — every pre-slice-7 command line is unchanged",
+  );
+  check(
+    parseTimeframeFlag(["run.mjs", "baseline", "--timeframe", "1h"]).id === "1h",
+    "--timeframe <id> resolves the id",
+  );
+  check(
+    parseTimeframeFlag(["run.mjs", "baseline", "--timeframe=4h"]).id === "4h",
+    "--timeframe=<id> resolves the id too",
+  );
+  check(
+    parseTimeframeFlag(["run.mjs", "baseline", "--timeframe", "5m"]).id === DEFAULT_TIMEFRAME,
+    "--timeframe 5m is the default, stated explicitly or not",
+  );
+
+  // An invalid timeframe must be REJECTED LOUDLY. Silently falling back to 5m
+  // would produce a plausible report about the wrong dataset — the one failure
+  // mode a measurement harness must never have.
+  const badIds = ["15m", "1H", "60", "d1", "", "  ", "hourly", "1hour"];
+  for (const bad of badIds) {
+    let threw = null;
+    try {
+      parseTimeframeFlag(["run.mjs", "baseline", "--timeframe", bad]);
+    } catch (err) {
+      threw = err;
+    }
+    check(
+      threw instanceof TimeframeError,
+      `an invalid timeframe is rejected loudly: --timeframe ${JSON.stringify(bad)}`,
+    );
+  }
+  // The message must NAME the valid values — a bare "invalid input" leaves the
+  // caller guessing what the harness would accept.
+  let badMessage = "";
+  try {
+    parseTimeframeFlag(["run.mjs", "fetch", "--timeframe", "15m"]);
+  } catch (err) {
+    badMessage = err.message;
+  }
+  check(
+    badMessage.includes('"5m"') && badMessage.includes('"1h"') && badMessage.includes('"4h"'),
+    "the rejection message lists every known timeframe",
+  );
+  // `--timeframe` with no value must not silently swallow the next argument.
+  let missingValueThrew = false;
+  try {
+    parseTimeframeFlag(["run.mjs", "fetch", "--timeframe", "--json"]);
+  } catch (err) {
+    missingValueThrew = err instanceof TimeframeError;
+  }
+  check(missingValueThrew, "--timeframe with no value is rejected, not treated as a subcommand flag");
+
+  // ── Per-timeframe coverage verdict (the T2 trap, per timeframe) ───────────
+  // The regression this guards is specific: a COMPLETE 5m fetch must never make
+  // a 1h fetch report itself complete. The mechanism is that each timeframe owns
+  // its own dataset AND meta file, and the verdict is recomputed from the
+  // candles rather than read out of stored metadata.
+  const tf5 = getTimeframe("5m");
+  const tf1h = getTimeframe("1h");
+  const tf4h = getTimeframe("4h");
+
+  check(
+    tf5.datasetPath !== tf1h.datasetPath &&
+      tf1h.datasetPath !== tf4h.datasetPath &&
+      tf5.metaPath !== tf1h.metaPath,
+    "every timeframe owns a distinct dataset file and meta file",
+  );
+  check(
+    tf1h.stepSec === 3600 && tf4h.stepSec === 14400 && tf5.stepSec === 300,
+    "the step sizes are the verified Bitstamp steps (300 / 3600 / 14400)",
+  );
+
+  // A 5m-complete dataset: 62,000 bars over 215.27 days.
+  const fiveMinuteComplete = { count: 62000, spanDays: 215.2743 };
+  check(
+    targetVerdict(fiveMinuteComplete.count, fiveMinuteComplete.spanDays, tf5).met === true,
+    "62,000 5m bars over 215.27 days MEET the 5m target",
+  );
+  check(
+    targetVerdict(fiveMinuteComplete.count, fiveMinuteComplete.spanDays, tf1h).met === false,
+    "the SAME 5m dataset does NOT meet the 1h target — the verdict is per timeframe",
+  );
+  check(
+    targetVerdict(fiveMinuteComplete.count, fiveMinuteComplete.spanDays, tf4h).met === false,
+    "the SAME 5m dataset does NOT meet the 4h target either",
+  );
+
+  // And the reverse: a 1h-complete dataset judged against the 5m target.
+  const oneHourComplete = { count: 44000, spanDays: 1833.2917 };
+  check(
+    targetVerdict(oneHourComplete.count, oneHourComplete.spanDays, tf1h).met === true,
+    "44,000 1h bars over 1833.29 days MEET the 1h target (>= 43,000 bars, >= 1825 days)",
+  );
+  // The 1h and 4h targets ask for the SAME wall-clock coverage, so a 1h-complete
+  // dataset also satisfies the 4h one — the 4h bar floor is simply lower. What
+  // must NOT happen is the reverse: a dataset too short for 1h must not be read
+  // as complete there, which is asserted above against the 5m dataset.
+  check(
+    tf4h.targetBars < tf1h.targetBars && tf1h.targetDays === tf4h.targetDays,
+    "1h and 4h target the same 1825-day span; only the bar floor differs (43,000 vs 10,900)",
+  );
+  check(
+    targetVerdict(11000, 1833.1667, tf4h).met === true,
+    "11,000 4h bars over 1833.17 days MEET the 4h target (>= 10,900 bars, >= 1825 days)",
+  );
+  check(
+    targetVerdict(11000, 1833.1667, tf1h).met === false,
+    "the SAME 4h dataset does NOT meet the 1h bar target (11,000 < 43,000) — per timeframe",
+  );
+  check(
+    targetVerdict(43000, 1825.0, tf5).met === false,
+    "a 1h-sized dataset does not meet the 5m target either — span, not just count, decides",
+  );
+
+  // Both halves of the target must hold independently — this is the bug class
+  // where only the bar count is checked.
+  check(
+    targetVerdict(50000, 100, tf1h).met === false &&
+      targetVerdict(1000, 2000, tf1h).met === false,
+    "neither half of the 1h target alone is enough (bars only, or days only)",
+  );
+
+  // Status resolution: a stored "complete" is downgraded when the constants in
+  // effect say otherwise; a stored "shortfall" is preserved, because
+  // recomputation cannot un-know that the exchange has no older data.
+  check(
+    resolveStatus("complete", false) === "partial",
+    "a cached `complete` is downgraded when the recomputed verdict says partial",
+  );
+  check(resolveStatus("complete", true) === "complete", "complete + met stays complete");
+  check(
+    resolveStatus("shortfall", false) === "shortfall",
+    "a recorded `shortfall` survives recomputation — it records exchange history",
+  );
+  check(
+    resolveStatus("shortfall", true) === "complete",
+    "a shortfall that actually meets the target is promoted, not left as shortfall",
+  );
+
+  // ── Warm-up arithmetic, recomputed per grid ───────────────────────────────
+  // 21 daily bars is 6,048 native 5m bars, 504 native 1h bars and 126 native 4h
+  // bars. These are the numbers the slice-6 finding would have been misquoted as
+  // if they had been carried across grids.
+  check(nativeBarsForDays(21, MS_5M) === 6048, "21 daily bars = 6,048 native 5m bars (288/day)");
+  check(nativeBarsForDays(21, MS_1H) === 504, "21 daily bars = 504 native 1h bars (24/day)");
+  check(nativeBarsForDays(21, MS_4H) === 126, "21 daily bars = 126 native 4h bars (6/day)");
+  check(nativeBarsForDays(14, MS_1H) === 336, "D1 ATR(14) warm-up = 336 native 1h bars");
+  check(nativeBarsForDays(14, MS_4H) === 84, "D1 ATR(14) warm-up = 84 native 4h bars");
+
+  check(
+    nativeBarsForDays(21, MS_5M) !== nativeBarsForDays(21, MS_1H) &&
+      nativeBarsForDays(21, MS_1H) !== nativeBarsForDays(21, MS_4H),
+    "the three grids give three DIFFERENT warm-up figures — none may be copied",
+  );
+  check(
+    /nativeBarsForDays\(21, tf\.stepMs\)/.test(
+      readFileSync(new URL("./baseline.mjs", import.meta.url), "utf8"),
+    ) &&
+      /nativeBarsForDays\(21, tf\.stepMs\)/.test(
+        readFileSync(new URL("./tier-diagnostic.mjs", import.meta.url), "utf8"),
+      ),
+    "both runners derive their warm-up field from the SAME pure function — neither " +
+      "re-derives it by hand and so they cannot drift apart",
+  );
+  check(
+    TIMEFRAMES[tf1h.id].minutesPerBar === 60 && TIMEFRAMES[tf4h.id].minutesPerBar === 240,
+    "each table entry carries its own minutesPerBar for horizon labelling",
+  );
+
+  // ── Tier availability: a tier finer than the native grid is unsynthesisable ─
+  const a5 = htfAvailability(tf5.stepMs);
+  const a1 = htfAvailability(tf1h.stepMs);
+  const a4 = htfAvailability(tf4h.stepMs);
+  check(
+    a5.unavailable.length === 0 && a1.unavailable.length === 0,
+    "on 5m and 1h every HTF tier (1H/4H/D1) can be aggregated",
+  );
+  check(
+    a4.unavailable.length === 1 && a4.unavailable[0].name === "1H",
+    "on 4h the 1H tier cannot be aggregated — 1h candles do not exist in a 4h dataset",
+  );
+  check(a4.available.d1 === true && a4.available.h4 === true, "on 4h the D1 and H4 tiers remain available");
+  // Pine's request.security WOULD return 1h bars on a 4h chart. This harness
+  // cannot, which is a limitation of the data chosen and is reported as such —
+  // never as a tier that produced nothing.
+  check(
+    a4.available.h1 === false,
+    "the 4h grid reports 1H unavailable rather than empty (no synthesis from nothing)",
+  );
+  check(
+    htfAvailability(MS_1H).available.h1 === true,
+    "on 1h the 1H context is the NATIVE series — available, and identical to what Pine returns",
+  );
+  check(barsPerDailyBar(tf5) === 288 && barsPerDailyBar(tf1h) === 24 && barsPerDailyBar(tf4h) === 6,
+    "bars per D1 bar: 288 / 24 / 6 across the three grids");
+
+  // ── Wiring: the flag is threaded, and the gate stays 5m-only ──────────────
+  const runSrc7 = readFileSync(new URL("./run.mjs", import.meta.url), "utf8");
+  const baseSrc7 = readFileSync(new URL("./baseline.mjs", import.meta.url), "utf8");
+  const diagSrc7 = readFileSync(new URL("./tier-diagnostic.mjs", import.meta.url), "utf8");
+
+  check(
+    runSrc7.includes('import {\n  DEFAULT_TIMEFRAME,') ||
+      /import\s*\{[^}]*DEFAULT_TIMEFRAME[^}]*\}\s*from\s*"\.\/timeframes\.mjs"/.test(runSrc7),
+    "run.mjs imports the timeframe table",
+  );
+  check(
+    runSrc7.includes("gateTimeframeRefusal"),
+    "run.mjs has an explicit refusal path for validate on a non-5m timeframe",
+  );
+  check(
+    /subcommand === "validate"[\s\S]{0,200}tf\.id !== DEFAULT_TIMEFRAME[\s\S]{0,80}gateTimeframeRefusal/.test(
+      runSrc7,
+    ),
+    "validate REFUSES any timeframe other than the default 5m instead of running",
+  );
+  check(
+    runSrc7.includes("await cmdFetch(tf)") && runSrc7.includes("requestPage(tf, endSec)"),
+    "fetch threads the timeframe through the request path",
+  );
+  check(
+    runSrc7.includes("await loadState(tf)") && runSrc7.includes("printReport(tf,"),
+    "fetch resolves its own state and report per timeframe",
+  );
+  check(
+    !/STEP_SEC\b/.test(runSrc7.replace(/tf\.stepSec/g, "")),
+    "no hard-coded STEP_SEC survives in run.mjs — the table is the only source",
+  );
+  check(
+    !runSrc7.includes("TARGET_BARS") && !runSrc7.includes("TARGET_DAYS"),
+    "the coverage targets live in the table, not as module constants in run.mjs",
+  );
+  check(
+    baseSrc7.includes("async function loadDataset(tf)") && baseSrc7.includes("runComparison(candles, meta, tf)"),
+    "baseline loads and compares against the timeframe's own dataset",
+  );
+  check(
+    baseSrc7.includes("createHtfSeries(tfMs, nativeStepMs)") &&
+      baseSrc7.includes("c.t + nativeStepMs === bucket + tfMs"),
+    "baseline's HTF aggregator completes buckets against the NATIVE step, not a hard-coded 5m",
+  );
+  check(
+    diagSrc7.includes("createHtfSeries(tfMs, nativeStepMs)") &&
+      diagSrc7.includes("c.t + nativeStepMs === bucket + tfMs"),
+    "the diagnostic's HTF aggregator uses the native step too — its isolation from " +
+      "baseline.mjs must not become a second, divergent implementation",
+  );
+  check(
+    diagSrc7.includes('from "./timeframes.mjs"'),
+    "the diagnostic reads the SAME timeframe table",
+  );
+  check(
+    !/MS_5M\b/.test(baseSrc7) && !/MS_5M\b/.test(diagSrc7),
+    "neither runner hard-codes a 5m step any more",
+  );
+  check(
+    baseSrc7.includes("avail.unavailable") && baseSrc7.includes("unavailableHtf"),
+    "baseline records which HTF tiers the grid cannot produce",
+  );
+  check(
+    /tier of that tier\./.test(diagSrc7) || diagSrc7.includes("not measurable on a"),
+    "the diagnostic prints an explicit unmeasurable cell rather than a row of zeros",
+  );
+  check(
+    baseSrc7.includes("MULTIPLE TIMEFRAMES ARE NOT MULTIPLE INDEPENDENT SAMPLES"),
+    "the cross-timeframe non-independence caveat is present and stated in full",
   );
 }
 
@@ -1879,6 +2177,7 @@ const ORDER = [
   "binary-model",
   "baseline-wiring",
   "tier-diagnostic",
+  "timeframe-table",
 ];
 console.log("section            checks");
 for (const name of ORDER) {

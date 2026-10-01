@@ -65,7 +65,15 @@ fidelity, not an assumption.
 - Route A (`strategy()` variant) — planned later as verification, not search.
 - The three Outstanding items in `docs/VALIDATION.md` (weight calibration
   methodology, box liveness, `src/lib/inputs.pine`).
-- Any timeframe other than 5m, any symbol other than BTC/USD.
+- ~~Any timeframe other than 5m~~ — **lifted on 2026-10-01 by explicit user
+  authorization.** 5m stays the reference timeframe and the *only* one the T8
+  fidelity gate may run on, because its readings were taken on a 5m grid. 1h
+  is added so T12/T13 can finally answer the question the feature exists to
+  ask; 4h only if the endpoint serves it. **Any symbol other than BTC/USD stays
+  out of scope.** The reason for the lift is recorded so it cannot be quietly
+  forgotten: slice 6 proved the D1/H4 tier dimensions are geometrically
+  degenerate on 5m, so a weight search there would fit a dimension that cannot
+  move.
 - Live/paper trading, order simulation, portfolio-level metrics.
 
 ## Constraints
@@ -416,6 +424,103 @@ a qualifying tier at all — it stamps a tier per zone and emits six booleans.
 The single-tier reduction lives in `signal-engine.mjs:355-362` (Pine
 `signal-engine.pine:64-66`). The port matches Pine expression for expression.
 
+### T15 — Second-timeframe measurement ✅ (delivered in slice 7 · GitHub PR #19)
+
+*(Also numbered out of order, deliberately. It exists because slice 6 proved
+that on 5m data the D1/H4 tier dimensions are geometrically degenerate, which
+makes T12 unfittable there. The maintainer explicitly lifted the "5m only"
+constraint on 2026-10-01 to allow this.)*
+
+- [x] Fetch 1h and 4h datasets from the same Bitstamp endpoint (5 years each).
+- [x] Parameterize `fetch`, `baseline` and `diagnose` by timeframe, with 5m
+  remaining the default so every existing command is unchanged.
+- [x] Answer the question slice 6 left open: **does the D1 tier become
+  reachable on 1h/4h?** Slice 6 predicted it should — the geometric contest
+  changes from `0.5 × D1-ATR` versus `3 × 5m-ATR` (5.04×, hopeless) to
+  `0.5 × D1-ATR` versus `3 × 1h-ATR`, a far closer contest.
+- [x] Produce the three-timeframe comparison side by side, and state what it
+  means for T12.
+- [x] Keep the gate **5m-only by construction** — `--timeframe 1h` on
+  `validate` refuses with an explained message instead of a meaningless
+  comparison.
+
+**The prediction held, unambiguously, on both grids.** The mechanism did not
+change and neither did the port — only the native grid moved:
+
+| | 5m | 1h | 4h |
+|---|---|---|---|
+| D1 zone body / proximity band (median) | 5.04× | **1.03×** | **0.50×** |
+| D1 bar-zone pairs in band | 1,377 | 38,255 | 18,026 |
+| …of which in-body | 1,377 | 33,149 | 10,566 |
+| …**eligible** | **0** | **5,106** | **7,460** |
+| `nearD1` flag fires | 0 | **256** | **1,229** |
+| verdict | unreachable | **qualifies** | **qualifies** |
+
+The discriminator `(eligible>0) === (flag fires>0)` holds on all three grids.
+
+**This is where the feature's question gets answered.** On 1h — the grid
+where the tier dimension is live and the sample has a size worth measuring:
+
+| | 5m | 1h | 4h |
+|---|---|---|---|
+| raw candidates | 393 | **7,924** | 2,583 |
+| weighted fired | 2 | **307** | 49 |
+| binary fired | 133 | **1,701** | 446 |
+| D.4 hit — weighted | 0.00% *(n=2)* | **31.25%** *(n=307)* | 42.22% *(n=49)* |
+| D.4 hit — binary | 41.59% | **33.75%** | 31.02% |
+| delta (binary − weighted) | +41.59 pp | **+2.50 pp** | −11.20 pp |
+| score ceiling observed | 80 | **90** | 70 |
+| rejected at `minConfidence 70` | 391 | 7,510 | 2,513 |
+
+**On 1h the binary model is ahead by 2.50 pp** (33.75% vs 31.25%). That is the
+first measurement in this feature where the weighted model's sample is large
+enough for its hit rate to mean anything rather than being a ratio over two
+observations.
+
+**Two caveats constrain every cross-grid comparison, and both are printed in
+every report:**
+
+- **Horizon semantics stretch with the grid.** 288 bars is 24h on 5m, **288h
+  (12 days) on 1h**, **1,152h (48 days) on 4h**. Definition A and Definition B
+  are held at a constant *bar* count, so **cross-timeframe hit-rate deltas are
+  not like-for-like.** The 0.00% vs 42.22% spread is mostly a horizon
+  difference, not a model difference.
+- **Three grids are not three independent samples.** The same price action
+  appears in all three runs, so a weight vector that wins on all three is one
+  observation reported three ways.
+
+**The 4h run is not a faithful Pine-on-4h reproduction.** Pine's
+`request.security(syminfo.tickerid, "60", …)` (`liquidity-zones.pine:95-96`)
+returns **1h bars even on a 4h chart**, so a 4h dataset has no 1H candles to
+aggregate. That tier is reported as `unavailable` / `not measurable` in every
+table rather than as a row of zeros — a zero row would read as "the H1 tier is
+worth nothing", which is a finding this grid cannot support. **Any T12 result
+touching the structure weights must exclude 4h.**
+
+**What T12 may now do.** On 1h the score dimension is fully live: D1
+candidates reach 80, H4 and H1 reach 90 against a configured `maxScore` of
+110; 414 of 7,924 candidates clear the threshold; 307 signals fire. That is
+the precondition slice 6 said was missing. **On 5m a search remains
+degenerate and must not be run there as a verdict on the weight vector.** On
+4h the tier moves too, but the sample is thin, the 1H tier is absent and the
+horizons stretch to 48 days — usable as a second result, not the primary one.
+
+**Datasets**: 1h = 44,000 bars / 1833.29 days / 44 requests; 4h = 11,000 bars /
+1833.17 days / 11 requests; both with 0 gaps, 0 off-grid, 0 duplicates. The 5m
+dataset was not disturbed — `fetch` reported *already complete, 0 requests*.
+
+**Endpoint facts, verified rather than assumed** (recorded because the
+orchestrator got the response shape wrong twice before catching it): the array
+is `data.ohlc`, **not** `data.ohlcv`; every field is a string; pagination is
+backwards via `end` only; steps 60/300/900/1800/3600/14400/86400 all serve; 1h
+and 4h both reach back to **at least 2011-09-01**.
+
+**Two smoke checks failed on the writer's first run and both were wrong
+assertions, not wrong code** — one asserted a source string that a legitimate
+rename changed, one asserted that a 1h-complete dataset fails the 4h target
+(it does not; both target the same 1825-day span and only the bar floor
+differs). The assertions were corrected and the implementation was not.
+
 ### T12 — Weight search
 
 - [ ] Search over weight vectors and thresholds (random or coordinate search;
@@ -508,9 +613,10 @@ numbered by GitHub.
 | 4 | T7 + T8 | Port signal-engine + **fidelity gate** (engine and its gate belong together) | ~380 |
 | 5 | T9 + T10 + T11 | Outcome labelling + both baselines | ~350 |
 | 6 | T14 | Liquidity tier diagnostic — closes C0's open question before T12 | ~200 |
-| 7 | T12 + T13 | Weight search + findings report | ~450 |
+| 7 | T15 | Second timeframe: 1h + 4h datasets and the three-timeframe measurement | ~500 |
+| 8 | T12 + T13 | Weight search + findings report | ~450 |
 
-If slice 7 exceeds ~400, it splits into T12 (search) and T13 (report) — the
+If slice 8 exceeds ~400, it splits into T12 (search) and T13 (report) — the
 report is documentation and can ship on its own.
 
 **Gate on progression:** slice 4 contains the fidelity gate. Slices 5 and 6 do
@@ -602,9 +708,26 @@ to the non-tier factors, or higher-timeframe data must be used.
       against D1 at signal moments. Baseline output byte-identical on all 130
       substantive lines. **This closes the precondition for T12**: a weight
       search here would fit a degenerate D1/H4 dimension.
-- [ ] T12 — weight search (now known to be **degenerate in its tier
-      dimensions** on 5m data — either narrow the objective to the non-tier
-      factors, or use higher-timeframe data, which is still out of scope)
+- [x] **T15 — slice 7 delivered** (second timeframe: 1h + 4h and the
+      three-timeframe measurement) → shipped as **GitHub PR #19**. **Slice 6's
+      prediction held**: the D1 tier is unreachable on 5m (body/band 5.04×,
+      0 eligible pairs) and **qualifies on 1h (1.03×, 5,106 eligible, 256
+      fires) and 4h (0.50×, 7,460 eligible, 1,229 fires)** — the mechanism and
+      the port unchanged, only the native grid moved. **The feature's question
+      is answered on 1h**: weighted fires 307 with a **31.25%** D.4 hit rate
+      against binary's **33.75%** over 1,701 — **binary ahead by 2.50 pp**,
+      and the first measurement here where the weighted sample is large enough
+      for its hit rate to mean anything. **But cross-timeframe hit rates are
+      not like-for-like**: 288 bars is 24h on 5m, 288h on 1h and 1,152h on 4h,
+      so most of the 0.00% → 42.22% spread is a horizon difference, not a
+      model difference. The 4h run is also **not** faithful Pine-on-4h, because
+      Pine's `request.security` always requests 1h regardless of chart
+      resolution. Gate stays **5m-only by construction** and now refuses any
+      other timeframe with an explained message. Scope lift and the verified
+      endpoint facts are recorded above.
+- [ ] T12 — weight search (now **meaningful on 1h**: the tier dimension is
+      live, 414 of 7,924 candidates clear 70, 307 signals fire. Still
+      degenerate on 5m, and the structure weights must exclude 4h)
 - [ ] T13 — findings report
 - [ ] Findings reported
 
@@ -618,6 +741,7 @@ to the non-tier factors, or higher-timeframe data must be used.
 | 4 | #15 | ~380 | **~2556** (597 signal-engine + 835 gate + 957 smoke + 38 run.mjs + 129 doc) |
 | 5 | #17 | ~350 | **~2957** (1221 baseline + 447 label + 437 binary + 711 smoke + 8 run.mjs + 133 doc) |
 | 6 | #18 | ~200 | **~1695** (1373 diagnostic + 224 smoke + 8 run.mjs + 90 doc) |
+| 7 | #19 | ~500 | **~1646** (336 baseline + 319 tier-diagnostic + 309 smoke + 277 run.mjs + 258 timeframes.mjs + 147 doc) |
 
 Every slice landed over its forecast.
 
@@ -664,6 +788,17 @@ gates, and the pre/post warm-up split. Every one of those sections exists
 because the first draft produced a number that *looked* like a bug — "1,377 D1
 pairs in band, 0 flag fires" — and the discriminator table exists specifically
 to close that false reading before it reached anyone else.
+
+**Slice 7** — ~3× over a ~500 forecast, and the excess is the same cause as
+every other slice: the forecast costed the *mechanism* and not the machinery a
+mechanism needs to be trustworthy. Parameterizing by timeframe is only honest
+if four things move together — the dataset table, the fetch verdict (which had
+to stay recomputed per timeframe, or a complete 5m fetch would mark a 1h fetch
+complete), the HTF aggregation and warm-up, and the caveats. Two more caveats
+exist that the earlier estimate could not know about: horizon semantics stretch
+with the grid, and multiple timeframes are not independent samples. Both are
+load-bearing — without them the three-timeframe table is the single most
+misreadable artifact this project can produce.
 
 The per-slice ~400 figure is an advisory planning heuristic stated as such in
 this document, not an acceptance criterion, so every variance is recorded

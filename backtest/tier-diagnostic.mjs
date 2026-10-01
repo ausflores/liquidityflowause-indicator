@@ -63,9 +63,13 @@
 // ============================================================================
 
 import { readFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 
+import {
+  DEFAULT_TIMEFRAME,
+  getTimeframe,
+  htfAvailability,
+  nativeBarsForDays,
+} from "./timeframes.mjs";
 import { createSessionMarkers } from "./modules/session-markers.mjs";
 import {
   createAtr,
@@ -78,17 +82,27 @@ import { createImbalanceDetector } from "./modules/imbalance-detector.mjs";
 import { createSignalEngine } from "./modules/signal-engine.mjs";
 import { createBinarySignalModel } from "./modules/binary.mjs";
 
-const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const DATASET_REL = "backtest/data/btcusd-5m.json";
-const DATASET_PATH = join(ROOT, "backtest", "data", "btcusd-5m.json");
-const META_PATH = join(ROOT, "backtest", "data", "btcusd-5m.meta.json");
-
 const SCHEMA_VERSION = 1;
 
-const MS_5M = 300000;
 const MS_1H = 3600000;
 const MS_4H = 14400000;
 const MS_1D = 86400000;
+
+// ─── Timeframe ───────────────────────────────────────────────────────────────
+//
+// Same contract as backtest/baseline.mjs: `tf` is threaded through rather than
+// read from a module constant, and defaults to 5m. On a coarser native grid the
+// DIAGNOSTIC'S CENTRAL RATIO CHANGES DEFINITIONALLY — `bodyToBandRatio` is the
+// median zone half-width over the median proximity band, and the band is
+// 3 x ATR(14) OF THE NATIVE GRID. On 5m that contest is hopeless (5.04x); on 1h
+// the band is an order of magnitude wider in price terms, which is precisely
+// the prediction slice 6 left open for this slice to measure.
+//
+// This file does NOT import baseline.mjs (see the header: the diagnostic must
+// not be able to perturb the comparison). It re-implements the wiring, so the
+// timeframe threading below is a second, independent implementation of the same
+// contract — and the "self-check" section exists to prove the two still agree.
+const DEFAULT_TF = getTimeframe(DEFAULT_TIMEFRAME);
 
 const out = (s = "") => console.log(`diagnose: ${s}`);
 
@@ -100,6 +114,18 @@ const out = (s = "") => console.log(`diagnose: ${s}`);
 // liquidity-zones.mjs:318-329 and liquidity-zones.pine:180-190.
 
 export const TIER_NAMES = Object.freeze(["D1", "H4", "H1"]);
+
+// Two vocabularies meet here and they are NOT the same strings: timeframes.mjs
+// names the higher-timeframe CONTEXTS "1H"/"4H"/"D1", while this diagnostic — and
+// the liquidity-zone module it measures — names the TIERS "H1"/"H4"/"D1". The
+// only difference is "1H" vs "H1", which is exactly the kind of mismatch that
+// makes an availability check silently false, so it is mapped once, here.
+const TIER_OF_HTF_NAME = Object.freeze({ "1H": "H1", "4H": "H4", D1: "D1" });
+
+/** HTF context names (["1H"]) -> liquidity-tier names (["H1"]), unmeasurable ones. */
+function unmeasurableTiers(timeframe) {
+  return (timeframe?.unavailableHtf ?? []).map((name) => TIER_OF_HTF_NAME[name]).filter(Boolean);
+}
 
 const TIER_OF_INDEX = Object.freeze({ 1: "D1", 2: "H4", 3: "H1" });
 const TIER_WEIGHT = Object.freeze({ D1: 30, H4: 20, H1: 10 });
@@ -248,22 +274,22 @@ function summarise(values) {
 
 // ─── Dataset ─────────────────────────────────────────────────────────────────
 
-async function loadDataset() {
+async function loadDataset(tf) {
   let candles;
   try {
-    candles = JSON.parse(await readFile(DATASET_PATH, "utf8")).candles;
+    candles = JSON.parse(await readFile(tf.datasetPath, "utf8")).candles;
   } catch (err) {
     throw new Error(
-      `dataset unavailable (${err.message}) at ${DATASET_REL} — backtest/data/ is ` +
-        "gitignored; run `node backtest/run.mjs fetch` first",
+      `dataset unavailable (${err.message}) at ${tf.datasetRel} — backtest/data/ is ` +
+        `gitignored; run \`node backtest/run.mjs fetch --timeframe ${tf.id}\` first`,
     );
   }
   if (!Array.isArray(candles) || candles.length === 0) {
-    throw new Error(`dataset at ${DATASET_REL} has no candles`);
+    throw new Error(`dataset at ${tf.datasetRel} has no candles`);
   }
   let meta = null;
   try {
-    meta = JSON.parse(await readFile(META_PATH, "utf8"));
+    meta = JSON.parse(await readFile(tf.metaPath, "utf8"));
   } catch {
     meta = null;
   }
@@ -278,7 +304,7 @@ async function loadDataset() {
 // request.security(..., lookahead_off) implies — a completed HTF bar becomes
 // visible on the chart bar where its last 5m candle closes, then holds.
 
-function createHtfSeries(tfMs) {
+function createHtfSeries(tfMs, nativeStepMs) {
   let bucket = null;
   let acc = null;
   let droppedBuckets = 0;
@@ -298,7 +324,11 @@ function createHtfSeries(tfMs) {
         acc.c = c.c;
         acc.v += c.v;
       }
-      if (c.t + MS_5M === bucket + tfMs) {
+      // Completion is tested against the NATIVE step. Hard-coding 5m here would
+      // complete no bucket at all on a 1h or 4h dataset, silently emptying the
+      // D1 series — the exact failure this diagnostic exists to detect, so it
+      // must not be introduced by the measurement harness itself.
+      if (c.t + nativeStepMs === bucket + tfMs) {
         const done = acc;
         bucket = null;
         acc = null;
@@ -309,9 +339,17 @@ function createHtfSeries(tfMs) {
   };
 }
 
-function createHtfContext(tfMs) {
+/**
+ * A context this native grid CANNOT produce is marked unavailable rather than
+ * fed. Pine's request.security(syminfo.tickerid, "60", ...) returns 1h bars even
+ * on a 4h chart; this harness aggregates only the dataset it was given, so a 4h
+ * dataset has no 1h candles to aggregate. Reporting that as an empty tier would
+ * read as a finding rather than as the limitation it is.
+ */
+function createHtfContext(tfMs, tf, available) {
   return {
-    series: createHtfSeries(tfMs),
+    available,
+    series: available ? createHtfSeries(tfMs, tf.stepMs) : null,
     atr: createAtr({ length: 14 }),
     atrValue: null,
     liqPivot: createPivotDetector({ pivotLenHigh: 10, pivotLenLow: 10 }),
@@ -366,17 +404,19 @@ function newPhaseAcc() {
 
 // ─── The diagnostic ──────────────────────────────────────────────────────────
 
-function runDiagnostic(candles, meta) {
+function runDiagnostic(candles, meta, tf) {
   const n = candles.length;
   const proxBand = LIQUIDITY_ZONE_DEFAULTS.proxATRMult;
+  const barsPerDay = MS_1D / tf.stepMs;
 
   // ── Module instances: shipped defaults everywhere, exactly as baseline ────
   const session = createSessionMarkers();
   const chartAtr = createAtr({ length: 14 });
+  const avail = htfAvailability(tf.stepMs);
   const ctx = {
-    h1: createHtfContext(MS_1H),
-    h4: createHtfContext(MS_4H),
-    d1: createHtfContext(MS_1D),
+    h1: createHtfContext(MS_1H, tf, avail.available.h1),
+    h4: createHtfContext(MS_4H, tf, avail.available.h4),
+    d1: createHtfContext(MS_1D, tf, avail.available.d1),
   };
   const structPivot = createPivotDetector({ pivotLenHigh: 5, pivotLenLow: 5 });
   const zones = createLiquidityZones();
@@ -425,7 +465,7 @@ function runDiagnostic(candles, meta) {
     const sm = session.evaluate({ t: c.t });
     const atrChart = chartAtr.update({ high: c.h, low: c.l, close: c.c });
 
-    const h1Bar = ctx.h1.series.feed(c);
+    const h1Bar = ctx.h1.available ? ctx.h1.series.feed(c) : null;
     if (h1Bar) {
       const p = ctx.h1.liqPivot.update({ high: h1Bar.h, low: h1Bar.l });
       ctx.h1.liq = { high: p.pivotHigh, low: p.pivotLow };
@@ -433,13 +473,13 @@ function runDiagnostic(candles, meta) {
       const sp = structPivot.update({ high: h1Bar.h, low: h1Bar.l });
       structPivots = { high: sp.pivotHigh, low: sp.pivotLow };
     }
-    const h4Bar = ctx.h4.series.feed(c);
+    const h4Bar = ctx.h4.available ? ctx.h4.series.feed(c) : null;
     if (h4Bar) {
       const p = ctx.h4.liqPivot.update({ high: h4Bar.h, low: h4Bar.l });
       ctx.h4.liq = { high: p.pivotHigh, low: p.pivotLow };
       ctx.h4.atrValue = ctx.h4.atr.update({ high: h4Bar.h, low: h4Bar.l, close: h4Bar.c });
     }
-    const d1Bar = ctx.d1.series.feed(c);
+    const d1Bar = ctx.d1.available ? ctx.d1.series.feed(c) : null;
     if (d1Bar) {
       const p = ctx.d1.liqPivot.update({ high: d1Bar.h, low: d1Bar.l });
       ctx.d1.liq = { high: p.pivotHigh, low: p.pivotLow };
@@ -647,9 +687,9 @@ function runDiagnostic(candles, meta) {
   }
 
   acc.droppedBuckets = {
-    h1: ctx.h1.series.droppedBuckets,
-    h4: ctx.h4.series.droppedBuckets,
-    d1: ctx.d1.series.droppedBuckets,
+    h1: ctx.h1.available ? ctx.h1.series.droppedBuckets : null,
+    h4: ctx.h4.available ? ctx.h4.series.droppedBuckets : null,
+    d1: ctx.d1.available ? ctx.d1.series.droppedBuckets : null,
   };
 
   // ── Derive the comparison figures the report prints ───────────────────────
@@ -725,6 +765,9 @@ function runDiagnostic(candles, meta) {
   const d1Built = acc.zones.created.D1 > 0 && acc.zones.liveBars.D1 > 0;
   const h4Built = acc.zones.created.H4 > 0 && acc.zones.liveBars.H4 > 0;
 
+  /** "1.677x" for a measured ratio, "n/a" for an unmeasurable one — never "n/ax". */
+const ratioCell = (v) => (v === null || v === undefined ? "n/a" : `${v.toFixed(3)}x`);
+
   // ── THE DISCRIMINATOR ─────────────────────────────────────────────────────
   //
   // A D1/H4 tier flag CAN fire on a bar only if some live zone of that tier was
@@ -744,14 +787,22 @@ function runDiagnostic(candles, meta) {
   // exactly the mistake this diagnostic exists to avoid: a bar deep inside a
   // D1 zone body is in the proximity band and is deliberately not reported.
 
+  const availHere = htfAvailability(tf.stepMs);
   const eligibility = {};
   let defects = 0;
   for (const name of TIER_NAMES) {
     const notInBody = acc.zones.proximity[name].nearNotInBody;
     const flag = nearFlagsTotal[name];
     const consistent = (notInBody > 0) === (flag > 0);
-    if (!consistent) defects += 1;
+    // A tier the native grid cannot produce is NOT a defect: there was never a
+    // series to populate. Counting it as one would report the harness's data
+    // choice as a bug in the port.
+    const producible = availHere.available[name.toLowerCase()];
+    if (producible && !consistent) defects += 1;
     eligibility[name] = {
+      // "built" = this grid can produce the tier at all. Distinct from
+      // "populated" (d1Built), which asks whether zones actually appeared.
+      producible,
       built: name === "D1" ? d1Built : name === "H4" ? h4Built : true,
       barZonePairs: acc.zones.proximity[name].pairs,
       withinBand: acc.zones.proximity[name].near,
@@ -803,8 +854,11 @@ function runDiagnostic(candles, meta) {
     );
     verdictSupport.push(
       `mechanism: a D1 zone body is half a D1 ATR wide, the proximity band is ${proxBand} ` +
-        `chart ATR. Median D1 body / median band = ${d1.bodyToBandRatio ?? "n/a"}x — the body is ` +
-        `far wider than the band, so price is always inside the zone before it is ever near it.`,
+        `x the CHART (${tf.id}) ATR. Median D1 body / median band = ` +
+        `${d1.bodyToBandRatio ?? "n/a"}x — the body is ` +
+        `${d1.bodyToBandRatio !== null && d1.bodyToBandRatio >= 1 ? "wider" : "narrower"} ` +
+        "than the band, so price is " +
+        `${d1.bodyToBandRatio !== null && d1.bodyToBandRatio >= 1 ? "already inside the zone before it is ever near it" : "near the zone from outside its body"}.`,
     );
   } else {
     verdictLabel = "property of the data";
@@ -817,14 +871,29 @@ function runDiagnostic(candles, meta) {
   }
 
   if (verdictLabel === "property of the data") {
+    // Every tier is reported, INCLUDING the ones this grid cannot produce — a
+    // 4h run has no 1h candles, so "H1 fired 0 times" must not be mistaken for a
+    // finding about the H1 tier.
+    const availNames = htfAvailability(tf.stepMs).unavailable.map((t) => t.name);
+    if (availNames.length > 0) {
+      verdictSupport.push(
+        `NOT MEASURED ON THIS GRID: ${availNames.join(", ")} is finer than the native ` +
+          `${tf.id} grid, so it has no candles to aggregate. Pine's request.security ` +
+          "would still fetch it from the exchange on a coarser chart; this harness " +
+          "cannot. Any zero for that tier below is a LIMITATION OF THE DATA, not a " +
+          "finding about the tier.",
+      );
+    }
     verdictSupport.push(
       `4H zones created ${int(acc.zones.created.H4)}, live on ${int(acc.zones.liveBars.H4)} bars; ` +
         `within the band on ${int(eligibility.H4.withinBand)} pairs ` +
         `(${int(eligibility.H4.withinBandInBody)} in-body, ${int(eligibility.H4.withinBandNotInBody)} ` +
         `eligible); nearH4 fired ${int(nearFlagsTotal.H4)} times; median body/band ratio ` +
-        `${eligibility.H4.bodyToBandRatio ?? "n/a"}x. H1: ${int(eligibility.H1.withinBandNotInBody)} ` +
-        `eligible pairs, nearH1 fired ${int(nearFlagsTotal.H1)} times, ratio ` +
-        `${eligibility.H1.bodyToBandRatio ?? "n/a"}x.`,
+        `${ratioCell(eligibility.H4.bodyToBandRatio)}. ` +
+        (eligibility.H1.producible
+          ? `H1: ${int(eligibility.H1.withinBandNotInBody)} eligible pairs, nearH1 fired ` +
+            `${int(nearFlagsTotal.H1)} times, ratio ${ratioCell(eligibility.H1.bodyToBandRatio)}.`
+          : "H1: not measured on this grid (see above)."),
     );
     for (const side of ["long", "short"]) {
       const g = comparison[side].global;
@@ -878,12 +947,25 @@ function runDiagnostic(candles, meta) {
       ],
     },
     dataset: {
-      path: DATASET_REL,
+      path: tf.datasetRel,
       bars: n,
       firstIso: candles.length ? iso(candles[0].t) : null,
       lastIso: candles.length ? iso(candles[n - 1].t) : null,
       spanDays: meta?.spanDays ?? null,
       status: meta?.status ?? null,
+    },
+    timeframe: {
+      id: tf.id,
+      nativeStepMs: tf.stepMs,
+      minutesPerBar: tf.minutesPerBar,
+      barsPerDailyBar: barsPerDay,
+      // RECOMPUTED per grid, never copied from the 5m run.
+      d1PivotWarmupNativeBars: nativeBarsForDays(21, tf.stepMs),
+      d1AtrWarmupNativeBars: nativeBarsForDays(14, tf.stepMs),
+      unavailableHtf: htfAvailability(tf.stepMs).unavailable.map((t) => t.name),
+      note:
+        `the proximity band is ${proxBand} x ATR(14) of the NATIVE ${tf.id} series, so ` +
+        "bodyToBandRatio below is a property of this grid as much as of the geometry.",
     },
     config: {
       proximityBandAtrMult: proxBand,
@@ -950,9 +1032,20 @@ function runDiagnostic(candles, meta) {
       candidates: { long: acc.candidates.long, short: acc.candidates.short },
       comparison,
       selfCheck: {
+        // The expected pair is the 5m baseline's 192 long / 201 short. It holds
+        // ONLY on 5m: the two wirings must agree on the same dataset and grid, so
+        // quoting it on a 1h run would be asserting a number that was never
+        // measured. On other timeframes the cross-check is reported as
+        // unavailable and the reader is pointed at `baseline --timeframe <id>`.
         note:
-          "this diagnostic re-implements the baseline wiring rather than importing it; these " +
-          "counts must match the baseline's 192 long / 201 short raw candidates",
+          tf.id === "5m"
+            ? "this diagnostic re-implements the baseline wiring rather than importing it; " +
+              "these counts must match the baseline's 192 long / 201 short raw candidates"
+            : `this diagnostic re-implements the baseline wiring rather than importing it; ` +
+              `run \`node backtest/run.mjs baseline --timeframe ${tf.id}\` and confirm these ` +
+              "counts match THAT run's raw candidates",
+        expectedLong: tf.id === "5m" ? 192 : null,
+        expectedShort: tf.id === "5m" ? 201 : null,
         long: acc.candidates.long,
         short: acc.candidates.short,
       },
@@ -984,7 +1077,12 @@ function runDiagnostic(candles, meta) {
     sectionF_warmUpSplit: {
       boundaryBar: acc.firstD1ZoneBar,
       boundaryIso: acc.firstD1ZoneBar === null ? null : iso(candles[acc.firstD1ZoneBar].t),
-      baselineReportedD1PivotBar: 8205,
+      // 8205 is the bar index the 5m BASELINE reports for the first D1 pivot.
+      // It is a property of the 5m grid, not a constant: on 1h the same warm-up
+      // arrives at a different index because the native bars are 12x wider.
+      // Quoting 8205 against a 1h run would fabricate a disagreement.
+      baselineReportedD1PivotBar: tf.id === "5m" ? 8205 : null,
+      expectedD1PivotNativeBars: nativeBarsForDays(21, tf.stepMs),
       firstD1PivotBar: acc.firstD1PivotBar,
       phases: acc.phase,
     },
@@ -1007,11 +1105,27 @@ function printReport(r) {
       `${r.dataset.lastIso}, ${r.dataset.spanDays} days`,
   );
   out(
-    `config   proximity band = ${r.config.proximityBandAtrMult} x ATR(14) on the 5m chart, ` +
+    `config   proximity band = ${r.config.proximityBandAtrMult} x ATR(14) on the ` +
+      `${r.timeframe.id} chart, ` +
       `maxZones ${r.config.maxZones}, minConfidence ${r.config.minConfidence}, ` +
       `maxScore ${r.config.maxScore}, tier weights D1 ${r.config.liquidityWeights.D1} / ` +
       `H4 ${r.config.liquidityWeights.H4} / H1 ${r.config.liquidityWeights.H1}`,
   );
+  out(
+    `grid     NATIVE ${r.timeframe.id} — ${int(r.timeframe.barsPerDailyBar)} bars per D1 ` +
+      `bar; D1 pivot warm-up = 21 daily bars = ` +
+      `${int(r.timeframe.d1PivotWarmupNativeBars)} native bars. The proximity band above ` +
+      "is an ATR of THIS grid, so body/band ratios are not comparable across grids " +
+      "without saying so.",
+  );
+  if (r.timeframe.unavailableHtf.length > 0) {
+    out(
+      `grid     NOT MEASURABLE HERE: ${r.timeframe.unavailableHtf.join(", ")} — finer ` +
+        "than the native grid, so it has no candles to aggregate. Pine's " +
+        "request.security would fetch it anyway; this harness cannot. Zeros for that " +
+        "tier are a data limitation, not a finding.",
+    );
+  }
   out("");
 
   // ── A. The rule ───────────────────────────────────────────────────────────
@@ -1057,7 +1171,7 @@ function printReport(r) {
   out("");
 
   // ── B. Global tier distribution ───────────────────────────────────────────
-  out("B. GLOBAL TIER DISTRIBUTION — all 62,000 bars, not just candidates");
+  out(`B. GLOBAL TIER DISTRIBUTION — all ${int(r.dataset.bars)} bars, not just candidates`);
   out("");
   for (const side of ["long", "short"]) {
     const m = r.sectionB_globalTierMix[side];
@@ -1115,9 +1229,22 @@ function printReport(r) {
       `${padR("in-body", 10)}${padR("eligible", 10)}${padR("closest", 10)}${padR("p50", 9)}` +
       `${padR("p90", 9)}${padR("body/band", 11)}`,
   );
+  const unmeasurable = new Set(unmeasurableTiers(r.timeframe));
   for (const name of TIER_NAMES) {
     const p = r.sectionC_zonePopulation.perTier[name].proximity;
     const d = p.distanceBands;
+    // A tier this native grid cannot aggregate gets an explicit cell rather than
+    // a row of zeros: "0 eligible" would read as a measurement, and it is not
+    // one. `d.min === null` is a width artifact of the existing formatter on the
+    // string "n/a", so the unmeasurable branch is checked before formatting.
+    if (unmeasurable.has(name)) {
+      out(
+        `    ${padL(name, 6)}${padR("not measurable on a " + r.timeframe.id + " grid", 16)}` +
+          `${padR("-", 10)}${padR("-", 10)}${padR("-", 10)}${padR("-", 10)}${padR("-", 9)}` +
+          `${padR("-", 9)}${padR("-", 11)}`,
+      );
+      continue;
+    }
     out(
       `    ${padL(name, 6)}${padR(int(p.barZonePairs), 16)}${padR(int(p.withinBand), 10)}` +
         `${padR(int(p.withinBandButInBody), 10)}${padR(int(p.withinBandAndNotInBody), 10)}` +
@@ -1144,6 +1271,16 @@ function printReport(r) {
   );
   for (const name of TIER_NAMES) {
     const e = r.sectionC_zonePopulation.tierEligibility[name];
+    // Same reason as the geometry table: a tier the grid cannot produce is not
+    // "consistent" in any meaningful sense — there was nothing to be consistent
+    // about, and calling it consistent would read as a passed test.
+    if (unmeasurable.has(name)) {
+      out(
+        `    ${padL(name, 6)}${padR("n/a", 11)}${padR("n/a", 12)}` +
+          `${padR("n/a", 10)}${padR("n/a", 10)}${padR("not tested", 12)}`,
+      );
+      continue;
+    }
     out(
       `    ${padL(name, 6)}${padR(int(e.withinBandNotInBody), 11)}${padR(int(e.tierFlagFires), 12)}` +
         `${padR(e.withinBandNotInBody > 0 ? "fires" : "silent", 10)}` +
@@ -1158,10 +1295,12 @@ function printReport(r) {
   out(
     "    nothing to report. Eligible pairs with a silent flag is the shape a defect would have.",
   );
+  const dbCell = (v) => (v === null ? "unavailable" : int(v));
   out(
-    `  dropped incomplete HTF buckets: 1H ${r.sectionC_zonePopulation.droppedBuckets.h1}, ` +
-      `4H ${r.sectionC_zonePopulation.droppedBuckets.h4}, D1 ${r.sectionC_zonePopulation.droppedBuckets.d1}` +
-      " (non-zero would mean a hole inside an HTF bucket)",
+    `  dropped incomplete HTF buckets: 1H ${dbCell(r.sectionC_zonePopulation.droppedBuckets.h1)}, ` +
+      `4H ${dbCell(r.sectionC_zonePopulation.droppedBuckets.h4)}, D1 ${dbCell(r.sectionC_zonePopulation.droppedBuckets.d1)}` +
+      " (non-zero would mean a hole inside an HTF bucket; 'unavailable' means the tier is " +
+      "finer than the native grid and cannot be aggregated at all)",
   );
   out("");
 
@@ -1176,6 +1315,10 @@ function printReport(r) {
         `${padR("all flagged", 12)}${padR("global %", 10)}${padR("lift", 8)}`,
     );
     for (const name of TIER_NAMES) {
+      if (unmeasurable.has(name)) {
+        out(`    ${padL(name, 6)}— not measurable on a ${r.timeframe.id} grid (no candidates and no flagged bars exist for it here).`);
+        continue;
+      }
       out(
         `    ${padL(name, 6)}${padR(int(cmp.candidates.counts[name]), 12)}` +
           `${padR(cmp.candidates.percentOfFlagged[name], 9)}` +
@@ -1197,7 +1340,19 @@ function printReport(r) {
   );
   for (const name of TIER_NAMES) {
     const s = r.sectionD2_scoreByTier[name];
+    // Zero candidates for an UNMEASURABLE tier is not "this tier is worth
+    // nothing" — it is "this tier was never available". Said explicitly.
     if (s.candidates === 0) {
+      if (unmeasurable.has(name)) {
+        // No row of zeros: a row of zeros would read as "this tier is worth
+        // nothing", which is a finding this grid cannot support.
+        out(
+          `    ${padL(name, 6)}— not measurable on a ${r.timeframe.id} grid ` +
+            "(finer than the native series); its weight and score range are unmeasured, " +
+            "not zero.",
+        );
+        continue;
+      }
       out(
         `    ${padL(name, 6)}${padR(int(s.candidates), 8)}${padR(s.tierWeight, 5)}` +
           `${padR("n/a", 11)}${padR("n/a", 11)}${padR("n/a", 14)}${padR("n/a", 10)}${padR("n/a", 7)}`,
@@ -1231,12 +1386,14 @@ function printReport(r) {
     const t = r.sectionE_proximityIsolated[side];
     out(
       `  ${padL(side, 8)}${padR(int(t.bars), 9)}${padR(int(t.D1), 10)}${padR(int(t.H4), 10)}` +
-        `${padR(int(t.H1), 10)}${padR(int(t.any), 10)}${padR(int(t.none), 10)}`,
+        `${padR(unmeasurable.has("H1") ? "n/a" : int(t.H1), 10)}${padR(int(t.any), 10)}` +
+        `${padR(int(t.none), 10)}`,
     );
   }
   out(
     `  combined across both sides: D1 ${int(r.sectionE_proximityIsolated.combined.D1)}, ` +
-      `H4 ${int(r.sectionE_proximityIsolated.combined.H4)}, H1 ${int(r.sectionE_proximityIsolated.combined.H1)}.`,
+      `H4 ${int(r.sectionE_proximityIsolated.combined.H4)}, ` +
+      `H1 ${unmeasurable.has("H1") ? "not measurable on this grid" : int(r.sectionE_proximityIsolated.combined.H1)}.`,
   );
   out("");
   out("  Reading this table correctly - the trap this section exists to avoid:");
@@ -1248,12 +1405,32 @@ function printReport(r) {
   );
   out("  near. Only 'eligible' pairs - in band and not in body - could have moved a tier flag, and");
   out("  the discriminator table in section C compares exactly those two numbers.");
-  out(
-    `  Here: near D1 = ${int(r.sectionE_proximityIsolated.combined.D1)} against ` +
-      `${int(r.sectionC_zonePopulation.tierEligibility.D1.withinBandNotInBody)} eligible pairs, so ` +
-      "price is genuinely never at a D1 zone from outside its body, and no weight search can",
-  );
-  out("  change that on this dataset.");
+  // This sentence is a CONCLUSION, so it is derived rather than asserted. On 5m
+  // it reads "price is genuinely never at a D1 zone from outside its body"; on a
+  // grid where D1 eligibility exists it must say the opposite instead of
+  // carrying the 5m verdict over as a fixed string.
+  const d1EligibleNow = r.sectionC_zonePopulation.tierEligibility.D1.withinBandNotInBody;
+  if (d1EligibleNow === 0) {
+    out(
+      `  Here: near D1 = ${int(r.sectionE_proximityIsolated.combined.D1)} against ` +
+        `${int(d1EligibleNow)} eligible pairs, so ` +
+        "price is genuinely never at a D1 zone from outside its body, and no weight search can",
+    );
+    out("  change that on this dataset.");
+  } else {
+    out(
+      `  Here: near D1 = ${int(r.sectionE_proximityIsolated.combined.D1)} against ` +
+        `${int(d1EligibleNow)} eligible pairs — price DOES reach D1 zones from outside ` +
+        `their body on this ${r.timeframe.id} grid, so the D1 tier is reachable here and a`,
+    );
+    out(
+      "  weight search over the liquidity factors is not degenerate on this dataset. The",
+    );
+    out(
+      `  eligibility is geometric: the proximity band is ${r.config.proximityBandAtrMult} x an ` +
+        `ATR of the ${r.timeframe.id} grid, so a wider native series widens the band.`,
+    );
+  }
   out("");
 
   // ── F. Warm-up boundary ───────────────────────────────────────────────────
@@ -1267,9 +1444,15 @@ function printReport(r) {
   out(
     `  cross-check against baseline: this diagnostic measures the first live D1 zone at bar ` +
       `${wu.boundaryBar === null ? "never" : int(wu.boundaryBar)} and the first confirmed D1 pivot ` +
-      `at bar ${wu.firstD1PivotBar === null ? "never" : int(wu.firstD1PivotBar)}; baseline's warm-up ` +
-      `table reports the D1 pivot at bar ${int(wu.baselineReportedD1PivotBar)}. ` +
-      `${wu.firstD1PivotBar === wu.baselineReportedD1PivotBar ? "AGREES" : "DISAGREES — investigate"}.`,
+      `at bar ${wu.firstD1PivotBar === null ? "never" : int(wu.firstD1PivotBar)}. ` +
+      (wu.baselineReportedD1PivotBar === null
+        ? `The 5m baseline's figure (bar 8,205) does NOT apply to this grid: 21 daily ` +
+          `bars is ${int(wu.expectedD1PivotNativeBars)} native ` +
+          `${r.timeframe.id} bars here, not 6,048 native 5m bars. Run ` +
+          `\`baseline --timeframe ${r.timeframe.id}\` for this grid's own warm-up table.`
+        : `baseline's warm-up table reports the D1 pivot at bar ` +
+          `${int(wu.baselineReportedD1PivotBar)}. ` +
+          `${wu.firstD1PivotBar === wu.baselineReportedD1PivotBar ? "AGREES" : "DISAGREES — investigate"}.`),
   );
   out("");
   if (wu.boundaryBar === null) {
@@ -1323,31 +1506,47 @@ function printReport(r) {
   );
   out("    which tiers this dataset can produce, and therefore which scores are reachable.");
   out(
-    "  * It says nothing about the 1H/4H/D1 timeframes the indicator is normally read on. Every",
+    `  * Every number here is scoped to the ${r.timeframe.id} NATIVE grid, for the same`,
   );
-  out("    number here is scoped to 5-minute bars, for the same reason baseline caveat C0 says.");
+  out("    reason baseline caveat [C0] says. Running the same code on another timeframe does");
+  out("    not re-test this one: it changes the measurement.");
+  if (r.timeframe.unavailableHtf.length > 0) {
+    out(
+      `  * ${r.timeframe.unavailableHtf.join(", ")} is NOT MEASURED on this grid — it is finer`,
+    );
+    out("    than the native series, so there are no candles to aggregate. Any zero above is");
+    out("    a property of the dataset chosen, not of the tier.");
+  }
   out(
     "  * Absence of D1 candidates before the warm-up boundary is arithmetic, not evidence about",
   );
   out("    the weights. Only the post-warm-up phase carries information about the tier itself.");
+  out(
+    "  * The 5m, 1h and 4h runs are NOT independent samples. They overlap in wall-clock time",
+  );
+  out("    and describe the same price action at different resolutions: agreement between");
+  out("    them is not corroboration, and disagreement is usually about semantics.");
   out("");
 }
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 /**
- * Runs the tier diagnostic and prints the requested format.
+ * Runs the tier diagnostic on ONE timeframe and prints the requested format.
  *
- * @param {{json?: boolean}} options
+ * @param {{json?: boolean, tf?: object}} options `tf` is a resolved entry of
+ *   backtest/timeframes.mjs; it defaults to 5m so every pre-slice-7 caller is
+ *   unchanged.
  * @returns {Promise<number>} process exit code (0 ok, 1 failed).
  */
 export async function runTierDiagnostic(options = {}) {
   const json = Boolean(options.json);
+  const tf = options.tf ?? DEFAULT_TF;
   const started = Date.now();
 
   try {
-    const { candles, meta } = await loadDataset();
-    const result = runDiagnostic(candles, meta);
+    const { candles, meta } = await loadDataset(tf);
+    const result = runDiagnostic(candles, meta, tf);
     result.runtimeMs = Date.now() - started;
 
     if (json) {
