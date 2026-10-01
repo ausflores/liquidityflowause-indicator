@@ -834,8 +834,20 @@ function runComparison(candles, meta, tf) {
       "110, and candidates cluster at 40–60. The weighted model's near-zero firing rate " +
       "is therefore a property of this timeframe as much as of these weights and must not " +
       "be read as a verdict about the weight vector on its intended timeframe. " +
-      "Establishing that would require replaying on higher-timeframe data, which is out " +
-      "of scope for this feature (`odd/tasks/weight-calibration.md`, \"Out of scope\")."
+      // The sentence that USED to end here — "Establishing that would require
+      // replaying on higher-timeframe data, which is out of scope for this
+      // feature" — became false on 2026-10-01: the maintainer lifted the 5m-only
+      // scope, and slice 7 performed that replay. Every number above it is
+      // unchanged and remains correct for 5m; only the claim about what is still
+      // unknown needed correcting, which is exactly the D1/D2 defect class
+      // (a superseded premise left standing because changing it was
+      // inconvenient). Corrected in 2026-10 under an explicit instruction to
+      // revise the caveat text while freezing the numbers.
+      "That replay has since been done: 1h and 4h datasets are in the harness, and on " +
+      "those native grids the D1 tier does qualify. The figures above are unchanged and " +
+      "remain exactly what was measured on 5-minute bars — read them as a statement about " +
+      "this timeframe, not about the weights. Run `baseline --timeframe 1h` for what the " +
+      "tier dimension looks like where it can move."
     : `EVERY NUMBER IS SCOPED TO ${tf.scopeWord} DATA, AND THE NATIVE GRID IS ` +
       `${tf.id} — NOT A 5-MINUTE CHART WITH MORE HISTORY. On this run atrChart is ` +
       `ta.atr(14) OF ${tf.id.toUpperCase()} BARS (${int(barsPerDay * 1)} bars per day, ` +
@@ -895,19 +907,31 @@ function runComparison(candles, meta, tf) {
       "printed in the header; a hole in the history would silently bias every number below.",
   ];
 
-  // The cross-timeframe caveat is appended ONLY for a non-default timeframe.
+  // The cross-timeframe caveat, appended on EVERY timeframe.
   //
-  // It is a caveat about reading SEVERAL OF THESE REPORTS SIDE BY SIDE, so it is
-  // printed where a comparison is actually in prospect, and it is withheld from
-  // the 5m run because the 5m report's output is contractually byte-identical to
-  // slice 6 and a reader comparing runs will read it there anyway. This is a real
-  // trade-off, made deliberately: the byte-identity guarantee is explicit, and
-  // appending a line to the 5m report would break it to serve a caveat that the
-  // 5m report alone cannot violate.
-  if (tf.id !== "5m") {
-    caveats.push(
-      "MULTIPLE TIMEFRAMES ARE NOT MULTIPLE INDEPENDENT SAMPLES: the 5m, 1h and 4h runs " +
-        "overlap in wall-clock time and describe the SAME BTC/USD price action at " +
+  // It used to be withheld from the 5m run on the grounds that the 5m report was
+  // contractually byte-identical and a reader comparing runs would see it on the
+  // others. That was the wrong call: 5m is the DEFAULT, so most readers never
+  // open a second report at all, and the reader who trusts that three timeframes
+  // corroborate each other is exactly the reader who is wrong. The numbers are
+  // still frozen; the caveat now travels with them on all three grids.
+  //
+  // The 5m wording is a FORWARD WARNING, because a 5m reader may not know the
+  // other runs exist. It names them as available rather than describing runs
+  // they may never have seen — the warning has to be actionable.
+  caveats.push(
+    tf.id === "5m"
+      ? "MULTIPLE TIMEFRAMES ARE NOT MULTIPLE INDEPENDENT SAMPLES: this harness also " +
+        "runs on 1h and 4h (`baseline --timeframe 1h` / `4h`), and those runs are NOT " +
+        "three samples of one measurement — they describe the same BTC/USD price action " +
+        "at different resolutions, so their errors are strongly correlated. Agreement " +
+        "between them is NOT corroboration, and disagreement between them is mostly " +
+        "about SEMANTICS (a different atrChart, a different HTF grid, a different " +
+        "warm-up) rather than about which timeframe is right. A configuration that " +
+        "looks good on several timeframes is one observation reported several ways, " +
+        "and supports no confidence interval, p-value, or 'N = 3 tests' framing."
+      : "MULTIPLE TIMEFRAMES ARE NOT MULTIPLE INDEPENDENT SAMPLES: the 5m, 1h and 4h " +
+        "runs overlap in wall-clock time and describe the SAME BTC/USD price action at " +
         "different resolutions. Agreement between them is NOT corroboration — it is the " +
         "same evidence counted twice, and their errors are strongly correlated. " +
         "Disagreement between them is mostly about SEMANTICS (a different atrChart, a " +
@@ -915,8 +939,7 @@ function runComparison(candles, meta, tf) {
         "Nothing here supports a confidence interval, a p-value, or any 'N = 3 " +
         "independent tests' framing: if a weight vector wins on all three, treat that " +
         "as one observation reported three ways.",
-    );
-  }
+  );
 
   const observations = [
     "D.1 DEAD DECLARATION: `liquidityOK` and `structureOK` (docs/technical-spec.md:1844, " +
