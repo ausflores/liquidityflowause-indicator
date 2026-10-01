@@ -2,7 +2,12 @@
 // Slice 4 smoke suite — signal-engine port (T7) + regression over the four
 // already-merged ports (T3/T4/T5/T6). Bare Node, zero dependencies, writes
 // nothing. Lives in backtest/ so a clean checkout can run it: it verifies the
-// five ported modules together, as one suite for the whole harness.
+// five ported modules together, as one suite for the whole harness. The
+// appended T9 section checks outcome labelling (modules/label.mjs) against
+// hand-built synthetic candles and never reads backtest/data/. The appended
+// T10/T11 sections check the binary confluence model (modules/binary.mjs) on
+// synthetic bars and the baseline runner's wiring by reading the harness's
+// own source — again never backtest/data/.
 //
 // Run: node backtest/smoke.mjs
 // ============================================================================
@@ -23,6 +28,22 @@ import {
   SIGNAL_ENGINE_DEFAULTS,
   SIGNAL_ENGINE_WEIGHT_KEYS,
 } from "./modules/signal-engine.mjs";
+import {
+  EXIT_RULE_DEFAULTS,
+  EXIT_STOP_PCT,
+  EXIT_TARGET_PCT,
+  FORWARD_RETURN_DEFAULTS,
+  labelExitRule,
+  labelForwardReturn,
+  labelSignalsExitRule,
+  labelSignalsForwardReturn,
+} from "./modules/label.mjs";
+import { readFileSync } from "node:fs";
+import {
+  createBinarySignalModel,
+  BINARY_INPUT_CONTRACT,
+  BINARY_MODEL_DEFAULTS,
+} from "./modules/binary.mjs";
 
 const counts = {};
 let section = "untitled";
@@ -938,6 +959,691 @@ function sum(obj) {
   check(err !== null && /liquidity factor/.test(err.message), "attribution error names the factor");
 }
 
+// ─── 6. outcome-labelling (T9) ──────────────────────────────────────────────
+//
+// Label correctness is proven with hand-computed synthetic candles built
+// INSIDE this section: tiny, explicit, arithmetic-checkable. Nothing here
+// reads backtest/data/, because a label rule must be provable without market
+// data — real candles only hide a wrong rule behind plausible numbers.
+
+sec("outcome-labels");
+{
+  /** Builds a candle in the module's input shape; all three fields explicit. */
+  const lb = (high, low, close) => ({ high, low, close });
+  /** Builds a signal event: { barIndex, side, price }. */
+  const sig = (barIndex, side, price) => ({ barIndex, side, price });
+
+  // 6a. Shipped constants are exactly the spec's D.4 literals (1961-1965).
+  check(EXIT_TARGET_PCT === 1.5, "exit target 1.5% (spec D.4 line 1961)");
+  check(EXIT_STOP_PCT === 0.8, "exit stop 0.8% (spec D.4 line 1962)");
+  check(EXIT_RULE_DEFAULTS.maxHorizonBars === 288, "default exit horizon 288 bars (24h of 5m)");
+  check(
+    FORWARD_RETURN_DEFAULTS.horizons.join(",") === "6,12,24,48,96,288",
+    `default forward horizons (got ${FORWARD_RETURN_DEFAULTS.horizons.join(",")})`,
+  );
+
+  // 6b. LONG rises straight through +1.5% -> win.
+  // Entry 100 => target 101.5, stop 99.2. Bar 1's high 101.6 touches the
+  // target while its low 99.9 stays above the stop, so nothing is ambiguous.
+  const rising = [
+    lb(100.5, 99.5, 100), // 0 — signal bar (close = entry price)
+    lb(101.6, 99.9, 101.2), // 1 — high 101.6 >= 101.5 -> target touched
+    lb(101.4, 100.8, 101.1),
+    lb(101.3, 100.9, 101.0),
+    lb(101.2, 100.7, 101.0),
+    lb(101.1, 100.6, 101.0),
+  ];
+  const winCase = labelExitRule(rising, sig(0, "long", 100), { maxHorizonBars: 4 });
+  check(winCase.label === "win", `LONG +1.5% -> win (got ${winCase.label})`);
+  check(winCase.doubleTouch === false, "single touch is not a double touch");
+  check(winCase.horizonBars === 1, `resolved on the first forward bar (got ${winCase.horizonBars})`);
+  check(Math.abs(winCase.targetPrice - 101.5) < 1e-9, "target price = entry + 1.5%");
+  check(Math.abs(winCase.stopPrice - 99.2) < 1e-9, "stop price = entry - 0.8%");
+
+  // 6c. LONG falls straight through -0.8% -> loss.
+  const falling = [
+    lb(100.5, 99.5, 100), // 0 — signal bar
+    lb(100.8, 99.1, 99.4), // 1 — low 99.1 <= 99.2 -> stop; high never 101.5
+    lb(100.6, 99.4, 100.0),
+    lb(100.5, 99.5, 100.0),
+    lb(100.4, 99.6, 100.0),
+    lb(100.3, 99.7, 100.0),
+  ];
+  const lossCase = labelExitRule(falling, sig(0, "long", 100), { maxHorizonBars: 4 });
+  check(lossCase.label === "loss", `LONG -0.8% -> loss (got ${lossCase.label})`);
+  check(lossCase.doubleTouch === false, "stop-only touch is not a double touch");
+  check(lossCase.horizonBars === 1, `stopped on the first forward bar (got ${lossCase.horizonBars})`);
+
+  // 6d. LONG wanders and never reaches either level -> timeout. Bar 5 DOES
+  // touch the target, on purpose: the label must stay timeout, because the
+  // scan stops at maxHorizonBars.
+  const wandering = [
+    lb(100.5, 99.5, 100), // 0 — signal bar
+    lb(100.4, 99.6, 100.1), // 1 — inside 99.2 .. 101.5
+    lb(100.3, 99.7, 100.0), // 2
+    lb(100.2, 99.8, 100.1), // 3
+    lb(100.1, 99.9, 100.0), // 4 — last bar inside the horizon
+    lb(103.0, 102.0, 102.5), // 5 — target touched, but OUTSIDE the horizon
+  ];
+  const timeoutCase = labelExitRule(wandering, sig(0, "long", 100), { maxHorizonBars: 4 });
+  check(timeoutCase.label === "timeout", `no touch inside the horizon -> timeout (got ${timeoutCase.label})`);
+  check(timeoutCase.horizonBars === 4, `horizon reached = maxHorizonBars (got ${timeoutCase.horizonBars})`);
+  check(timeoutCase.barsAvailable === 5, `5 candles existed after the signal (got ${timeoutCase.barsAvailable})`);
+  check(timeoutCase.doubleTouch === false, "timeout is never a double touch");
+
+  // 6e. SHORT wins when price FALLS: entry 100 => target 98.5, stop 100.8.
+  const shortFalling = [
+    lb(100.5, 99.5, 100), // 0 — signal bar
+    lb(100.6, 98.4, 98.6), // 1 — low 98.4 <= 98.5 -> target; high < 100.8
+    lb(100.5, 99.5, 100),
+    lb(100.5, 99.5, 100),
+    lb(100.5, 99.5, 100),
+    lb(100.5, 99.5, 100),
+  ];
+  const shortWin = labelExitRule(shortFalling, sig(0, "short", 100), { maxHorizonBars: 4 });
+  check(shortWin.label === "win", `SHORT -1.5% -> win (got ${shortWin.label})`);
+  check(Math.abs(shortWin.targetPrice - 98.5) < 1e-9, "short target = entry - 1.5%");
+  check(Math.abs(shortWin.stopPrice - 100.8) < 1e-9, "short stop = entry + 0.8%");
+
+  // 6f. SHORT loses when price RISES through +0.8%.
+  const shortRising = [
+    lb(100.5, 99.5, 100), // 0 — signal bar
+    lb(100.9, 99.5, 100.2), // 1 — high 100.9 >= 100.8 -> stop; low > 98.5
+    lb(100.5, 99.5, 100),
+    lb(100.5, 99.5, 100),
+    lb(100.5, 99.5, 100),
+    lb(100.5, 99.5, 100),
+  ];
+  const shortLoss = labelExitRule(shortRising, sig(0, "short", 100), { maxHorizonBars: 4 });
+  check(shortLoss.label === "loss", `SHORT +0.8% -> loss (got ${shortLoss.label})`);
+  check(shortLoss.doubleTouch === false, "stop-only touch is not a double touch");
+
+  // 6g. ONE bar straddles BOTH levels (high >= target AND low <= stop).
+  // Intra-bar order is unknowable from OHLC, so the conservative rule says
+  // loss, and the raw double-touch is flagged separately.
+  const straddleLong = labelExitRule(
+    [
+      lb(100.5, 99.5, 100), // 0 — signal bar
+      lb(102.0, 98.0, 100.0), // 1 — high 102 >= 101.5 AND low 98 <= 99.2
+      lb(100.5, 99.5, 100),
+      lb(100.5, 99.5, 100),
+      lb(100.5, 99.5, 100),
+      lb(100.5, 99.5, 100),
+    ],
+    sig(0, "long", 100),
+    { maxHorizonBars: 4 },
+  );
+  check(straddleLong.label === "loss", "double touch -> loss (conservative rule)");
+  check(straddleLong.doubleTouch === true, "doubleTouch flag raised");
+  check(straddleLong.horizonBars === 1, `resolved on the straddling bar (got ${straddleLong.horizonBars})`);
+
+  // The short mirror: low 98.0 touches the 98.5 target, high 101.5 touches
+  // the 100.8 stop, on the same bar.
+  const straddleShort = labelExitRule(
+    [
+      lb(100.5, 99.5, 100),
+      lb(101.5, 98.0, 100.0),
+      lb(100.5, 99.5, 100),
+      lb(100.5, 99.5, 100),
+      lb(100.5, 99.5, 100),
+      lb(100.5, 99.5, 100),
+    ],
+    sig(0, "short", 100),
+    { maxHorizonBars: 4 },
+  );
+  check(
+    straddleShort.label === "loss" && straddleShort.doubleTouch === true,
+    "short double touch -> loss + flag",
+  );
+
+  // 6h. Signal 2 bars from the end of the array: with the default 288-bar
+  // horizon the observation window cannot exist, so the label is
+  // insufficient_data — its own bucket, never a win, a loss or a timeout.
+  const nearEnd = [
+    lb(100.5, 99.5, 100),
+    lb(100.4, 99.6, 100),
+    lb(100.4, 99.6, 100), // 2 — signal: only 2 candles follow
+    lb(100.4, 99.6, 100),
+    lb(100.4, 99.6, 100),
+  ];
+  const truncated = labelExitRule(nearEnd, sig(2, "long", 100));
+  check(truncated.label === "insufficient_data", `2 bars left -> insufficient_data (got ${truncated.label})`);
+  check(truncated.barsAvailable === 2, `barsAvailable = 2 (got ${truncated.barsAvailable})`);
+  check(truncated.horizonBars === 0, "no scan runs when the horizon cannot be observed");
+  check(truncated.doubleTouch === false, "insufficient_data never claims a double touch");
+
+  // The availability rule fires BEFORE the scan: this window WOULD touch the
+  // target on its first forward bar and it is still insufficient_data. If
+  // the intended rule ever becomes scan-first, this is the check that must
+  // change with it.
+  const touchTruncated = labelExitRule(
+    [
+      lb(100.5, 99.5, 100),
+      lb(100.4, 99.6, 100),
+      lb(100.4, 99.6, 100), // 2 — signal
+      lb(101.6, 100.0, 101.0), // 3 — would touch the +1.5% target
+      lb(100.4, 99.6, 100),
+    ],
+    sig(2, "long", 100),
+  );
+  check(
+    touchTruncated.label === "insufficient_data",
+    "touch inside a truncated window stays insufficient_data (availability first)",
+  );
+
+  // 6i. Forward return with hand-built closes: entry 100, close 101.5 six
+  // bars later => exactly +1.5% long and exactly -1.5% short (the raw price
+  // change is negated for the short). ((101.5 - 100) / 100) * 100 === 1.5 is
+  // exact in IEEE-754 for these operands, so the assertions are exact.
+  const forward = [
+    lb(100.5, 99.5, 100), // 0 — signal bar, close 100
+    lb(100.5, 99.5, 100),
+    lb(100.5, 99.5, 100),
+    lb(100.5, 99.5, 100),
+    lb(100.5, 99.5, 100),
+    lb(100.5, 99.5, 100),
+    lb(101.6, 100.0, 101.5), // 6 — close 101.5 = +1.5% from 100
+  ];
+  const fwdLong = labelForwardReturn(forward, sig(0, "long", 100));
+  check(fwdLong.returns[6] === 1.5, `long forward return at 6 = +1.5 (got ${fwdLong.returns[6]})`);
+  check(fwdLong.returns[6] > 0, "positive = the trade would have made money");
+  const fwdShort = labelForwardReturn(forward, sig(0, "short", 100));
+  check(fwdShort.returns[6] === -1.5, `short forward return at 6 = -1.5 (got ${fwdShort.returns[6]})`);
+  check(fwdShort.returns[6] < 0, "a price RISE is a loss for the short");
+  check(fwdShort.returns[6] === -fwdLong.returns[6], "short return is the exact negation of the long");
+
+  // 6j. A horizon longer than the remaining data is null, NOT 0 — and a
+  // genuinely flat close still returns a real 0, so the two can never be
+  // mistaken for one another.
+  check(288 in fwdLong.returns, "every requested horizon is present as a key");
+  check(fwdLong.returns[288] === null, "horizon beyond the data -> null");
+  check(fwdLong.returns[288] !== 0, "null is not 0");
+  const twoBars = [lb(100.5, 99.5, 100), lb(100.5, 99.5, 100)];
+  const beyond = labelForwardReturn(twoBars, sig(0, "long", 100), { horizons: [3] });
+  check(beyond.returns[3] === null, "explicit horizon past the end -> null");
+  const flat = labelForwardReturn(twoBars, sig(0, "long", 100), { horizons: [1] });
+  check(flat.returns[1] === 0, "an unchanged close is a real 0%, distinct from null");
+
+  // 6k. Batch aggregation: the RAW double-touch count is reported separately
+  // from the label counts, because it is exactly how much the conservative
+  // rule moves any hit rate.
+  const batchCandles = [
+    lb(100.5, 99.5, 100), // 0 — signal A (long, close 100)
+    lb(102.0, 98.0, 100), // 1 — A resolves: both levels on one bar
+    lb(100.5, 99.5, 100),
+    lb(100.5, 99.5, 100),
+    lb(100.5, 99.5, 100), // 4 — signal B (long, close 100)
+    lb(101.6, 99.9, 100), // 5 — B: high 101.6 >= 101.5 -> win
+    lb(100.5, 99.5, 100),
+    lb(100.5, 99.5, 100),
+    lb(100.5, 99.5, 100),
+    lb(100.5, 99.5, 100),
+  ];
+  const batch = labelSignalsExitRule(batchCandles, [sig(0, "long", 100), sig(4, "long", 100)], {
+    maxHorizonBars: 4,
+  });
+  check(batch.total === 2, `two signals labelled (got ${batch.total})`);
+  check(batch.counts.loss === 1 && batch.counts.win === 1, "one loss, one win");
+  check(batch.counts.timeout === 0 && batch.counts.insufficient_data === 0, "no other labels");
+  check(batch.doubleTouchCount === 1, `raw double-touch count = 1 (got ${batch.doubleTouchCount})`);
+  check(batch.results[0].label === "loss" && batch.results[0].doubleTouch === true, "A: straddle flagged");
+  check(batch.results[1].label === "win" && batch.results[1].doubleTouch === false, "B: clean win");
+
+  const fwdBatch = labelSignalsForwardReturn(forward, [sig(0, "long", 100), sig(0, "short", 100)]);
+  check(fwdBatch.total === 2, `two forward-return labels (got ${fwdBatch.total})`);
+  check(fwdBatch.horizons.join(",") === "6,12,24,48,96,288", "batch echoes the horizons");
+  check(fwdBatch.results[0].returns[6] === -fwdBatch.results[1].returns[6], "batch keeps both sides distinct");
+
+  // 6l. Validation: a miswired signal THROWS instead of producing plausible
+  // labels for the wrong bars.
+  throws(() => labelExitRule([], sig(0, "long", 100)), RangeError, "signal beyond the data rejected");
+  throws(() => labelExitRule(rising, sig(-1, "long", 100)), TypeError, "negative barIndex rejected");
+  throws(() => labelExitRule(rising, sig(0, "long", -1)), TypeError, "non-positive price rejected");
+  throws(() => labelExitRule(rising, sig(0, "buy", 100)), TypeError, "side domain enforced");
+  throws(
+    () => labelExitRule(rising, sig(1, "long", 100)), // bar 1 closes 101.2, not 100
+    TypeError,
+    "price that is not the signal bar's close rejected (anti-miswire)",
+  );
+  throws(
+    () => labelExitRule([{ t: 0, o: 1, h: 2, l: 0.5, c: 1, v: 1 }], sig(0, "long", 1)),
+    TypeError,
+    "unmapped dataset candle rejected (field shape)",
+  );
+  throws(
+    () => labelExitRule(rising, sig(0, "long", 100), { targetPct: 2 }),
+    TypeError,
+    "unknown option rejected — the D.4 levels are spec, not knobs",
+  );
+  throws(
+    () => labelExitRule(rising, sig(0, "long", 100), { maxHorizonBars: 0 }),
+    RangeError,
+    "maxHorizonBars minval 1",
+  );
+  throws(() => labelForwardReturn(forward, sig(0, "long", 100), { horizons: [0] }), RangeError, "horizon minval 1");
+  throws(() => labelForwardReturn(forward, sig(0, "long", 100), { horizons: [] }), TypeError, "empty horizons rejected");
+  throws(
+    () => labelSignalsExitRule(rising, [], { bogus: 1 }),
+    TypeError,
+    "batch validates options even when no signal is labelled",
+  );
+}
+
+// ─── 7. binary baseline model (T10/T11) ─────────────────────────────────────
+//
+// The D.1 binary confluence model (modules/binary.mjs) on hand-built synthetic
+// bars: the fairness contract (weighted raw ⇒ binary strict, with the score
+// threshold as the ONLY difference between the models), the shared input
+// contract, per-model cooldown and exclusivity state, and the "no invented
+// score" rule. This section never reads backtest/data/ — the real-dataset
+// assertion runs inside `node backtest/run.mjs baseline`, which throws on any
+// violation.
+
+sec("binary-model");
+{
+  // 7a. Construction: the cooldown default is READ from the engine so the two
+  // can never drift, and the contract is the engine's 23-field bar shape.
+  const bm0 = createBinarySignalModel();
+  check(
+    bm0.defaults.signalCooldownBars === SIGNAL_ENGINE_DEFAULTS.signalCooldownBars,
+    "cooldown default read from the engine's defaults (single source)",
+  );
+  check(BINARY_MODEL_DEFAULTS.signalCooldownBars === 10, "shipped cooldown 10");
+  check(Object.isFrozen(BINARY_INPUT_CONTRACT), "input contract is frozen");
+  check(BINARY_INPUT_CONTRACT.length === 23, `23 contract fields (got ${BINARY_INPUT_CONTRACT.length})`);
+  const bare = seBar();
+  check(
+    BINARY_INPUT_CONTRACT.every((f) => f in bare),
+    "every contract field present in the shared bar shape",
+  );
+  check(
+    Object.keys(bare).length === BINARY_INPUT_CONTRACT.length,
+    "shared bar shape carries nothing beyond the contract",
+  );
+
+  // 7b. Options: D.1 computes no score, so there are no score knobs.
+  throws(() => createBinarySignalModel({ minConfidence: 70 }), TypeError, "minConfidence rejected — no score exists");
+  throws(() => createBinarySignalModel({ bogus: 1 }), TypeError, "unknown option rejected");
+  throws(() => createBinarySignalModel({ signalCooldownBars: 0 }), RangeError, "signalCooldownBars minval 1");
+  throws(() => createBinarySignalModel("no"), TypeError, "non-object options rejected");
+
+  // 7c. Input contract: reduced / pre-derived shapes AND each other's outputs
+  // are rejected — the executable form of "the same bar object, both models".
+  const bm = createBinarySignalModel();
+  throws(() => bm.evaluate(null), TypeError, "bar is required");
+  const reduced = seBar();
+  delete reduced.nearD1LiquidityLong;
+  throws(() => bm.evaluate(reduced), TypeError, "reduced shape rejected");
+  const derived = seBar();
+  delete derived.sessionStrength;
+  derived.sessionOK = true;
+  throws(() => bm.evaluate(derived), TypeError, "pre-derived sessionOK rejected — raw flags only");
+  const engineOut = createSignalEngine().evaluate(seBar());
+  throws(
+    () => createBinarySignalModel().evaluate(engineOut),
+    TypeError,
+    "engine output not accepted as a bar (binary side)",
+  );
+  const binaryOut = createBinarySignalModel().evaluate(seBar());
+  throws(
+    () => createSignalEngine().evaluate(binaryOut),
+    TypeError,
+    "binary output not accepted as a bar (engine side)",
+  );
+
+  // 7d. Domain errors: both models reject the SAME bars with the SAME class,
+  // so a wiring mistake surfaces identically whichever model reads the bar.
+  const domainCases = [
+    [{ barIndex: -1 }, TypeError, "barIndex"],
+    [{ sessionStrength: -1 }, TypeError, "sessionStrength"],
+    [{ marketStructure: 2 }, RangeError, "marketStructure"],
+  ];
+  for (const [over, type, label] of domainCases) {
+    throws(() => createSignalEngine().evaluate(seBar(over)), type, `engine rejects bad ${label}`);
+    throws(() => createBinarySignalModel().evaluate(seBar(over)), type, `binary rejects bad ${label}`);
+  }
+  const eSeq = createSignalEngine();
+  eSeq.evaluate(seBar({ barIndex: 0 }));
+  throws(() => eSeq.evaluate(seBar({ barIndex: 3 })), RangeError, "engine: consecutive bars enforced");
+  const bSeq = createBinarySignalModel();
+  bSeq.evaluate(seBar({ barIndex: 0 }));
+  throws(() => bSeq.evaluate(seBar({ barIndex: 3 })), RangeError, "binary: consecutive bars enforced");
+
+  // 7e. Synthetic sweep of the raw-decision input space, both sides: the
+  // fairness contract itself. weighted raw ⇒ binary strict, and raw ===
+  // strict && score >= minConfidence — the threshold is the only difference.
+  const strengths = [0, 1, 2, 7];
+  const structures = [-1, 0, 1];
+  const bools = [false, true];
+  let sweepBars = 0;
+  let implicationViolations = 0;
+  let equalityMismatches = 0;
+  let sessionDrift = 0;
+  let gateViolations = 0;
+  let strictOnly = 0;
+  let bothAdmitted = 0;
+  for (const side of ["long", "short"]) {
+    for (const near of bools) {
+      for (const tier of bools) {
+        for (const sessionStrength of strengths) {
+          for (const arm1 of bools) {
+            for (const arm2 of bools) {
+              for (const arm3 of bools) {
+                for (const marketStructure of structures) {
+                  const over = { barIndex: 0, sessionStrength, marketStructure, inOverlap: true };
+                  if (side === "long") {
+                    Object.assign(over, {
+                      nearLiquidityLong: near,
+                      nearD1LiquidityLong: near && tier,
+                      breakUp: arm1,
+                      nearImbalanceLong: arm2,
+                      inImbalanceLong: arm3,
+                    });
+                  } else {
+                    Object.assign(over, {
+                      nearLiquidityShort: near,
+                      nearD1LiquidityShort: near && tier,
+                      breakDown: arm1,
+                      nearImbalanceShort: arm2,
+                      inImbalanceShort: arm3,
+                    });
+                  }
+                  const bar = seBar(over);
+                  const e = createSignalEngine().evaluate(bar);
+                  const m = createBinarySignalModel().evaluate(bar);
+                  sweepBars += 1;
+                  const raw = side === "long" ? e.longSignalRaw : e.shortSignalRaw;
+                  const strict = side === "long" ? m.longSignalStrict : m.shortSignalStrict;
+                  const score = side === "long" ? e.longScore : e.shortScore;
+                  if (raw && !strict) implicationViolations += 1;
+                  if (raw !== (strict && score >= SIGNAL_ENGINE_DEFAULTS.minConfidence)) {
+                    equalityMismatches += 1;
+                  }
+                  if (e.sessionOK !== m.sessionOK) sessionDrift += 1;
+                  if (sessionStrength < 2 && (raw || strict)) gateViolations += 1;
+                  if (strict && !raw) strictOnly += 1;
+                  if (raw && strict) bothAdmitted += 1;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  check(sweepBars === 768, `768 sweep bars (got ${sweepBars})`);
+  check(
+    implicationViolations === 0,
+    `weighted raw ⇒ binary strict on all ${sweepBars} bars (violations ${implicationViolations})`,
+  );
+  check(
+    equalityMismatches === 0,
+    `raw === strict && score >= minConfidence on all ${sweepBars} (mismatches ${equalityMismatches})`,
+  );
+  check(sessionDrift === 0, "sessionOK identical on every sweep bar");
+  check(gateViolations === 0, "strength < 2 gates BOTH models on every sweep bar");
+  check(strictOnly > 0, `strict && !raw occurs in the sweep: ${strictOnly} bars (the threshold's effect)`);
+  check(bothAdmitted > 0, `raw && strict occurs in the sweep: ${bothAdmitted} bars`);
+
+  // 7f. The threshold in isolation: ONE term differs (spec D.1 vs Pine :165).
+  const lowFlags = {
+    nearLiquidityLong: true,
+    nearH1LiquidityLong: true,
+    sessionStrength: 2,
+    inOverlap: false,
+    inLondon: true,
+    breakUp: true,
+    marketStructure: 1,
+  };
+  const eLow = createSignalEngine().evaluate(seBar(lowFlags));
+  const bLow = createBinarySignalModel().evaluate(seBar(lowFlags));
+  check(eLow.longScore === 45, `below-threshold bar: 10+15+20 = 45 (got ${eLow.longScore})`);
+  check(eLow.longScore < SIGNAL_ENGINE_DEFAULTS.minConfidence, "score below minConfidence");
+  check(eLow.longSignalRaw === false && eLow.longSignal === false, "weighted: silent on the bar");
+  check(
+    bLow.longSignalStrict === true && bLow.longSignal === true,
+    "binary: admits the SAME bar — the threshold is the only difference",
+  );
+
+  // Agreement when the score clears.
+  const clearFlags = {
+    nearLiquidityLong: true,
+    nearD1LiquidityLong: true,
+    sessionStrength: 7,
+    inOverlap: true,
+    breakUp: true,
+    marketStructure: 1,
+    volumeConfirmed: true,
+  };
+  const eClear = createSignalEngine().evaluate(seBar(clearFlags));
+  const bClear = createBinarySignalModel().evaluate(seBar(clearFlags));
+  check(eClear.longScore === 85, `clearing bar: 30+25+20+10 = 85 (got ${eClear.longScore})`);
+  check(
+    eClear.longSignalRaw === true && bClear.longSignalStrict === true,
+    "both models admit when the score clears",
+  );
+  check(eClear.longSignal === true && bClear.longSignal === true, "both survive exclusivity");
+
+  // 7g. The session gate: strength 1 blocks BOTH models even when the score
+  // clears; strength 2 admits BOTH. sessionOK is derived identically.
+  const gatedFlags = {
+    nearLiquidityLong: true,
+    nearD1LiquidityLong: true,
+    breakUp: true,
+    nearImbalanceLong: true,
+    marketStructure: 1,
+    volumeConfirmed: true,
+    inOverlap: false,
+  };
+  const offSession = seBar({
+    ...gatedFlags,
+    sessionStrength: 1,
+    inLondon: false,
+    inNY: false,
+    inAsia: true,
+  });
+  const eOff = createSignalEngine().evaluate(offSession);
+  const bOff = createBinarySignalModel().evaluate(offSession);
+  check(eOff.longScore === 80, `off-session score clears anyway: 30+5+20+15+10 = 80 (got ${eOff.longScore})`);
+  check(eOff.sessionOK === false && bOff.sessionOK === false, "strength 1: sessionOK false on both");
+  check(
+    eOff.longSignalRaw === false && bOff.longSignalStrict === false,
+    "strength 1: neither model admits despite the score",
+  );
+  const inSession = seBar({ ...gatedFlags, sessionStrength: 2, inLondon: true, inAsia: false });
+  const eOn = createSignalEngine().evaluate(inSession);
+  const bOn = createBinarySignalModel().evaluate(inSession);
+  check(eOn.longScore === 90, `in-session score: 30+15+20+15+10 = 90 (got ${eOn.longScore})`);
+  check(eOn.sessionOK === true && bOn.sessionOK === true, "strength 2: sessionOK true on both");
+  check(
+    eOn.longSignalRaw === true && bOn.longSignalStrict === true,
+    "strength 2: both models admit",
+  );
+
+  // 7h. Per-model cooldown state: one shared bar sequence, TWO independent
+  // state machines. If the stamp were shared, neither model could keep
+  // firing on the alternating pattern below.
+  const seqEngine = createSignalEngine();
+  const seqBinary = createBinarySignalModel();
+  const highFlags = {
+    nearLiquidityLong: true,
+    nearD1LiquidityLong: true,
+    sessionStrength: 7,
+    inOverlap: true,
+    breakUp: true,
+    marketStructure: 1,
+    volumeConfirmed: true,
+  };
+  const trace = [];
+  let lastE = null;
+  let lastB = null;
+  for (let i = 0; i <= 15; i += 1) {
+    const flags = i === 0 ? lowFlags : i === 5 || i === 10 || i === 15 ? highFlags : {};
+    const bar = seBar({ barIndex: i, ...flags });
+    lastE = seqEngine.evaluate(bar);
+    lastB = seqBinary.evaluate(bar);
+    trace.push({
+      i,
+      eRaw: lastE.longSignalRaw,
+      bStrict: lastB.longSignalStrict,
+      eFired: lastE.longSignalFired,
+      bFired: lastB.longSignalFired,
+      eCool: lastE.inCooldown,
+      bCool: lastB.inCooldown,
+    });
+  }
+  const t = (i) => trace[i];
+  check(
+    t(0).eRaw === false && t(0).eFired === false && t(0).bStrict === true && t(0).bFired === true,
+    "bar 0 (score 45): weighted silent, binary fires and stamps ITS OWN bar",
+  );
+  check(
+    t(5).eFired === true && t(5).eCool === false && t(5).bFired === false && t(5).bCool === true,
+    "bar 5: weighted fires on an empty stamp while binary cools from its own bar-0 fire",
+  );
+  check(
+    t(10).eFired === false && t(10).eCool === true && t(10).bFired === true && t(10).bCool === false,
+    "bar 10: roles swap — binary fires on its own stamp while weighted cools from bar 5",
+  );
+  check(
+    t(15).eFired === true && t(15).bFired === false && t(15).bCool === true,
+    "bar 15: roles swap again — two independent state machines",
+  );
+  check(
+    lastE.seLongFires === 2 && lastB.binLongFires === 2,
+    `independent fire counts 2 / 2 (got ${lastE.seLongFires} / ${lastB.binLongFires})`,
+  );
+  check(
+    lastE.lastSignalBar === 15 && lastB.lastSignalBar === 10,
+    "separate lastSignalBar stamps (15 / 10)",
+  );
+  check(lastE.seDualFires === 0 && lastB.binDualFires === 0, "no dual fires in the sequence");
+
+  // 7i. Directional exclusivity runs PER MODEL against its own flags, with
+  // structure breaking the tie and a structureless tie dropped by both.
+  const tieFlags = {
+    nearLiquidityLong: true,
+    nearLiquidityShort: true,
+    nearD1LiquidityLong: true,
+    nearD1LiquidityShort: true,
+    breakUp: true,
+    breakDown: true,
+    sessionStrength: 7,
+    inOverlap: true,
+    volumeConfirmed: true,
+  };
+  const eTie = createSignalEngine().evaluate(seBar({ ...tieFlags, marketStructure: 0 }));
+  const bTie = createBinarySignalModel().evaluate(seBar({ ...tieFlags, marketStructure: 0 }));
+  check(
+    eTie.longSignalRaw === true && eTie.shortSignalRaw === true,
+    "engine: both sides qualify on the tie bar",
+  );
+  check(
+    bTie.longSignalStrict === true && bTie.shortSignalStrict === true,
+    "binary: both sides qualify on the tie bar",
+  );
+  check(eTie.ambiguousTie === true && bTie.ambiguousTie === true, "both flag the genuine tie");
+  check(eTie.longSignal === false && eTie.shortSignal === false, "engine: structureless tie dropped");
+  check(bTie.longSignal === false && bTie.shortSignal === false, "binary: structureless tie dropped");
+  check(
+    eTie.seAmbiguousDrops === 1 && bTie.binAmbiguousDrops === 1,
+    "each model counts its own drop",
+  );
+  check(eTie.longSignalFired === false && bTie.longSignalFired === false, "neither fires on the tie");
+  const eBull = createSignalEngine().evaluate(seBar({ ...tieFlags, marketStructure: 1 }));
+  const bBull = createBinarySignalModel().evaluate(seBar({ ...tieFlags, marketStructure: 1 }));
+  check(
+    eBull.longSignal === true && eBull.shortSignal === false,
+    "engine: structure breaks the tie toward LONG",
+  );
+  check(
+    bBull.longSignal === true && bBull.shortSignal === false,
+    "binary: same direction from the same tie-break",
+  );
+  check(
+    eBull.longSignalFired === true && bBull.longSignalFired === true,
+    "both fire LONG on the tie-break bar",
+  );
+
+  // 7j. No invented score: conditions instead of a distribution.
+  const bPlain = createBinarySignalModel().evaluate(seBar());
+  check(!("longScore" in bPlain) && !("shortScore" in bPlain), "binary output carries no score fields");
+  check(!("longFactors" in bPlain), "no factor breakdown either — there is nothing to distribute");
+  check("longConditions" in bPlain && "shortConditions" in bPlain, "condition report present instead");
+  check(
+    bPlain.longConditions.liquidity === false && bPlain.longConditions.trigger === null,
+    "conditions reported on non-qualifying bars too (trigger null)",
+  );
+  const bCond = createBinarySignalModel().evaluate(
+    seBar({
+      nearLiquidityLong: true,
+      nearD1LiquidityLong: true,
+      nearH4LiquidityLong: true,
+      sessionStrength: 7,
+      inOverlap: true,
+      breakUp: true,
+      nearImbalanceLong: true,
+    }),
+  );
+  check(bCond.longConditions.liquidity === true, "liquidity condition reported");
+  check(
+    bCond.longConditions.liquidityTier === "D1",
+    `highest nearby tier wins the condition report (got ${bCond.longConditions.liquidityTier})`,
+  );
+  check(bCond.longConditions.session === true, "session condition reported");
+  check(
+    bCond.longConditions.trigger === "break+nearImbalance",
+    `trigger arms reported in order (got ${bCond.longConditions.trigger})`,
+  );
+}
+
+// ─── 8. baseline wiring (T10/T11) ───────────────────────────────────────────
+//
+// The runner's wiring, asserted against the harness's own source: dispatch
+// exists and is no longer a stub, BOTH models receive the SAME engineBar
+// from TWO separate instances (never shared cooldown state), and the
+// real-dataset invariants are present as runtime throws.
+
+sec("baseline-wiring");
+{
+  const runSrc = readFileSync(new URL("./run.mjs", import.meta.url), "utf8");
+  const baseSrc = readFileSync(new URL("./baseline.mjs", import.meta.url), "utf8");
+  const binSrc = readFileSync(new URL("./modules/binary.mjs", import.meta.url), "utf8");
+
+  check(
+    runSrc.includes('import { runBaseline } from "./baseline.mjs"'),
+    "run.mjs imports the baseline runner",
+  );
+  check(
+    /subcommand === "baseline"[\s\S]{0,200}runBaseline\(\{ json: process\.argv\.includes\("--json"\) \}\)/.test(runSrc),
+    "baseline dispatch runs runBaseline with the --json flag",
+  );
+  check(!runSrc.includes('stub("T10/T11 baselines")'), "T10/T11 no longer a stub");
+  check(runSrc.includes('stub("T12 weight search")'), "T12 search still stubbed — out of scope");
+
+  check(
+    baseSrc.includes("weighted.evaluate(engineBar)") && baseSrc.includes("binary.evaluate(engineBar)"),
+    "both models are handed the SAME engineBar",
+  );
+  check(
+    baseSrc.includes("const weighted = createSignalEngine()") &&
+      baseSrc.includes("const binary = createBinarySignalModel()"),
+    "two separate instances — cooldown and exclusivity state never shared",
+  );
+  check(
+    baseSrc.includes("raw && !strict") && baseSrc.includes("implicationViolations"),
+    "raw ⇒ strict asserted on every real bar (throws on violation)",
+  );
+  check(
+    baseSrc.includes("equalityMismatches"),
+    "raw === strict && score >= threshold asserted on every real bar",
+  );
+  check(
+    binSrc.includes("minConfidence is not an option"),
+    "binary module enforces the no-score rule at construction",
+  );
+}
+
 // ─── Report ─────────────────────────────────────────────────────────────────
 
 const ORDER = [
@@ -946,6 +1652,9 @@ const ORDER = [
   "structure-break",
   "imbalance-detector",
   "signal-engine",
+  "outcome-labels",
+  "binary-model",
+  "baseline-wiring",
 ];
 console.log("section            checks");
 for (const name of ORDER) {

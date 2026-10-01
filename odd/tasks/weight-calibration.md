@@ -291,26 +291,90 @@ is not recorded as established.
 >   weight table and needs no candles. It was previously unused and is the
 >   cheapest strong check available.
 
-### T9 — Outcome labelling
+### T9 — Outcome labelling ✅ (delivered in slice 5 · GitHub PR #17)
 
-- [ ] Define one label per signal using the spec's own D.4 parameters
-  (target 1.5%, stop 0.8%) as the primary definition.
-- [ ] Also record raw forward return at fixed horizons as a secondary,
-  assumption-light definition.
-- [ ] Document both; report results under both so the conclusion does not
-  depend on one arbitrary exit rule.
+- [x] Define one label per signal using the spec's own D.4 parameters
+  (target 1.5%, stop 0.8%) as the primary definition — `labelExitRule` /
+  `labelSignalsExitRule`, with the 1.5/0.8 values read from
+  `technical-spec.md:1961-1965` and TradingView's `profit`/`loss` read as
+  position P&L, so a short wins when price falls.
+- [x] Also record raw forward return at fixed horizons as a secondary,
+  assumption-light definition — `labelForwardReturn` over horizons
+  6/12/24/48/96/288, `null` and never `0` for an unobserved close.
+- [x] Document both; report results under both — `backtest/baseline.mjs`
+  prints them side by side, so no conclusion rests on one exit rule.
 
-### T10 — Baseline: current configuration
+**Two decisions worth keeping.** (1) Fewer than one horizon of candles left
+after a signal ⇒ `insufficient_data`, decided **before** any scan rather than
+scanned and then called a win: at the dataset edge a touch is only observable
+if it happens early inside the truncated window, so partial observation would
+bias the hit rate upward. The exclusion is position-based and therefore
+independent of outcome. (2) A bar whose range straddles both target and stop
+counts as a **loss**, the conservative reading, and the raw `doubleTouchCount`
+is printed next to every hit rate so a reader can see what that rule moves.
 
-- [ ] Run the port with the shipped weights and threshold 70 over the dataset.
-- [ ] Report signal count, hit rate, distribution of scores, and outcome under
-  both label definitions.
+**Correctness is proven by construction, not by running it.** 60 hand-computed
+synthetic fixture checks were appended to `backtest/smoke.mjs`, none of which
+reads the dataset. Suite 1153 → 1213, `failed: 0`.
 
-### T11 — Binary model baseline (spec D.1)
+### T10 — Baseline: current configuration ✅ (delivered in slice 5 · GitHub PR #17)
 
-- [ ] Implement the strict binary model exactly as D.1 specifies.
-- [ ] Report the same metrics as T10.
-- [ ] This is the comparison the whole feature exists to make.
+- [x] Run the port with the shipped weights and threshold 70 over the dataset.
+- [x] Report signal count, hit rate, distribution of scores, and outcome under
+  both label definitions — `node backtest/run.mjs baseline`.
+
+**Result (62,000 bars, 215.27 days, 0 gaps).** The weighted model fires on
+**2 bars out of 62,000**. Its 393 raw candidates are rejected 391 times by
+the threshold alone: candidates cluster at 40–60 and the observed score
+ceiling on this dataset is **80 against a configured `maxScore` of 110**. Its
+D.4 hit rate is `0.00%` — 0 win, 1 loss, 1 insufficient — which on n=2 is not
+a measurement, and the report says so instead of inviting the comparison.
+
+### T11 — Binary model baseline (spec D.1) ✅ (delivered in slice 5 · GitHub PR #17)
+
+- [x] Implement the strict binary model exactly as D.1 specifies.
+- [x] Report the same metrics as T10 — same bars, same labels, same report.
+- [x] This is the comparison the whole feature exists to make. **Answered:
+  the binary model wins decisively on this dataset — but the result is
+  dominated by the timeframe, not by the weights. See caveat C0 below.**
+
+**Result.** 393 raw candidates → **133 fired** after cooldown (260
+suppressed, 0 removed by exclusivity, 0 ambiguous ties). D.4 hit rate
+**41.59%** — 47 win, 66 loss, 18 timeout, 2 insufficient — long 40.00%, short
+43.40%. Forward return positive on 51.15% of signals at 288 bars against the
+weighted model's 0.00%.
+
+**The comparison is exact, not approximate.** D.1's strict expression is
+`signal-engine.pine:165-171` minus the single `longScore >= minConfidence`
+term, and `sessionOK` is `sessionStrength >= 2` in both (pine:83, spec:1845).
+The binary model therefore consumes the engine's own 23-field input contract
+instead of re-deriving one, and `weighted.raw => binary.strict` is asserted
+across all 124,000 bar-side checks with 0 violations.
+
+**Cooldown state is per-model, deliberately.** Because binary fires more often
+it enters cooldown more often, which can suppress a bar where weighted would
+have fired. So **weighted-fired is *not* a subset of binary-fired** on the
+final flags — each model owns its exclusivity and cooldown state, exactly as
+each would alone on the chart. That relation holds only at the raw level,
+where it is asserted on every bar. Conflating the raw gap (the threshold
+alone) with the fired gap (threshold plus downstream dynamics) would
+misattribute the result, so the report prints both and labels them.
+
+**Caveat C0 governs how any of the above may be read.** Every number is scoped
+to **5-minute data**. The multi-timeframe liquidity tiering that produces the
+score's largest single component barely materialises at that resolution: D1
+qualifies **0/192** long and **0/201** short candidates, H4 only **7/192**
+long, because a D1 pivot needs 21 completed daily bars and the run supplies
+them only from bar 8,205. The weighted model's near-zero firing rate is
+therefore a property of **this timeframe as much as of these weights**, and is
+not a verdict about the weight vector on its intended timeframe. C0 is printed
+first in the report and pointed at from both headline sections, so a single
+copied line cannot lose the scope.
+
+**Costs are not modelled.** Labels are gross of slippage, commission, fees,
+funding and spread, while D.4's own strategy declares `commission_value=0.05`
+and `slippage=2` — every hit rate here is an **upper bound** on what that
+strategy would realise.
 
 ### T12 — Weight search
 
@@ -465,7 +529,22 @@ ports whose correctness is established by the gate itself.
       found**: the `4H` label in `docs/VALIDATION.md` (corrected with proof) and
       `backtest/run.mjs:69`'s `CHART_TIMEZONE = "exchange"` presented as a
       chart observation when it is the indicator's input default.
-- [ ] T9–T12 — labelling, baselines, search
+- [x] **T9 + T10 + T11 — slice 5 delivered** (outcome labelling + both
+      baselines) → shipped as **GitHub PR #17**. **The comparison this whole
+      feature exists to make now exists and is published**: over 62,000 5m
+      bars the weighted model fires **2** times and the binary model **133**;
+      D.4 hit rate `0.00%` vs `41.59%`. **The result is dominated by the
+      timeframe, not by the weights** — caveat C0: the score ceiling on 5m
+      data is 80 against a configured `maxScore` of 110, because D1 liquidity
+      qualifies 0 of 393 candidates. Two orchestrator decisions made here:
+      splitting T9 from T10/T11 into two sequential writers (the labelling
+      module is independently provable on synthetic fixtures before anything
+      consumes it), and requiring caveat C0 after the orchestrator's own
+      read-through found the headline quotable without its scope limit. The
+      orchestrator independently re-ran `baseline` and reproduced every number
+      verbatim.
+- [ ] T12 — weight search (not blocked: the search is exactly the mechanism
+      that would show whether any weight vector clears 70 on this data)
 - [ ] T13 — findings report
 - [ ] Findings reported
 
@@ -477,6 +556,7 @@ ports whose correctness is established by the gate itself.
 | 2 | #13 | ~410 | **~899** (307 + 500 ported lines + 92 doc) |
 | 3 | #14 | ~410 | **~814** (316 + 456 ported lines + 42 doc) |
 | 4 | #15 | ~380 | **~2556** (597 signal-engine + 835 gate + 957 smoke + 38 run.mjs + 129 doc) |
+| 5 | #17 | ~350 | **~2957** (1221 baseline + 447 label + 437 binary + 711 smoke + 8 run.mjs + 133 doc) |
 
 Every slice landed over its forecast.
 
@@ -499,6 +579,17 @@ assumption, every excluded row with its reason, and both timezone candidates
 for each ambiguous reading, which is the only way a `PASS` means anything. The
 smoke suite is 957 lines because it replaced an ad-hoc one living in `Temp\`
 that would have evaporated with the temp directory.
+
+**Slice 5** — the forecast was wrong by a factor of about eight, and again the
+forecast, not the work, is what failed. The estimate costed "outcome labelling
++ both baselines" as if labelling were one scoring function and the baselines
+two counters. Labelling is two independent definitions carrying four
+non-obvious edge cases — `insufficient_data` decided *before* the scan, the
+conservative double-touch rule, `null` rather than `0`, and per-signal
+overlap — and a baseline that can be quoted without being misread has to
+carry its own caveats: C0–C8 and O1–O4 are a large share of `baseline.mjs`,
+and C0 was added *after* the orchestrator's read-through caught the headline
+being quotable without its scope limit.
 
 The per-slice ~400 figure is an advisory planning heuristic stated as such in
 this document, not an acceptance criterion, so every variance is recorded

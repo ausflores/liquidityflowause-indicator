@@ -14,7 +14,8 @@
 // Usage:
 //   node backtest/run.mjs fetch      download BTC/USD 5m OHLCV from Bitstamp
 //   node backtest/run.mjs validate   T8 fidelity gate (backtest/gate.mjs)
-//   node backtest/run.mjs baseline   T10/T11 baselines (not implemented yet)
+//   node backtest/run.mjs baseline   T10/T11 baselines (backtest/baseline.mjs),
+//                                    add --json for the same numbers as JSON
 //   node backtest/run.mjs search     T12 weight search (not implemented yet)
 //
 // Historical market data lives under backtest/data/ and is gitignored.
@@ -26,6 +27,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { runGate } from "./gate.mjs";
+import { runBaseline } from "./baseline.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -600,7 +602,7 @@ function usage() {
   console.log("");
   console.log("  fetch      download BTC/USD 5m OHLCV candles from Bitstamp");
   console.log("  validate   fidelity gate against docs/VALIDATION.md (T8)");
-  console.log("  baseline   weighted + binary baselines (T10/T11)");
+  console.log("  baseline   weighted + binary baselines (T10/T11), --json for JSON output");
   console.log("  search     weight search with holdout evaluation (T12)");
   console.log("");
   console.log(`Historical data is written to backtest/data/ (gitignored).`);
@@ -622,7 +624,7 @@ if (subcommand === undefined || !SUBCOMMANDS.includes(subcommand)) {
     } else if (subcommand === "validate") {
       process.exitCode = await runGate();
     } else if (subcommand === "baseline") {
-      stub("T10/T11 baselines");
+      process.exitCode = await runBaseline({ json: process.argv.includes("--json") });
     } else if (subcommand === "search") {
       stub("T12 weight search");
     }
