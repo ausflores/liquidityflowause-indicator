@@ -55,6 +55,15 @@ import {
   recordTier,
 } from "./tier-diagnostic.mjs";
 import {
+  clusterSignals,
+  jointClusters,
+  makeRng,
+  maxSignalGap,
+  pairedClusterBootstrap,
+  parseCompareFlags,
+  percentileOfSorted,
+} from "./compare.mjs";
+import {
   DEFAULT_TIMEFRAME,
   MS_1H,
   MS_4H,
@@ -1868,7 +1877,7 @@ sec("tier-diagnostic");
     "diagnose dispatch runs the diagnostic with --json AND the resolved timeframe",
   );
   check(
-    runSrc.includes('SUBCOMMANDS = ["fetch", "validate", "baseline", "diagnose", "search"]'),
+    runSrc.includes('SUBCOMMANDS = ["fetch", "validate", "baseline", "diagnose", "compare", "search"]'),
     "diagnose is registered in SUBCOMMANDS",
   );
   check(runSrc.includes('stub("T12 weight search")'), "T12 search still stubbed — out of scope");
@@ -2165,6 +2174,496 @@ sec("timeframe-table");
   );
 }
 
+// ─── 11. cluster bootstrap (T11 addendum) ────────────────────────────────────
+//
+// backtest/compare.mjs is the file that puts a NUMBER on baseline caveat [C1]:
+// signals whose 288-bar forward windows overlap are not independent trials, so
+// a hit rate quoted over n_signals overstates its own evidence. These checks
+// are DATA-FREE — synthetic signal layouts and synthetic label counts only,
+// never backtest/data/ — and they cover the four things that could silently
+// make an interval wrong:
+//
+//   * the clustering rule (a known layout → a known cluster count),
+//   * the bootstrap reproducing a known statistic,
+//   * the seed making two runs byte-identical,
+//   * win/(win+loss) EXCLUDING timeout and insufficient_data.
+//
+// The last one is the check that matters most: folding a timeout into the
+// denominator is the easiest way to make this report lie, and it would not
+// change any count — only the rate.
+
+sec("cluster-bootstrap");
+{
+  // ── Clustering: a known layout → a known cluster count ────────────────────
+  //
+  // Layout at a 288-bar horizon. Gaps of 287 share a cluster, a gap of exactly
+  // 288 does NOT (the windows abut without overlapping), and 1,000 does not.
+  const layout = [0, 100, 287, 575, 863, 1151, 5000, 5287];
+  const cl = clusterSignals(
+    layout.map((barIndex) => ({ barIndex })),
+    288,
+  );
+  // Consecutive gaps of this layout are 100, 187, 288, 288, 288, 3849, 287.
+  // A gap of exactly 288 ABUTS without overlapping, so it starts a NEW cluster:
+  //   [0,100,287] [575] [863] [1151] [5000,5287]  →  5 clusters.
+  // This layout is what pins the `<` boundary. Treating the test as `<=` would
+  // merge the abutting pairs and report 3 clusters — i.e. call two windows that
+  // share no bar at all "overlapping", which is the mistake this file exists to
+  // avoid in the other direction.
+  check(cl.length === 5, `layout of 8 signals at 288 bars → 5 clusters (got ${cl.length})`);
+  check(
+    cl[0].map((s) => s.barIndex).join(",") === "0,100,287",
+    `cluster 1 holds bars 0,100,287 (got ${cl[0].map((s) => s.barIndex).join(",")})`,
+  );
+  check(
+    cl[1].map((s) => s.barIndex).join(",") === "575",
+    `a gap of exactly 288 abuts WITHOUT overlapping, so it starts a new cluster ` +
+      `(got ${cl[1].map((s) => s.barIndex).join(",")})`,
+  );
+  check(
+    cl[4].map((s) => s.barIndex).join(",") === "5000,5287",
+    `cluster 5 holds the far pair (got ${cl[4].map((s) => s.barIndex).join(",")})`,
+  );
+
+  check(
+    clusterSignals([{ barIndex: 7 }], 288).length === 1,
+    "a single signal is one cluster of one",
+  );
+  check(clusterSignals([], 288).length === 0, "no signals → no clusters, not one empty cluster");
+  check(
+    clusterSignals([{ barIndex: 5 }, { barIndex: 5 }], 288).length === 1,
+    "two signals on the same bar share a cluster (gap 0 < horizon)",
+  );
+  // Input order must not matter — the function sorts before clustering, so a
+  // caller that hands over signals in firing order vs bar order gets the same
+  // answer.
+  check(
+    clusterSignals(layout.map((barIndex) => ({ barIndex })).reverse(), 288).length === 5,
+    "clustering is order-independent — the input is sorted first",
+  );
+  throws(() => clusterSignals(layout.map((barIndex) => ({ barIndex })), 0), RangeError,
+    "a zero horizon is rejected rather than silently clustering everything together");
+
+  // The 10-bars-apart case the brief names: two signals 10 bars apart share 278
+  // of 288 forward bars, so they MUST land in one cluster. If this ever fails,
+  // the independence assumption the whole file rests on has been quietly lost.
+  check(
+    clusterSignals([{ barIndex: 0 }, { barIndex: 10 }], 288).length === 1,
+    "signals 10 bars apart (cooldown spacing) share 278 of 288 bars → ONE cluster",
+  );
+
+  // The max-gap diagnostic is what makes a cluster count checkable: a count of 1
+  // means every gap is below the horizon, which the max gap proves directly.
+  const gaps = maxSignalGap([{ barIndex: 0 }, { barIndex: 100 }, { barIndex: 900 }]);
+  check(gaps.maxGap === 800 && gaps.atBar === 900, "maxSignalGap finds the largest consecutive gap");
+  check(
+    maxSignalGap([{ barIndex: 4 }]).maxGap === null,
+    "a lone signal has no gap — reported as null, not 0",
+  );
+  check(
+    clusterSignals([{ barIndex: 0 }, { barIndex: 261 }], 288).length === 1 &&
+      maxSignalGap([{ barIndex: 0 }, { barIndex: 261 }]).maxGap === 261,
+    "the 1h binary shape: max gap 261 < 288 → a single cluster, and the gap says why",
+  );
+
+  // ── Joint clustering: the paired resampling unit ──────────────────────────
+  //
+  // Two models, different bar sets, ONE shared partition. The joint partition
+  // must never be FINER than either model's own clustering, because splitting a
+  // cluster would split an overlapping window pair across two draws.
+  const jsig = {
+    weighted: [{ barIndex: 0 }, { barIndex: 2000 }],
+    binary: [{ barIndex: 5 }, { barIndex: 10 }, { barIndex: 1500 }, { barIndex: 2100 }],
+  };
+  const joint = jointClusters(jsig, 288);
+  check(
+    joint.length === 3,
+    `joint clustering of 2+4 signals → 3 shared clusters (got ${joint.length})`,
+  );
+  check(
+    joint[0].weighted.length === 1 && joint[0].binary.length === 2,
+    "a weighted signal and two binary signals inside 288 bars share the first joint cluster",
+  );
+  check(
+    joint[1].weighted.length === 0 && joint[1].binary.length === 1,
+    "a joint cluster may hold only binary signals — the models need not both be present",
+  );
+  // The invariant that matters is NOT "the joint count is <= both own counts" —
+  // that is false, because a cluster may legitimately hold only one model's
+  // signals and so contribute to one count and not the other. The invariant is
+  // that NO OVERLAPPING PAIR of either model is split across two joint clusters:
+  // every cluster of each model's own partition must sit entirely inside one
+  // joint cluster. Checked directly rather than asserted as a count.
+  const ownOf = (list) => clusterSignals(list, 288);
+  const jointIndexOf = new Map();
+  joint.forEach((c, idx) => {
+    for (const model of ["weighted", "binary"]) {
+      for (const s of c[model]) jointIndexOf.set(`${model}:${s.barIndex}`, idx);
+    }
+  });
+  const splits = [];
+  for (const model of ["weighted", "binary"]) {
+    for (const own of ownOf(jsig[model])) {
+      const idxs = new Set(own.map((s) => jointIndexOf.get(`${model}:${s.barIndex}`)));
+      if (idxs.size > 1) splits.push(`${model} cluster split across ${idxs.size} joint clusters`);
+    }
+  }
+  check(
+    splits.length === 0,
+    `no own-cluster of either model is SPLIT across joint clusters (${splits.join("; ") || "none split"})`,
+  );
+  // And the converse must hold too: a joint cluster may not separate two
+  // signals of one model that are within the horizon of each other.
+  const tooFine = [];
+  for (const model of ["weighted", "binary"]) {
+    for (const own of ownOf(jsig[model])) {
+      if (own.length < 2) continue;
+      const idxs = new Set(own.map((s) => jointIndexOf.get(`${model}:${s.barIndex}`)));
+      if (idxs.size > 1) tooFine.push(`${model} overlapping pair separated`);
+    }
+  }
+  check(tooFine.length === 0, "overlapping pairs of one model stay in the same joint cluster");
+  check(jointClusters({ weighted: [], binary: [] }, 288).length === 0, "no signals → no joint clusters");
+
+  // ── The bootstrap reproduces a KNOWN statistic ────────────────────────────
+  //
+  // A degenerate case with an exact answer: every draw must return the SAME
+  // difference, because both clusters have identical rates in both models. The
+  // interval must therefore have zero width and sit exactly on that difference.
+  // This is the check that the rate arithmetic is win/(win+loss) and not, say,
+  // win/total — a bootstrap of a degenerate case pins the point estimate.
+  const degenerate = [
+    { weighted: { win: 3, loss: 1 }, binary: { win: 3, loss: 1 } },
+    { weighted: { win: 1, loss: 3 }, binary: { win: 1, loss: 3 } },
+  ];
+  const degenerateBoot = pairedClusterBootstrap(degenerate, 500, 7);
+  // 75% and 25% for both models → difference exactly 0, every draw.
+  check(
+    degenerateBoot.excludesZero === false && degenerateBoot.lo === 0 && degenerateBoot.hi === 0,
+    `a degenerate paired case has an exactly-zero difference and a zero-width interval ` +
+      `(got [${degenerateBoot.lo}, ${degenerateBoot.hi}])`,
+  );
+  check(degenerateBoot.draws === 500, "every draw of a non-degenerate denominator is kept");
+
+  // A second degenerate case with a NON-zero known difference: weighted at
+  // 50/50 = 50%, binary at 75/25 = 75%, so the difference is exactly +25 pp on
+  // every draw. This pins the SIGN and the SCALE of the statistic.
+  const known = [{ weighted: { win: 1, loss: 1 }, binary: { win: 3, loss: 1 } }];
+  const knownBoot = pairedClusterBootstrap(known, 200, 7);
+  check(
+    knownBoot.lo === 25 && knownBoot.hi === 25 && knownBoot.excludesZero === true,
+    `a one-cluster known case gives exactly +25 pp (50% vs 75%) with a zero-width ` +
+      `interval that excludes zero (got [${knownBoot.lo}, ${knownBoot.hi}])`,
+  );
+
+  // Resampling SIGNALS instead of clusters is the error this file exists to
+  // avoid: with 4 independent clusters the difference is not constant, so the
+  // interval must be non-degenerate. A zero-width interval here would mean the
+  // per-cluster draws were not varying — i.e. the bootstrap was collapsing to
+  // a point regardless of the data.
+  const varied = [
+    { weighted: { win: 4, loss: 0 }, binary: { win: 1, loss: 3 } },
+    { weighted: { win: 0, loss: 4 }, binary: { win: 3, loss: 1 } },
+    { weighted: { win: 2, loss: 2 }, binary: { win: 2, loss: 2 } },
+    { weighted: { win: 1, loss: 3 }, binary: { win: 0, loss: 4 } },
+  ];
+  const variedBoot = pairedClusterBootstrap(varied, 2000, 11);
+  check(
+    variedBoot.hi > variedBoot.lo,
+    `varying per-cluster rates produce a non-zero-width interval ` +
+      `([${variedBoot.lo}, ${variedBoot.hi}]) — the draws really are resampling`,
+  );
+  check(
+    variedBoot.lo <= 0 && variedBoot.hi >= 0,
+    "an interval spanning both signs does not exclude zero",
+  );
+
+  // The resampling unit is the CLUSTER, so the interval must be far wider than
+  // one computed over the same wins as if they were independent trials. This is
+  // the quantitative form of the file's premise.
+  const manySignals = Array.from({ length: 40 }, () => ({
+    weighted: { win: 1, loss: 1 },
+    binary: { win: 1, loss: 1 },
+  }));
+  const independentBoot = pairedClusterBootstrap(manySignals, 2000, 3);
+  check(
+    independentBoot.lo === 0 && independentBoot.hi === 0,
+    "40 identical single-signal clusters all give the same difference — width is a " +
+      "property of cluster VARIATION, not of the count of units",
+  );
+
+  // Undefined draws: a model whose resampled population resolves to zero
+  // win+loss labels has no hit rate, so the difference is undefined. Those draws
+  // must be COUNTED, never coerced into the interval.
+  const undefinedCase = [
+    { weighted: { win: 1, loss: 0 }, binary: { win: 0, loss: 0 } },
+    { weighted: { win: 0, loss: 1 }, binary: { win: 0, loss: 0 } },
+  ];
+  const undefinedBoot = pairedClusterBootstrap(undefinedCase, 100, 5);
+  check(
+    undefinedBoot.draws === 0 && undefinedBoot.undefinedDraws === 100,
+    `a model with no resolved labels makes every draw undefined, and all 100 are ` +
+      `counted rather than coerced (got ${undefinedBoot.draws} kept / ` +
+      `${undefinedBoot.undefinedDraws} undefined)`,
+  );
+  check(
+    undefinedBoot.lo === null && undefinedBoot.excludesZero === null,
+    "no interval and no zero-exclusion verdict when every draw was undefined",
+  );
+  check(
+    pairedClusterBootstrap([], 100, 1).draws === 0,
+    "zero clusters → no draws, not a crash",
+  );
+
+  // ── The seed makes two runs IDENTICAL ─────────────────────────────────────
+  const rngA = makeRng(20260901);
+  const rngB = makeRng(20260901);
+  const seqA = Array.from({ length: 50 }, () => rngA());
+  const seqB = Array.from({ length: 50 }, () => rngB());
+  check(
+    seqA.length === 50 && seqA.every((v, i) => v === seqB[i]),
+    "the same seed produces the same 50-draw sequence — the RNG is reproducible",
+  );
+  const rngC = makeRng(20260902);
+  const seqC = Array.from({ length: 50 }, () => rngC());
+  check(
+    seqA.some((v, i) => v !== seqC[i]),
+    "a DIFFERENT seed produces a different sequence — the seed is actually used",
+  );
+  check(
+    seqA.every((v) => v >= 0 && v < 1),
+    "the RNG stays in [0, 1) so Math.floor(rng() * n) is a valid cluster index",
+  );
+
+  // Two full bootstraps at the same seed must agree to the last digit; that is
+  // the reproducibility claim a report makes when it prints a seed.
+  const reproA = pairedClusterBootstrap(varied, 3000, 4242);
+  const reproB = pairedClusterBootstrap(varied, 3000, 4242);
+  const reproC = pairedClusterBootstrap(varied, 3000, 4243);
+  check(
+    reproA.lo === reproB.lo && reproA.hi === reproB.hi && reproA.mean === reproB.mean,
+    `the same seed gives an identical interval (${reproA.lo} / ${reproA.hi} twice)`,
+  );
+  // A different seed must move the DISTRIBUTION. Note the endpoints of a small
+  // discrete bootstrap can coincide across seeds — with 4 clusters the possible
+  // differences are a handful of exact rationals, so the 2.5th percentile may
+  // legitimately land on the same value twice. What must differ is the draw
+  // set itself, which the MEAN detects: it averages every draw, not two of them.
+  check(
+    reproA.mean !== reproC.mean,
+    `a different seed moves the bootstrap distribution (mean ${reproA.mean} vs ${reproC.mean}) ` +
+      "— the draws really are seed-dependent",
+  );
+  // With enough clusters the endpoints themselves must separate too, otherwise
+  // an interval quoted to two decimals would be seed-blind.
+  const manyVaried = Array.from({ length: 200 }, (_, i) => ({
+    weighted: { win: (i * 7) % 11, loss: 1 + ((i * 3) % 5) },
+    binary: { win: (i * 5) % 13, loss: 1 + ((i * 2) % 7) },
+  }));
+  const manyA = pairedClusterBootstrap(manyVaried, 4000, 99);
+  const manyB = pairedClusterBootstrap(manyVaried, 4000, 99);
+  const manyC = pairedClusterBootstrap(manyVaried, 4000, 100);
+  check(
+    manyA.lo === manyB.lo && manyA.hi === manyB.hi,
+    "with 200 clusters the same seed reproduces the endpoints exactly",
+  );
+  check(
+    manyA.lo !== manyC.lo || manyA.hi !== manyC.hi,
+    `with 200 clusters a different seed moves the endpoints (${manyA.lo}/${manyA.hi} vs ` +
+      `${manyC.lo}/${manyC.hi}) — the reported precision is seed-sensitive, not rounded-flat`,
+  );
+
+  // ── win / (win + loss): timeout and insufficient_data are EXCLUDED ────────
+  //
+  // Checked against label.mjs itself rather than against a re-implementation,
+  // so the exclusion is proven on the module the report actually uses. These
+  // synthetic candles are built to produce a known label mix.
+  const flat = (n) => Array.from({ length: n }, () => ({ high: 100, low: 100, close: 100 }));
+  // 800 candles so that bar 10 and bar 100 each have a FULL 288-bar window
+  // (100 + 288 = 388 < 800) and bar 400 has exactly enough (400 + 288 = 688 <
+  // 800) to be a timeout rather than insufficient_data. With a 400-candle series
+  // every one of these would have been insufficient_data — the distinction
+  // under test is precisely the one the fixture has to be built to make.
+  const labelCandles = flat(800);
+  // Bar 10 rises to the +1.5% target within its window → win.
+  for (let k = 1; k <= 288; k++) labelCandles[10 + k] = { high: 102, low: 100, close: 100 };
+  // Bar 100 falls to the -0.8% stop within its window → loss.
+  for (let k = 1; k <= 288; k++) labelCandles[100 + k] = { high: 100, low: 98, close: 100 };
+  // Bar 400's window is flat: never touches either level → timeout.
+  const timed = [
+    { barIndex: 10, side: "long", price: 100 },
+    { barIndex: 100, side: "long", price: 100 },
+    { barIndex: 400, side: "long", price: 100 },
+    { barIndex: 795, side: "long", price: 100 },
+    { barIndex: 796, side: "long", price: 100 },
+  ];
+  const mixed = labelSignalsExitRule(labelCandles, timed);
+  check(
+    mixed.counts.win === 1 && mixed.counts.loss === 1,
+    `the synthetic mix produces one win and one loss (got ${mixed.counts.win}W / ${mixed.counts.loss}L)`,
+  );
+  check(
+    mixed.counts.timeout === 1,
+    `the flat bar-400 window has a FULL horizon and touches neither level → timeout, ` +
+      `not insufficient_data (got ${mixed.counts.timeout} timeout)`,
+  );
+  check(
+    mixed.counts.insufficient_data === 2,
+    `the bar-795 and bar-796 signals have fewer than 288 bars after them → ` +
+      `insufficient_data, never a timeout and never a win (got ` +
+      `${mixed.counts.timeout} timeout / ${mixed.counts.insufficient_data} insufficient)`,
+  );
+  // 1 / (1 + 1) = 50%. The 2 insufficient_data signals must NOT be in the
+  // denominator: including them would give 1/3 = 33.33%.
+  const mixedRate = (mixed.counts.win / (mixed.counts.win + mixed.counts.loss)) * 100;
+  check(
+    mixedRate === 50,
+    `hit rate is win/(win+loss) = 50%, not win/total = ${((1 / 5) * 100).toFixed(2)}% — the ` +
+      "1 timeout and 2 insufficient_data stay out of the denominator",
+  );
+  // A rate with NO resolved labels is undefined, not 0 and not 100: an
+  // unresolved model must not be mistaken for one that never wins.
+  const allInsufficient = labelSignalsExitRule(labelCandles, [
+    { barIndex: 799, side: "long", price: 100 },
+  ]);
+  check(
+    allInsufficient.counts.win + allInsufficient.counts.loss === 0 &&
+      allInsufficient.counts.insufficient_data === 1,
+    "a signal with no observable window resolves to zero win+loss — the rate is undefined, " +
+      "so no hit rate may be printed for it",
+  );
+  // A loss-only population must read 0%, and a win-only population 100%: the
+  // endpoints of the same definition.
+  const winOnly = labelSignalsExitRule(labelCandles, [
+    { barIndex: 10, side: "long", price: 100 },
+  ]);
+  check(
+    (winOnly.counts.win / (winOnly.counts.win + winOnly.counts.loss)) * 100 === 100,
+    "a win-only population reads 100% under win/(win+loss)",
+  );
+  const lossOnly = labelSignalsExitRule(labelCandles, [
+    { barIndex: 100, side: "long", price: 100 },
+  ]);
+  check(
+    (lossOnly.counts.win / (lossOnly.counts.win + lossOnly.counts.loss)) * 100 === 0,
+    "a loss-only population reads 0% under win/(win+loss)",
+  );
+  // A SHORT inverts the levels: it wins when price FALLS to -1.5%, so the same
+  // rising series must be a LOSS for the short side. If this ever passes as a
+  // win, the side is being ignored in the level construction.
+  const shortOnRise = labelSignalsExitRule(labelCandles, [
+    { barIndex: 10, side: "short", price: 100 },
+  ]);
+  check(
+    shortOnRise.counts.loss === 1 && shortOnRise.counts.win === 0,
+    "a short against a rising series is a LOSS — the stop sits above the entry",
+  );
+
+  // ── Percentiles ───────────────────────────────────────────────────────────
+  const sorted = [0, 10, 20, 30, 40];
+  check(percentileOfSorted(sorted, 0) === 0, "p0 of a sorted array is its minimum");
+  check(percentileOfSorted(sorted, 1) === 40, "p100 is its maximum");
+  check(percentileOfSorted(sorted, 0.5) === 20, "p50 of an odd-length array is the middle element");
+  check(
+    percentileOfSorted([0, 10], 0.025) === 0.25,
+    `percentiles interpolate linearly between ranks (got ${percentileOfSorted([0, 10], 0.025)})`,
+  );
+  check(percentileOfSorted([], 0.5) === null, "an empty array has no percentile");
+  check(percentileOfSorted([7], 0.975) === 7, "a single draw has that draw as every percentile");
+
+  // ── Flag parsing: an unseeded bootstrap is not reproducible ───────────────
+  check(
+    parseCompareFlags(["node", "run.mjs", "compare", "--seed", "1"]).seed === 1,
+    "--seed <n> parses",
+  );
+  check(
+    parseCompareFlags(["node", "run.mjs", "compare", "--bootstrap", "500"]).bootstrap === 500,
+    "--bootstrap <n> parses",
+  );
+  check(
+    parseCompareFlags(["node", "run.mjs", "compare"]).seed === undefined &&
+      parseCompareFlags(["node", "run.mjs", "compare"]).bootstrap === undefined,
+    "no flag → undefined, so compare.mjs applies its own printed defaults",
+  );
+  check(
+    parseCompareFlags(["node", "run.mjs", "compare", "--seed", "1", "--seed", "1"]).seed === 1,
+    "a repeated --seed is accepted (last occurrence wins)",
+  );
+  throws(
+    () => parseCompareFlags(["node", "run.mjs", "compare", "--seed"]),
+    Error,
+    "--seed with no value is rejected rather than swallowing the next argument",
+  );
+  throws(
+    () => parseCompareFlags(["node", "run.mjs", "compare", "--seed", "abc"]),
+    Error,
+    "a non-integer --seed is rejected — a silently defaulted seed would break reproducibility",
+  );
+
+  // ── Wiring: the new subcommand exists and cannot perturb the baselines ─────
+  const cmpSrc = readFileSync(new URL("./compare.mjs", import.meta.url), "utf8");
+  const runSrcCmp = readFileSync(new URL("./run.mjs", import.meta.url), "utf8");
+  check(
+    runSrcCmp.includes('import { parseCompareFlags, runCompare } from "./compare.mjs"'),
+    "run.mjs imports the cluster bootstrap",
+  );
+  check(
+    runSrcCmp.includes('subcommand === "compare"'),
+    "compare is a dispatched subcommand",
+  );
+  check(
+    runSrcCmp.includes('SUBCOMMANDS = ["fetch", "validate", "baseline", "diagnose", "compare", "search"]'),
+    "compare is registered in SUBCOMMANDS — a typo'd name must not dispatch",
+  );
+  // compare.mjs MUST reuse baseline's signal generation rather than re-deriving
+  // it: a second wiring loop could drift, and then the interval would describe a
+  // population the baseline report never had.
+  check(
+    cmpSrc.includes('from "./baseline.mjs"') &&
+      /import\s*\{[^}]*runComparison[^}]*\}\s*from\s*"\.\/baseline\.mjs"/.test(cmpSrc),
+    "compare.mjs imports baseline's OWN runComparison — signals are reused, not re-derived",
+  );
+  check(
+    cmpSrc.includes("labelSignalsExitRule") && cmpSrc.includes("labelSignalsForwardReturn"),
+    "compare.mjs labels through modules/label.mjs — the same labeller baseline uses",
+  );
+  check(
+    cmpSrc.includes("win + loss") || cmpSrc.includes("(win + loss)"),
+    "the hit rate is computed as win/(win+loss) in compare.mjs too",
+  );
+  check(
+    !cmpSrc.includes('from "./modules/signal-engine.mjs"') &&
+      !cmpSrc.includes('from "./modules/binary.mjs"'),
+    "compare.mjs does NOT instantiate either model — it cannot perturb the comparison",
+  );
+  // The interval must be REFUSED below the cluster threshold, never approximated.
+  check(
+    cmpSrc.includes("MIN_CLUSTERS_FOR_INTERVAL") &&
+      cmpSrc.includes("joint.length >= MIN_CLUSTERS_FOR_INTERVAL"),
+    "a small cluster count gates the interval — it is a gate, not a formatted warning",
+  );
+  // The CHECK, not the word: the file's header legitimately NAMES Math.random
+  // while explaining why it is not used, so matching the bare identifier would
+  // fail on a comment. This looks for an actual call site.
+  check(
+    /Math\.random\s*\(/.test(cmpSrc.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "")) ===
+      false,
+    "no Math.random CALL anywhere in compare.mjs — the bootstrap is seed-reproducible",
+  );
+  // baseline.mjs's sink must be OPTIONAL, or passing the extra argument would
+  // change the baseline report it is supposed to leave byte-identical.
+  check(
+    /function runComparison\(candles, meta, tf, sink = null\)/.test(
+      readFileSync(new URL("./baseline.mjs", import.meta.url), "utf8"),
+    ),
+    "baseline's sink parameter defaults to null — the baseline path is unchanged",
+  );
+  check(
+    /if \(sink !== null\)/.test(readFileSync(new URL("./baseline.mjs", import.meta.url), "utf8")),
+    "baseline calls the sink only when one was passed",
+  );
+}
+
 // ─── Report ─────────────────────────────────────────────────────────────────
 
 const ORDER = [
@@ -2178,6 +2677,7 @@ const ORDER = [
   "baseline-wiring",
   "tier-diagnostic",
   "timeframe-table",
+  "cluster-bootstrap",
 ];
 console.log("section            checks");
 for (const name of ORDER) {

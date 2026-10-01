@@ -18,6 +18,9 @@
 //                                    add --json for the same numbers as JSON
 //   node backtest/run.mjs diagnose   liquidity tier diagnostic
 //                                    (backtest/tier-diagnostic.mjs), --json too
+//   node backtest/run.mjs compare    paired cluster bootstrap on the baseline
+//                                    difference (backtest/compare.mjs):
+//                                    --seed <n>, --bootstrap <n>, --json
 //   node backtest/run.mjs search     T12 weight search (not implemented yet)
 //
 // Every data-reading subcommand takes `--timeframe <5m|1h|4h>` and defaults to
@@ -34,6 +37,7 @@ import { fileURLToPath } from "node:url";
 
 import { runGate } from "./gate.mjs";
 import { runBaseline } from "./baseline.mjs";
+import { parseCompareFlags, runCompare } from "./compare.mjs";
 import { runTierDiagnostic } from "./tier-diagnostic.mjs";
 import {
   DEFAULT_TIMEFRAME,
@@ -634,10 +638,16 @@ function usage() {
   console.log("  validate   fidelity gate against docs/VALIDATION.md (T8) — 5m ONLY");
   console.log("  baseline   weighted + binary baselines (T10/T11), --json for JSON output");
   console.log("  diagnose   liquidity tier diagnostic, --json for JSON output");
+  console.log(
+    "  compare    paired cluster bootstrap on the baseline hit-rate difference,",
+  );
+  console.log(
+    "             --seed <n> / --bootstrap <n> pin the RNG, --json for JSON output",
+  );
   console.log("  search     weight search with holdout evaluation (T12)");
   console.log("");
   console.log(
-    `  --timeframe   native grid for fetch/baseline/diagnose ` +
+    `  --timeframe   native grid for fetch/baseline/diagnose/compare ` +
       `(${TIMEFRAME_IDS.join(", ")}); default "${DEFAULT_TIMEFRAME}".`,
   );
   console.log(
@@ -702,7 +712,7 @@ function gateTimeframeRefusal(tf) {
 
 // ─── Dispatch ────────────────────────────────────────────────────────────────
 
-const SUBCOMMANDS = ["fetch", "validate", "baseline", "diagnose", "search"];
+const SUBCOMMANDS = ["fetch", "validate", "baseline", "diagnose", "compare", "search"];
 const subcommand = process.argv[2];
 
 // The flag is parsed BEFORE dispatch so an invalid --timeframe fails loudly on
@@ -744,6 +754,17 @@ if (subcommand === undefined || !SUBCOMMANDS.includes(subcommand)) {
       process.exitCode = await runBaseline({
         json: process.argv.includes("--json"),
         tf,
+      });
+    } else if (subcommand === "compare") {
+      // The seed and draw count are PARSED HERE and passed explicitly rather
+      // than read from argv inside compare.mjs, so the flags that shape the
+      // numbers a report quotes are visible at the dispatch site.
+      const compareFlags = parseCompareFlags(process.argv);
+      process.exitCode = await runCompare({
+        json: process.argv.includes("--json"),
+        tf,
+        seed: compareFlags.seed,
+        bootstrap: compareFlags.bootstrap,
       });
     } else if (subcommand === "diagnose") {
       process.exitCode = await runTierDiagnostic({

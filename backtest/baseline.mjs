@@ -235,7 +235,7 @@ function bump(map, key) {
 
 // ─── Dataset ────────────────────────────────────────────────────────────────
 
-async function loadDataset(tf) {
+export async function loadDataset(tf) {
   let candles;
   try {
     candles = JSON.parse(await readFile(tf.datasetPath, "utf8")).candles;
@@ -443,7 +443,20 @@ function sharedDeltas(a, b, prefix = "", into = []) {
 
 // ─── The comparison ─────────────────────────────────────────────────────────
 
-function runComparison(candles, meta, tf) {
+/**
+ * The ONE signal-generation pass both baseline.mjs and backtest/compare.mjs
+ * run. Exported so the cluster-bootstrap report can reuse the very same
+ * signals and labels instead of re-deriving them: a second wiring loop would
+ * be free to drift from this one, and a comparison between two models is only
+ * meaningful if both were produced by identical wiring.
+ *
+ * `sink` is an optional callback invoked once with the raw signal lists, the
+ * label candle view and the score-candidate counts. It is a pure side channel:
+ * when it is null (every baseline run) nothing here changes, and the returned
+ * object is byte-for-byte what it was before the parameter existed — the report
+ * and the JSON payload are untouched.
+ */
+export function runComparison(candles, meta, tf, sink = null) {
   const n = candles.length;
   const barsPerDay = MS_1D / tf.stepMs;
   // label.mjs reads { high, low, close }; the dataset holds { t, o, h, l, c, v }.
@@ -727,6 +740,20 @@ function runComparison(candles, meta, tf) {
         );
       }
     }
+  }
+
+  // Side channel for backtest/compare.mjs. Fires exactly once, after the
+  // signal lists are final and before any summarising — see runComparison()'s
+  // doc comment. No effect when `sink` is null.
+  if (sink !== null) {
+    sink({
+      labelCandles,
+      signals,
+      scoreCandidateCounts: {
+        long: scoreCandidate.long.length,
+        short: scoreCandidate.short.length,
+      },
+    });
   }
 
   const defA = {
