@@ -376,6 +376,46 @@ funding and spread, while D.4's own strategy declares `commission_value=0.05`
 and `slippage=2` — every hit rate here is an **upper bound** on what that
 strategy would realise.
 
+### T14 — Liquidity tier diagnostic ✅ (delivered in slice 6 · GitHub PR #18)
+
+*(Inserted after T11 and before T12, so the numbering skips — it is not a
+renumbering mistake. It answers the question caveat C0 left open, and T12 is
+worthless until it is answered.)*
+
+- [x] Determine whether the weighted model's near-zero firing rate is a
+  property of the 5m data or a defect in tier assignment — the precondition
+  for T12 being worth running at all.
+- [x] Do it without moving the baseline: **no baseline number may change.**
+  Verified by diffing the full baseline output — all 130 substantive lines
+  byte-identical.
+
+**Verdict: property of the data, and the mechanism is geometric.** A D1 zone
+body is `0.5 ×` its **own** timeframe's ATR, while the proximity band is
+`3 ×` the **5m chart** ATR. The median D1 half-width is therefore **5.04×**
+the band, so price is always already *inside* a D1 zone before it can ever be
+*near* one — and the in-body exclusion, which Pine performs identically,
+withholds the flag **by design**. All **1,377** D1 bar-zone pairs falling
+inside the band were in-body, leaving **0 eligible**. H4 is `1.68×` and does
+fire 48 times; H1 is `0.78×` and fires 2,113.
+
+**The defect hypothesis is closed, not merely unsupported.** D1 is not absent:
+3,436 zones are created, live on 7,269 bars, last created at bar 60,908. The
+post-warm-up tier mix is unchanged, so it is not warm-up arithmetic. And the
+candidate tier mix **equals** the global tier mix (H1 lift 0.985 long, 1.023
+short), which **refutes the premise of the diagnostic's own brief** — nothing
+selects against D1 at signal moments.
+
+**The quotable consequence.** On 5m data an H1 candidate tops out at **60**
+and only an H4 candidate can reach **70**. That is why `minConfidence 70`
+admits 2 of 393 candidates. **The threshold is not a statement about the
+weight vector on this dataset.**
+
+**Fifth brief-vs-source disagreement.** The brief said to read the
+qualifying-tier rule from `liquidity-zones.mjs`. That module does not assign
+a qualifying tier at all — it stamps a tier per zone and emits six booleans.
+The single-tier reduction lives in `signal-engine.mjs:355-362` (Pine
+`signal-engine.pine:64-66`). The port matches Pine expression for expression.
+
 ### T12 — Weight search
 
 - [ ] Search over weight vectors and thresholds (random or coordinate search;
@@ -467,15 +507,22 @@ numbered by GitHub.
 | 3 | T5 + T6 | Port structure-break + imbalance-detector (the *trigger* modules) | ~410 |
 | 4 | T7 + T8 | Port signal-engine + **fidelity gate** (engine and its gate belong together) | ~380 |
 | 5 | T9 + T10 + T11 | Outcome labelling + both baselines | ~350 |
-| 6 | T12 + T13 | Weight search + findings report | ~450 |
+| 6 | T14 | Liquidity tier diagnostic — closes C0's open question before T12 | ~200 |
+| 7 | T12 + T13 | Weight search + findings report | ~450 |
 
-If PR 6 exceeds ~400, it splits into T12 (search) and T13 (report) — the
+If slice 7 exceeds ~400, it splits into T12 (search) and T13 (report) — the
 report is documentation and can ship on its own.
 
-**Gate on progression:** PR 4 contains the fidelity gate. PRs 5 and 6 do not
-start until that gate is reported. A failed gate blocks the slices that depend
-on a trustworthy port; it does not block PRs 1–3, which are infrastructure and
-ports whose correctness is established by the gate itself.
+**Gate on progression:** slice 4 contains the fidelity gate. Slices 5 and 6 do
+not start until that gate is reported. A failed gate blocks the slices that
+depend on a trustworthy port; it does not block slices 1–3, which are
+infrastructure and ports whose correctness is established by the gate itself.
+
+**Second gate, added after slice 5:** slice 6 (T14) must report whether the
+weighted model's near-zero firing rate is a data property or a defect before
+T12 runs. It reported a data property, so **T12 on this dataset would be
+fitting a degenerate D1/H4 dimension** — either the objective must be narrowed
+to the non-tier factors, or higher-timeframe data must be used.
 
 ### Route amendment
 
@@ -543,8 +590,21 @@ ports whose correctness is established by the gate itself.
       read-through found the headline quotable without its scope limit. The
       orchestrator independently re-ran `baseline` and reproduced every number
       verbatim.
-- [ ] T12 — weight search (not blocked: the search is exactly the mechanism
-      that would show whether any weight vector clears 70 on this data)
+- [x] **T14 — slice 6 delivered** (liquidity tier diagnostic) → shipped as
+      **GitHub PR #18**. **Verdict: property of the data, not a defect.** The
+      D1 tier is unreachable on 5m *by geometry* — the median D1 zone body is
+      **5.04×** the proximity band, so price is always already inside the zone
+      before it can be near it, and Pine's in-body exclusion withholds the flag
+      by design; **0 of 1,377** in-band D1 pairs were eligible. D1 is not
+      absent (3,436 zones created, live on 7,269 bars, last at bar 60,908), the
+      post-warm-up mix is unchanged, and the candidate tier mix equals the
+      global mix — so this is not warm-up arithmetic and nothing selects
+      against D1 at signal moments. Baseline output byte-identical on all 130
+      substantive lines. **This closes the precondition for T12**: a weight
+      search here would fit a degenerate D1/H4 dimension.
+- [ ] T12 — weight search (now known to be **degenerate in its tier
+      dimensions** on 5m data — either narrow the objective to the non-tier
+      factors, or use higher-timeframe data, which is still out of scope)
 - [ ] T13 — findings report
 - [ ] Findings reported
 
@@ -557,6 +617,7 @@ ports whose correctness is established by the gate itself.
 | 3 | #14 | ~410 | **~814** (316 + 456 ported lines + 42 doc) |
 | 4 | #15 | ~380 | **~2556** (597 signal-engine + 835 gate + 957 smoke + 38 run.mjs + 129 doc) |
 | 5 | #17 | ~350 | **~2957** (1221 baseline + 447 label + 437 binary + 711 smoke + 8 run.mjs + 133 doc) |
+| 6 | #18 | ~200 | **~1695** (1373 diagnostic + 224 smoke + 8 run.mjs + 90 doc) |
 
 Every slice landed over its forecast.
 
@@ -590,6 +651,19 @@ overlap — and a baseline that can be quoted without being misread has to
 carry its own caveats: C0–C8 and O1–O4 are a large share of `baseline.mjs`,
 and C0 was added *after* the orchestrator's read-through caught the headline
 being quotable without its scope limit.
+
+**Slice 6** — the forecast of ~200 was wrong by roughly 3×, and this time the
+honest reason is that a diagnostic that answers its question badly is worth
+nothing. `tier-diagnostic.mjs` re-derives the zone wiring rather than importing
+`baseline.mjs`, so the baseline's bytes cannot move — a trade made deliberately
+to guarantee the comparison stays fixed, backed by a self-check that catches
+drift in the candidate counts. It also prints the tier rule read from both the
+port and Pine with line citations, the global tier distribution, whether D1/H4
+zones exist at all, candidate-vs-global mix, proximity isolated from the other
+gates, and the pre/post warm-up split. Every one of those sections exists
+because the first draft produced a number that *looked* like a bug — "1,377 D1
+pairs in band, 0 flag fires" — and the discriminator table exists specifically
+to close that false reading before it reached anyone else.
 
 The per-slice ~400 figure is an advisory planning heuristic stated as such in
 this document, not an acceptance criterion, so every variance is recorded
