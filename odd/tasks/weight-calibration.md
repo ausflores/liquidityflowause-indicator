@@ -521,6 +521,66 @@ rename changed, one asserted that a 1h-complete dataset fails the 4h target
 (it does not; both target the same 1825-day span and only the bar floor
 differs). The assertions were corrected and the implementation was not.
 
+### T16 — Dependence-aware comparison ✅ (delivered in slice 8 · GitHub PR #20)
+
+*(Inserted before T13, not numbered in sequence. The findings report cannot
+state whether the 1h result means anything until this exists — writing
+"binary wins by 2.50 pp" without knowing whether 2.50 pp survives the
+dependence would repeat exactly the mistake this project has already made
+twice: publishing a number without its condition of validity.)*
+
+- [x] Quantify how much the baseline hit rates overstated their own evidence.
+  Labels walk 288 bars forward and the cooldown is 10 bars, so two signals 10
+  bars apart share **278 of 288** forward bars.
+- [x] Build clusters independently per model — the two models have different
+  signal sets and do not share a partition.
+- [x] **Paired** cluster bootstrap, fixed seed **20260901**, 10,000 draws.
+- [x] Report the 95% interval of `binary − weighted` per side and per grid,
+  and a plain verdict.
+- [x] Secondary check under Definition B at every horizon.
+- [x] The n-versus-cluster collapse ratio as the headline.
+
+**The result is worse than "fewer effective observations", and it is the most
+important finding in the project.** On 1h, **binary's 1,701 signals form a
+single cluster** — its largest consecutive gap in five years is **261 bars**
+against a 288-bar horizon, so there is no gap at all. The whole five-year run
+is one unbroken chain of overlapping forward windows. Weighted collapses
+307 → **45** clusters; binary 1,701 → **1**.
+
+**The paired bootstrap therefore has exactly one resampling unit on 1h, and
+the +2.50 pp difference cannot be intervaled at all.** Not "the interval is
+wide" — there is no interval. So both of these are false and neither may be
+reported: *"binary is better by 2.50 pp"* and *"the two are
+indistinguishable"*. Each presupposes an interval that does not exist. The
+honest word is **indeterminate**.
+
+**The only interval computable anywhere** is 1h-short: **+3.72 pp observed,
+95% CI [−3.54 pp, +9.55 pp], does not exclude zero.** 4h points the opposite
+way (−11.20 pp) and is equally un-intervalable — one measurement at two
+resolutions, not one refuting the other.
+
+**What survived, and matters more:** under Definition B **both models have
+negative mean forward returns at every horizon** (1h, 24 bars: weighted
+−0.51%, binary −0.11%). This is not a difference between models, so the
+dependence problem does not touch it. The intervals on the *difference* do
+exclude zero in binary's favour at 12–96 bars, so binary is measurably less
+bad — but the shorter horizons are exactly the computable ones, which makes
+this a different measurement from the 288-bar D.4 question, not a
+confirmation of it.
+
+### T13 — Findings report and delivery ✅ (delivered in slice 8 · GitHub PR #20)
+
+- [x] Write the findings into `docs/` in English — `docs/WEIGHT-CALIBRATION.md`.
+- [x] State plainly whether weighted beats binary, ties, or loses — **neither
+  is available, and the report says so rather than picking one**.
+- [x] No candidate weight vector emerged, so nothing is presented as evidence
+  for a weight change.
+- [x] Land through the repo PR convention.
+
+**The report leads with the negative-expectancy finding, not the model
+comparison**, because the model comparison is indeterminate and the
+expectancy finding is not.
+
 ### T12 — Weight search
 
 - [ ] Search over weight vectors and thresholds (random or coordinate search;
@@ -530,15 +590,6 @@ differs). The assertions were corrected and the implementation was not.
   single in-sample winner. An in-sample-only result is not a calibration.
 - [ ] Report the top configurations with their metrics and their deltas versus
   both baselines.
-
-### T13 — Findings report and delivery
-
-- [ ] Write the findings into `docs/` in English.
-- [ ] State plainly whether weighted beats binary, ties, or loses.
-- [ ] If a candidate weight vector emerges, present it as **evidence for a
-  separate decision** — not as a change applied to the Pine source.
-- [ ] Land through the repo PR convention: rich markdown body, zero labels,
-  no issue link, merge commit, delete branch.
 
 ## Acceptance criteria
 
@@ -614,9 +665,10 @@ numbered by GitHub.
 | 5 | T9 + T10 + T11 | Outcome labelling + both baselines | ~350 |
 | 6 | T14 | Liquidity tier diagnostic — closes C0's open question before T12 | ~200 |
 | 7 | T15 | Second timeframe: 1h + 4h datasets and the three-timeframe measurement | ~500 |
-| 8 | T12 + T13 | Weight search + findings report | ~450 |
+| 8 | T16 + T13 | Dependence-aware comparison + findings report | ~450 |
+| 9 | T12 | Weight search (deferred — its objective depends on T13's recommendation) | ~450 |
 
-If slice 8 exceeds ~400, it splits into T12 (search) and T13 (report) — the
+If slice 8 exceeds ~400, it splits into T16 (analysis) and T13 (report) — the
 report is documentation and can ship on its own.
 
 **Gate on progression:** slice 4 contains the fidelity gate. Slices 5 and 6 do
@@ -725,9 +777,33 @@ to the non-tier factors, or higher-timeframe data must be used.
       resolution. Gate stays **5m-only by construction** and now refuses any
       other timeframe with an explained message. Scope lift and the verified
       endpoint facts are recorded above.
-- [ ] T12 — weight search (now **meaningful on 1h**: the tier dimension is
-      live, 414 of 7,924 candidates clear 70, 307 signals fire. Still
-      degenerate on 5m, and the structure weights must exclude 4h)
+- [x] **T16 + T13 — slice 8 delivered** (dependence-aware comparison + the
+      findings report) → shipped as **GitHub PR #20**, report at
+      `docs/WEIGHT-CALIBRATION.md`. **The comparison the whole feature existed
+      to make turned out to be unmeasurable as designed**, and finding that out
+      is the slice's result: on 1h, **binary's 1,701 signals form a SINGLE
+      cluster** — largest gap in five years 261 bars against a 288-bar horizon,
+      so there is no gap. Weighted collapses 307 → 45 clusters, binary 1,701 →
+      **1**. **The +2.50 pp difference cannot be intervaled at all**, so neither
+      "binary is better" nor "they are indistinguishable" may be reported —
+      both presuppose an interval that does not exist. The only interval
+      computable anywhere is 1h-short: **+3.72 pp, CI [−3.54, +9.55]**, which
+      includes zero.
+      **What survived the dependence problem is more useful than the model
+      comparison:** under Definition B **both models have negative mean forward
+      returns at every horizon** (1h @24 bars: weighted −0.51%, binary −0.11%),
+      and **D.4's own 1.5%/0.8% exit rule needs a 34.78% hit rate to break
+      even — which neither model reaches on 1h**. The one result pointing at
+      binary (5m, 41.59%, +0.16% per trade) is reported with its three
+      disqualifiers rather than buried.
+      **The report's recommendation: do not change the weights, do not adopt
+      binary, and do not run the weight search yet** — optimising 11 parameters
+      toward a bar that may be unreachable fits noise. The binding constraint
+      appears to be the **exit ratio, not the weights**, and it was never
+      searched because it was treated as fixed.
+- [ ] T12 — weight search (**deferred to slice 9, and the report says why**:
+      search the target/stop ratio first, or shorten the horizon so the
+      comparison is computable at all)
 - [ ] T13 — findings report
 - [ ] Findings reported
 
