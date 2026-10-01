@@ -2,7 +2,9 @@
 // Slice 4 smoke suite — signal-engine port (T7) + regression over the four
 // already-merged ports (T3/T4/T5/T6). Bare Node, zero dependencies, writes
 // nothing. Lives in backtest/ so a clean checkout can run it: it verifies the
-// five ported modules together, as one suite for the whole harness.
+// five ported modules together, as one suite for the whole harness. The
+// appended T9 section checks outcome labelling (modules/label.mjs) against
+// hand-built synthetic candles and never reads backtest/data/.
 //
 // Run: node backtest/smoke.mjs
 // ============================================================================
@@ -23,6 +25,16 @@ import {
   SIGNAL_ENGINE_DEFAULTS,
   SIGNAL_ENGINE_WEIGHT_KEYS,
 } from "./modules/signal-engine.mjs";
+import {
+  EXIT_RULE_DEFAULTS,
+  EXIT_STOP_PCT,
+  EXIT_TARGET_PCT,
+  FORWARD_RETURN_DEFAULTS,
+  labelExitRule,
+  labelForwardReturn,
+  labelSignalsExitRule,
+  labelSignalsForwardReturn,
+} from "./modules/label.mjs";
 
 const counts = {};
 let section = "untitled";
@@ -938,6 +950,276 @@ function sum(obj) {
   check(err !== null && /liquidity factor/.test(err.message), "attribution error names the factor");
 }
 
+// ─── 6. outcome-labelling (T9) ──────────────────────────────────────────────
+//
+// Label correctness is proven with hand-computed synthetic candles built
+// INSIDE this section: tiny, explicit, arithmetic-checkable. Nothing here
+// reads backtest/data/, because a label rule must be provable without market
+// data — real candles only hide a wrong rule behind plausible numbers.
+
+sec("outcome-labels");
+{
+  /** Builds a candle in the module's input shape; all three fields explicit. */
+  const lb = (high, low, close) => ({ high, low, close });
+  /** Builds a signal event: { barIndex, side, price }. */
+  const sig = (barIndex, side, price) => ({ barIndex, side, price });
+
+  // 6a. Shipped constants are exactly the spec's D.4 literals (1961-1965).
+  check(EXIT_TARGET_PCT === 1.5, "exit target 1.5% (spec D.4 line 1961)");
+  check(EXIT_STOP_PCT === 0.8, "exit stop 0.8% (spec D.4 line 1962)");
+  check(EXIT_RULE_DEFAULTS.maxHorizonBars === 288, "default exit horizon 288 bars (24h of 5m)");
+  check(
+    FORWARD_RETURN_DEFAULTS.horizons.join(",") === "6,12,24,48,96,288",
+    `default forward horizons (got ${FORWARD_RETURN_DEFAULTS.horizons.join(",")})`,
+  );
+
+  // 6b. LONG rises straight through +1.5% -> win.
+  // Entry 100 => target 101.5, stop 99.2. Bar 1's high 101.6 touches the
+  // target while its low 99.9 stays above the stop, so nothing is ambiguous.
+  const rising = [
+    lb(100.5, 99.5, 100), // 0 — signal bar (close = entry price)
+    lb(101.6, 99.9, 101.2), // 1 — high 101.6 >= 101.5 -> target touched
+    lb(101.4, 100.8, 101.1),
+    lb(101.3, 100.9, 101.0),
+    lb(101.2, 100.7, 101.0),
+    lb(101.1, 100.6, 101.0),
+  ];
+  const winCase = labelExitRule(rising, sig(0, "long", 100), { maxHorizonBars: 4 });
+  check(winCase.label === "win", `LONG +1.5% -> win (got ${winCase.label})`);
+  check(winCase.doubleTouch === false, "single touch is not a double touch");
+  check(winCase.horizonBars === 1, `resolved on the first forward bar (got ${winCase.horizonBars})`);
+  check(Math.abs(winCase.targetPrice - 101.5) < 1e-9, "target price = entry + 1.5%");
+  check(Math.abs(winCase.stopPrice - 99.2) < 1e-9, "stop price = entry - 0.8%");
+
+  // 6c. LONG falls straight through -0.8% -> loss.
+  const falling = [
+    lb(100.5, 99.5, 100), // 0 — signal bar
+    lb(100.8, 99.1, 99.4), // 1 — low 99.1 <= 99.2 -> stop; high never 101.5
+    lb(100.6, 99.4, 100.0),
+    lb(100.5, 99.5, 100.0),
+    lb(100.4, 99.6, 100.0),
+    lb(100.3, 99.7, 100.0),
+  ];
+  const lossCase = labelExitRule(falling, sig(0, "long", 100), { maxHorizonBars: 4 });
+  check(lossCase.label === "loss", `LONG -0.8% -> loss (got ${lossCase.label})`);
+  check(lossCase.doubleTouch === false, "stop-only touch is not a double touch");
+  check(lossCase.horizonBars === 1, `stopped on the first forward bar (got ${lossCase.horizonBars})`);
+
+  // 6d. LONG wanders and never reaches either level -> timeout. Bar 5 DOES
+  // touch the target, on purpose: the label must stay timeout, because the
+  // scan stops at maxHorizonBars.
+  const wandering = [
+    lb(100.5, 99.5, 100), // 0 — signal bar
+    lb(100.4, 99.6, 100.1), // 1 — inside 99.2 .. 101.5
+    lb(100.3, 99.7, 100.0), // 2
+    lb(100.2, 99.8, 100.1), // 3
+    lb(100.1, 99.9, 100.0), // 4 — last bar inside the horizon
+    lb(103.0, 102.0, 102.5), // 5 — target touched, but OUTSIDE the horizon
+  ];
+  const timeoutCase = labelExitRule(wandering, sig(0, "long", 100), { maxHorizonBars: 4 });
+  check(timeoutCase.label === "timeout", `no touch inside the horizon -> timeout (got ${timeoutCase.label})`);
+  check(timeoutCase.horizonBars === 4, `horizon reached = maxHorizonBars (got ${timeoutCase.horizonBars})`);
+  check(timeoutCase.barsAvailable === 5, `5 candles existed after the signal (got ${timeoutCase.barsAvailable})`);
+  check(timeoutCase.doubleTouch === false, "timeout is never a double touch");
+
+  // 6e. SHORT wins when price FALLS: entry 100 => target 98.5, stop 100.8.
+  const shortFalling = [
+    lb(100.5, 99.5, 100), // 0 — signal bar
+    lb(100.6, 98.4, 98.6), // 1 — low 98.4 <= 98.5 -> target; high < 100.8
+    lb(100.5, 99.5, 100),
+    lb(100.5, 99.5, 100),
+    lb(100.5, 99.5, 100),
+    lb(100.5, 99.5, 100),
+  ];
+  const shortWin = labelExitRule(shortFalling, sig(0, "short", 100), { maxHorizonBars: 4 });
+  check(shortWin.label === "win", `SHORT -1.5% -> win (got ${shortWin.label})`);
+  check(Math.abs(shortWin.targetPrice - 98.5) < 1e-9, "short target = entry - 1.5%");
+  check(Math.abs(shortWin.stopPrice - 100.8) < 1e-9, "short stop = entry + 0.8%");
+
+  // 6f. SHORT loses when price RISES through +0.8%.
+  const shortRising = [
+    lb(100.5, 99.5, 100), // 0 — signal bar
+    lb(100.9, 99.5, 100.2), // 1 — high 100.9 >= 100.8 -> stop; low > 98.5
+    lb(100.5, 99.5, 100),
+    lb(100.5, 99.5, 100),
+    lb(100.5, 99.5, 100),
+    lb(100.5, 99.5, 100),
+  ];
+  const shortLoss = labelExitRule(shortRising, sig(0, "short", 100), { maxHorizonBars: 4 });
+  check(shortLoss.label === "loss", `SHORT +0.8% -> loss (got ${shortLoss.label})`);
+  check(shortLoss.doubleTouch === false, "stop-only touch is not a double touch");
+
+  // 6g. ONE bar straddles BOTH levels (high >= target AND low <= stop).
+  // Intra-bar order is unknowable from OHLC, so the conservative rule says
+  // loss, and the raw double-touch is flagged separately.
+  const straddleLong = labelExitRule(
+    [
+      lb(100.5, 99.5, 100), // 0 — signal bar
+      lb(102.0, 98.0, 100.0), // 1 — high 102 >= 101.5 AND low 98 <= 99.2
+      lb(100.5, 99.5, 100),
+      lb(100.5, 99.5, 100),
+      lb(100.5, 99.5, 100),
+      lb(100.5, 99.5, 100),
+    ],
+    sig(0, "long", 100),
+    { maxHorizonBars: 4 },
+  );
+  check(straddleLong.label === "loss", "double touch -> loss (conservative rule)");
+  check(straddleLong.doubleTouch === true, "doubleTouch flag raised");
+  check(straddleLong.horizonBars === 1, `resolved on the straddling bar (got ${straddleLong.horizonBars})`);
+
+  // The short mirror: low 98.0 touches the 98.5 target, high 101.5 touches
+  // the 100.8 stop, on the same bar.
+  const straddleShort = labelExitRule(
+    [
+      lb(100.5, 99.5, 100),
+      lb(101.5, 98.0, 100.0),
+      lb(100.5, 99.5, 100),
+      lb(100.5, 99.5, 100),
+      lb(100.5, 99.5, 100),
+      lb(100.5, 99.5, 100),
+    ],
+    sig(0, "short", 100),
+    { maxHorizonBars: 4 },
+  );
+  check(
+    straddleShort.label === "loss" && straddleShort.doubleTouch === true,
+    "short double touch -> loss + flag",
+  );
+
+  // 6h. Signal 2 bars from the end of the array: with the default 288-bar
+  // horizon the observation window cannot exist, so the label is
+  // insufficient_data — its own bucket, never a win, a loss or a timeout.
+  const nearEnd = [
+    lb(100.5, 99.5, 100),
+    lb(100.4, 99.6, 100),
+    lb(100.4, 99.6, 100), // 2 — signal: only 2 candles follow
+    lb(100.4, 99.6, 100),
+    lb(100.4, 99.6, 100),
+  ];
+  const truncated = labelExitRule(nearEnd, sig(2, "long", 100));
+  check(truncated.label === "insufficient_data", `2 bars left -> insufficient_data (got ${truncated.label})`);
+  check(truncated.barsAvailable === 2, `barsAvailable = 2 (got ${truncated.barsAvailable})`);
+  check(truncated.horizonBars === 0, "no scan runs when the horizon cannot be observed");
+  check(truncated.doubleTouch === false, "insufficient_data never claims a double touch");
+
+  // The availability rule fires BEFORE the scan: this window WOULD touch the
+  // target on its first forward bar and it is still insufficient_data. If
+  // the intended rule ever becomes scan-first, this is the check that must
+  // change with it.
+  const touchTruncated = labelExitRule(
+    [
+      lb(100.5, 99.5, 100),
+      lb(100.4, 99.6, 100),
+      lb(100.4, 99.6, 100), // 2 — signal
+      lb(101.6, 100.0, 101.0), // 3 — would touch the +1.5% target
+      lb(100.4, 99.6, 100),
+    ],
+    sig(2, "long", 100),
+  );
+  check(
+    touchTruncated.label === "insufficient_data",
+    "touch inside a truncated window stays insufficient_data (availability first)",
+  );
+
+  // 6i. Forward return with hand-built closes: entry 100, close 101.5 six
+  // bars later => exactly +1.5% long and exactly -1.5% short (the raw price
+  // change is negated for the short). ((101.5 - 100) / 100) * 100 === 1.5 is
+  // exact in IEEE-754 for these operands, so the assertions are exact.
+  const forward = [
+    lb(100.5, 99.5, 100), // 0 — signal bar, close 100
+    lb(100.5, 99.5, 100),
+    lb(100.5, 99.5, 100),
+    lb(100.5, 99.5, 100),
+    lb(100.5, 99.5, 100),
+    lb(100.5, 99.5, 100),
+    lb(101.6, 100.0, 101.5), // 6 — close 101.5 = +1.5% from 100
+  ];
+  const fwdLong = labelForwardReturn(forward, sig(0, "long", 100));
+  check(fwdLong.returns[6] === 1.5, `long forward return at 6 = +1.5 (got ${fwdLong.returns[6]})`);
+  check(fwdLong.returns[6] > 0, "positive = the trade would have made money");
+  const fwdShort = labelForwardReturn(forward, sig(0, "short", 100));
+  check(fwdShort.returns[6] === -1.5, `short forward return at 6 = -1.5 (got ${fwdShort.returns[6]})`);
+  check(fwdShort.returns[6] < 0, "a price RISE is a loss for the short");
+  check(fwdShort.returns[6] === -fwdLong.returns[6], "short return is the exact negation of the long");
+
+  // 6j. A horizon longer than the remaining data is null, NOT 0 — and a
+  // genuinely flat close still returns a real 0, so the two can never be
+  // mistaken for one another.
+  check(288 in fwdLong.returns, "every requested horizon is present as a key");
+  check(fwdLong.returns[288] === null, "horizon beyond the data -> null");
+  check(fwdLong.returns[288] !== 0, "null is not 0");
+  const twoBars = [lb(100.5, 99.5, 100), lb(100.5, 99.5, 100)];
+  const beyond = labelForwardReturn(twoBars, sig(0, "long", 100), { horizons: [3] });
+  check(beyond.returns[3] === null, "explicit horizon past the end -> null");
+  const flat = labelForwardReturn(twoBars, sig(0, "long", 100), { horizons: [1] });
+  check(flat.returns[1] === 0, "an unchanged close is a real 0%, distinct from null");
+
+  // 6k. Batch aggregation: the RAW double-touch count is reported separately
+  // from the label counts, because it is exactly how much the conservative
+  // rule moves any hit rate.
+  const batchCandles = [
+    lb(100.5, 99.5, 100), // 0 — signal A (long, close 100)
+    lb(102.0, 98.0, 100), // 1 — A resolves: both levels on one bar
+    lb(100.5, 99.5, 100),
+    lb(100.5, 99.5, 100),
+    lb(100.5, 99.5, 100), // 4 — signal B (long, close 100)
+    lb(101.6, 99.9, 100), // 5 — B: high 101.6 >= 101.5 -> win
+    lb(100.5, 99.5, 100),
+    lb(100.5, 99.5, 100),
+    lb(100.5, 99.5, 100),
+    lb(100.5, 99.5, 100),
+  ];
+  const batch = labelSignalsExitRule(batchCandles, [sig(0, "long", 100), sig(4, "long", 100)], {
+    maxHorizonBars: 4,
+  });
+  check(batch.total === 2, `two signals labelled (got ${batch.total})`);
+  check(batch.counts.loss === 1 && batch.counts.win === 1, "one loss, one win");
+  check(batch.counts.timeout === 0 && batch.counts.insufficient_data === 0, "no other labels");
+  check(batch.doubleTouchCount === 1, `raw double-touch count = 1 (got ${batch.doubleTouchCount})`);
+  check(batch.results[0].label === "loss" && batch.results[0].doubleTouch === true, "A: straddle flagged");
+  check(batch.results[1].label === "win" && batch.results[1].doubleTouch === false, "B: clean win");
+
+  const fwdBatch = labelSignalsForwardReturn(forward, [sig(0, "long", 100), sig(0, "short", 100)]);
+  check(fwdBatch.total === 2, `two forward-return labels (got ${fwdBatch.total})`);
+  check(fwdBatch.horizons.join(",") === "6,12,24,48,96,288", "batch echoes the horizons");
+  check(fwdBatch.results[0].returns[6] === -fwdBatch.results[1].returns[6], "batch keeps both sides distinct");
+
+  // 6l. Validation: a miswired signal THROWS instead of producing plausible
+  // labels for the wrong bars.
+  throws(() => labelExitRule([], sig(0, "long", 100)), RangeError, "signal beyond the data rejected");
+  throws(() => labelExitRule(rising, sig(-1, "long", 100)), TypeError, "negative barIndex rejected");
+  throws(() => labelExitRule(rising, sig(0, "long", -1)), TypeError, "non-positive price rejected");
+  throws(() => labelExitRule(rising, sig(0, "buy", 100)), TypeError, "side domain enforced");
+  throws(
+    () => labelExitRule(rising, sig(1, "long", 100)), // bar 1 closes 101.2, not 100
+    TypeError,
+    "price that is not the signal bar's close rejected (anti-miswire)",
+  );
+  throws(
+    () => labelExitRule([{ t: 0, o: 1, h: 2, l: 0.5, c: 1, v: 1 }], sig(0, "long", 1)),
+    TypeError,
+    "unmapped dataset candle rejected (field shape)",
+  );
+  throws(
+    () => labelExitRule(rising, sig(0, "long", 100), { targetPct: 2 }),
+    TypeError,
+    "unknown option rejected — the D.4 levels are spec, not knobs",
+  );
+  throws(
+    () => labelExitRule(rising, sig(0, "long", 100), { maxHorizonBars: 0 }),
+    RangeError,
+    "maxHorizonBars minval 1",
+  );
+  throws(() => labelForwardReturn(forward, sig(0, "long", 100), { horizons: [0] }), RangeError, "horizon minval 1");
+  throws(() => labelForwardReturn(forward, sig(0, "long", 100), { horizons: [] }), TypeError, "empty horizons rejected");
+  throws(
+    () => labelSignalsExitRule(rising, [], { bogus: 1 }),
+    TypeError,
+    "batch validates options even when no signal is labelled",
+  );
+}
+
 // ─── Report ─────────────────────────────────────────────────────────────────
 
 const ORDER = [
@@ -946,6 +1228,7 @@ const ORDER = [
   "structure-break",
   "imbalance-detector",
   "signal-engine",
+  "outcome-labels",
 ];
 console.log("section            checks");
 for (const name of ORDER) {
