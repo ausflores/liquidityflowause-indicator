@@ -818,6 +818,7 @@ to the non-tier factors, or higher-timeframe data must be used.
 | 5 | #17 | ~350 | **~2957** (1221 baseline + 447 label + 437 binary + 711 smoke + 8 run.mjs + 133 doc) |
 | 6 | #18 | ~200 | **~1695** (1373 diagnostic + 224 smoke + 8 run.mjs + 90 doc) |
 | 7 | #19 | ~500 | **~1646** (336 baseline + 319 tier-diagnostic + 309 smoke + 277 run.mjs + 258 timeframes.mjs + 147 doc) |
+| 8 | #20 | ~450 | **~2167** (1261 compare + 502 smoke + 232 report + 104 doc + 31 baseline + 25 run.mjs) |
 
 Every slice landed over its forecast.
 
@@ -875,6 +876,17 @@ exist that the earlier estimate could not know about: horizon semantics stretch
 with the grid, and multiple timeframes are not independent samples. Both are
 load-bearing — without them the three-timeframe table is the single most
 misreadable artifact this project can produce.
+
+**Slice 8** — ~5× over a ~450 forecast, and this one is the forecast's blind
+spot rather than its generosity. The estimate costed "findings report" as prose.
+It did not know the report could not be written until someone put a number on
+how much the baseline's hit rates overstated themselves — and the answer
+(1,701 signals collapsing to one cluster) turned the report from a performance
+claim into a statement about what cannot be claimed. `compare.mjs` is 1,261
+lines because it must refuse to print a number where none is meaningful, print
+why each cell was refused, cross-check its own candidate and label counts
+against `baseline` on three grids, and re-derive its cluster counts with a
+second wiring and a different algorithm. The 232-line report is the cheap half.
 
 The per-slice ~400 figure is an advisory planning heuristic stated as such in
 this document, not an acceptance criterion, so every variance is recorded
