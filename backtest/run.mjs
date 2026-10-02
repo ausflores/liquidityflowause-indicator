@@ -27,6 +27,8 @@
 //                                    --seed <n>, --bootstrap <n>, --json
 //                                    --horizon <bars> re-runs the analysis at a
 //                                    different hold (default 288 = shipped)
+//   node backtest/run.mjs band       proximity-band counterfactual sweep
+//                                    (backtest/band.mjs), --json too
 //   node backtest/run.mjs search     T12 weight search (not implemented yet)
 //
 // Every data-reading subcommand takes `--timeframe <5m|1h|4h>` and defaults to
@@ -46,6 +48,7 @@ import { runBaseline } from "./baseline.mjs";
 import { parseCompareFlags, runCompare } from "./compare.mjs";
 import { parseRatioFlags, parseRatioHorizonFlag, runRatio } from "./ratio.mjs";
 import { runTierDiagnostic } from "./tier-diagnostic.mjs";
+import { runBand } from "./band.mjs";
 import {
   DEFAULT_TIMEFRAME,
   TIMEFRAME_IDS,
@@ -673,10 +676,16 @@ function usage() {
     "             have resolved later. Omitting the flag reproduces the 288-bar report",
   );
   console.log("             exactly and adds no power or horizon section.");
+  console.log(
+    "  band       COUNTERFACTUAL proximity-band sweep — every row but A is a",
+  );
+  console.log(
+    "             what-if, nothing under src/ changes and nothing is recommended",
+  );
   console.log("  search     weight search with holdout evaluation (T12)");
   console.log("");
   console.log(
-    `  --timeframe   native grid for fetch/baseline/diagnose/compare/ratio ` +
+    `  --timeframe   native grid for fetch/baseline/diagnose/compare/ratio/band ` +
       `(${TIMEFRAME_IDS.join(", ")}); default "${DEFAULT_TIMEFRAME}".`,
   );
   console.log(
@@ -750,8 +759,15 @@ const SUBCOMMANDS = ["fetch", "validate", "baseline", "diagnose", "compare", "se
 // would edit an assertion to make a new test pass, which is the one move this
 // harness must never make. `ratio` is registered through DISPATCHABLE below, so
 // a typo in it still refuses to dispatch.
+// `band` was added after `ratio` and is registered through its OWN list for the
+// same reason: appending to EXTRA_SUBCOMMANDS in place would break smoke.mjs's
+// verbatim assertion of that literal, and editing the assertion to admit a new
+// subcommand is precisely what that assertion exists to prevent. The cost is one
+// more named list; the benefit is that both existing literals keep meaning what
+// smoke.mjs says they mean.
 const EXTRA_SUBCOMMANDS = ["ratio"];
-const DISPATCHABLE = [...SUBCOMMANDS, ...EXTRA_SUBCOMMANDS];
+const LATER_SUBCOMMANDS = ["band"];
+const DISPATCHABLE = [...SUBCOMMANDS, ...EXTRA_SUBCOMMANDS, ...LATER_SUBCOMMANDS];
 const subcommand = process.argv[2];
 
 // The flag is parsed BEFORE dispatch so an invalid --timeframe fails loudly on
@@ -823,6 +839,16 @@ if (subcommand === undefined || !DISPATCHABLE.includes(subcommand)) {
         seed: ratioFlags.seed,
         bootstrap: ratioFlags.bootstrap,
         horizon: parseRatioHorizonFlag(process.argv),
+      });
+    } else if (subcommand === "band") {
+      // Counterfactual only. `band` re-runs the baseline wiring against a set of
+      // alternative proximity-band definitions and reports what WOULD change; it
+      // writes nothing, changes nothing under src/, and recommends nothing.
+      // Candidate A is REQUIRED to reproduce `baseline` on the same grid or the
+      // whole sweep throws rather than reporting.
+      process.exitCode = await runBand({
+        json: process.argv.includes("--json"),
+        tf,
       });
     } else if (subcommand === "diagnose") {
       process.exitCode = await runTierDiagnostic({

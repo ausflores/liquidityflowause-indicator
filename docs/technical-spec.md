@@ -371,7 +371,7 @@ if array.size(zones) > 0
         LiquidityZone z = array.get(zones, i)
 
         bool tooOld   = bar_index - z.bornBar > maxZoneAgeBars
-        bool tooFar   = math.abs(close - z.center) > atrChart * maxZoneDistanceATR
+        bool tooFar   = math.abs(close - z.center) > atrH4 * maxZoneDistanceATR
         bool stale    = not na(z.sweptBar) and bar_index - z.sweptBar > sweptRetainBars
 
         if tooOld or tooFar or stale

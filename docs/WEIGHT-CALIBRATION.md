@@ -207,7 +207,7 @@ The spec argues for binary on *discipline* grounds — "*a missing factor means 
 
 What this work does justify saying plainly:
 
-- **On 5-minute charts the indicator does not function** at the shipped threshold. Two signals in 215 days. If 5m is a timeframe anyone reads it on, that is a bug report, not a tuning question.
+- **On 5-minute charts the indicator does not function** at the shipped threshold. Two signals in 215 days. **Measured, 2026-10-02: no proximity-band change fixes it.** Eleven definitions were swept — including the one the spec already applies to the distance cull — and every one that makes the D1 tier fire on a 5m chart **drops the binary model's independent hit rate below the 40.63% it already achieves there**. The two that cost no accuracy never make D1 fire at all. D1's share of candidate moments stays under 5% even at a 32× band, because widening floods in the H4 tier as well and the score ceiling rises for the wrong reason. **The D1 weight was never the binding constraint.** See §11.
 - **On 1h the signal's raw expectancy is negative**, for both models, at every horizon, and **negative for both after D.4's own declared commission** — the one result that survived every caveat in this document.
 - **A ratio is not a property of a strategy; it is a property of a strategy at a given hold.** The ratio the observed accuracy requires moves with the horizon — **and so does its sign** — while the shipped 1.875 is applied unchanged to a 24-hour trade and a 12-day one. That mismatch is the strongest remaining lead, and it was never examined because the ratio was treated as fixed.
 
@@ -252,6 +252,36 @@ node scripts/build.mjs                                   # production SHA unchan
 ```
 
 Datasets are gitignored and must be fetched first (`node backtest/run.mjs fetch --timeframe 1h`). Production Pine SHA throughout: `1DD6F536AE4F50C2F669E9C1A2B34A0FB97A7D51428905B9E18F8616D1582CE2`.
+
+---
+
+## 11. Why the 5-minute chart finds nothing — and why no band change fixes it
+
+*Added 2026-10-02, after the maintainer confirmed 5m is a timeframe they trade.*
+
+The weighted model's near-zero firing rate on 5m has a single mechanism: a D1 zone's half-width is `0.5 ×` **its own timeframe's** ATR while the proximity band is `3 ×` the **chart's** ATR, so on 5m the median D1 half-width is **5.04× the band**. Price is always already *inside* the zone before it can be *near* one, and the in-body exclusion withholds the flag. D1 is worth +30 of 110 points, which is why candidates cluster at 40–60 against a threshold of 70.
+
+**This is not out of scope by design.** The spec targeted 5m explicitly, twice, and reasoned about exactly this: *"Anchored to the entry timeframe, 15 x a 5-minute ATR is a tiny distance, so D1 zones are born and culled on the same bar and the tier hierarchy collapses — with no error, D1 liquidity just goes missing."* The author identified the failure mode and fixed it **in the distance cull**, by anchoring that distance to the 4H ATR. The same fix was never applied to the **proximity check** — which is where D1 still dies.
+
+**That asymmetry is real. Fixing it does not help.** Eleven band definitions were measured across all three grids (`node backtest/run.mjs band`), including the author's own cull precedent:
+
+| on 5m | D1 fires | binary hit rate | |
+|---|---|---|---|
+| **A — shipped** | **0** | **40.63% [28.79, 53.03]** | baseline |
+| B — anchored to 4H ATR (the cull's precedent) | 410 | 30.34% | −9.38 pp |
+| C — `max(chart, 4H)` | 410 | 30.34% | −9.38 pp |
+| D4 / D8 / D16 / D32 — widen ×4 … ×32 | 10 … 4,145 | 32.5% … 33.7% | worse |
+| E2 / E3 — scale-free, band ≥ zone size | 410 / 429 | 33.72% / 36.52% | worse |
+
+**No candidate makes D1 fire on 5m without the hit rate falling below what the binary model already achieves there.** The two that cost no accuracy never make D1 fire at all.
+
+**The deeper finding: the D1 weight was never the binding constraint.** Widening the band raises the score ceiling to 110/110 — but D1 stays **under 5% of candidate moments** even at 32×, because the H4 tier floods in alongside it. The ceiling moved for the wrong reason. Everything in this document that treated "the D1 tier is unreachable, therefore the threshold is unreachable" was reading a symptom as a cause.
+
+**The defect is also 5m-specific.** On 1h the D1 tier is already reachable under the shipped expression — 5,106 eligible pairs, 256 fires, 0.38% of candidates. On 4h it is 8.40%. Only on a fine chart does it collapse.
+
+**So the practical question for a 5m chart is not "how do I fix the band" — it is "should I be on a 5m chart at all".** On 1h the weighted model fires 307 times. Whether that is *profitable* is still not answerable locally, for the reasons in §4 and §9a; only Route A answers it.
+
+**Note on the wider band.** It admits approaches the shipped rule deliberately excludes — any bar inside the band but outside the zone body, which is precisely what the in-body exclusion exists to withhold. D32 admits 140,874 D1 pairs against today's zero. That is a behavioural change, not a free win, and it is the reason "more signals" was never treated here as progress.
 
 ---
 

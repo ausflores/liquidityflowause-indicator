@@ -109,6 +109,12 @@ import {
   verifyParametricLabeller,
   windowIndexOf,
 } from "./ratio.mjs";
+import {
+  baselineCandidate,
+  discriminator,
+  gateIndependent,
+  proximityCandidates,
+} from "./band.mjs";
 
 const counts = {};
 let section = "untitled";
@@ -4254,6 +4260,267 @@ sec("horizon-sweep");
 
 // ─── Report ─────────────────────────────────────────────────────────────────
 
+// ─── 14. proximity-band counterfactual sweep (band.mjs) ──────────────────────
+//
+// Data-free, like every other section: the candidates are pure functions of a
+// proximity context and the discriminator is pure arithmetic, so the parts of
+// this sweep that can be checked without candles are checked here rather than
+// being asserted in prose.
+
+sec("band-sweep");
+{
+  const bandSrc = readFileSync(new URL("./band.mjs", import.meta.url), "utf8");
+  const ratioSrcBand = readFileSync(new URL("./ratio.mjs", import.meta.url), "utf8");
+  const lzSrcBand = readFileSync(new URL("./modules/liquidity-zones.mjs", import.meta.url), "utf8");
+  const runSrcBand = readFileSync(new URL("./run.mjs", import.meta.url), "utf8");
+
+  // ── The candidate list is complete and frozen ──
+  const cands = proximityCandidates();
+  const ids = cands.map((c) => c.id);
+  check(
+    ids.length === 11 &&
+      ids[0] === "A" && ids[1] === "B" && ids[2] === "C" &&
+      ids.slice(3, 8).join(",") === "D2,D4,D8,D16,D32" &&
+      ids.slice(8).join(",") === "E1,E2,E3",
+    `the candidate list is A, B, C, D(2/4/8/16/32), E(1/2/3) in that order (got ${ids.join(",")})`,
+  );
+  check(
+    cands.every((c) => Object.isFrozen(c) && typeof c.expr === "string" && c.expr.length > 0),
+    "every candidate is frozen and carries a printable expression",
+  );
+  // Every family the brief names must be present: a sweep that quietly dropped
+  // one would still print a full-looking table.
+  check(
+    ["A", "B", "C", "D", "E"].every((f) => cands.some((c) => c.family === f)) &&
+      cands.filter((c) => c.family === "D").length === 5 &&
+      cands.filter((c) => c.family === "E").length === 3,
+    "all five families are present, with all five D widenings and all three E scale-free rows",
+  );
+  // E is the scale-free family and must be the only one that reads zone.halfWidth.
+  check(
+    cands.filter((c) => c.family === "E").every((c) => c.bandWidth({ atrChart: 5, atrH4: 5, atrD1: 5, atrH1: 5, zone: { halfWidth: 111 } }) === 111 * c.k),
+    "E measures against the ZONE'S OWN half-width and ignores every ATR",
+  );
+  check(
+    cands.filter((c) => c.family !== "E").every((c) => c.bandWidth({ atrChart: 5, atrH4: 9, atrD1: 40, atrH1: 2, zone: { halfWidth: 111 } }) !== 111 * c.k),
+    "no ATR-anchored candidate accidentally reads the zone's half-width",
+  );
+  // Compared by identity of the ROW, not of the object: proximityCandidates()
+  // builds fresh frozen objects per call, so `===` across two calls would fail on
+  // two structurally identical candidates and pass on nothing.
+  check(
+    baselineCandidate().family === "A" && proximityCandidates()[0].id === baselineCandidate().id,
+    "the baseline candidate is family A and is FIRST, so every delta has a fixed reference",
+  );
+  check(
+    cands.every((c) => typeof c.givesUp === "string" && c.givesUp.length > 20),
+    "every candidate states what it GIVES UP — the field the reader should quote",
+  );
+
+  // ── Candidate A equals the shipped definition, on synthetic input ──
+  check(
+    /const near = Math\.abs\(close - zp\.center\) <= atrChart \* cfg\.proxATRMult/.test(lzSrcBand),
+    "the port still carries `atrChart * cfg.proxATRMult` at its proximity line",
+  );
+  const aBand = baselineCandidate().bandWidth;
+  const ctxA = { atrChart: 73.5, atrH4: 640, atrD1: 2100, atrH1: 70, zone: { halfWidth: 5 } };
+  check(
+    aBand(ctxA) === 73.5 * 3 && Math.abs(aBand(ctxA) - 220.5) < 1e-12,
+    "candidate A reproduces the shipped expression exactly: atrChart * proxATRMult = 3x the chart ATR",
+  );
+  const probe = proximityCandidates();
+  const bBand = probe.find((c) => c.id === "B").bandWidth;
+  check(
+    aBand(ctxA) !== bBand(ctxA) && bBand(ctxA) === 640 * 3,
+    "candidate B is genuinely a DIFFERENT expression — 3x the 4H ATR, not 3x the chart ATR, " +
+      "so it could not silently equal A",
+  );
+  // An unavailable anchor yields Pine `na`, never a fabricated band.
+  const cBand = probe.find((c) => c.id === "C").bandWidth;
+  check(
+    aBand({ ...ctxA, atrChart: null }) === null &&
+      bBand({ ...ctxA, atrH4: null }) === null &&
+      cBand({ ...ctxA, atrChart: null, atrH4: null }) === null,
+    "an unavailable anchor yields null (Pine na), never a fabricated band out of a warm-up bar",
+  );
+
+  // ── C is a FLOOR: it can never shrink the band below A ──
+  const chartOnly = { atrChart: 100, atrH4: 10, atrD1: 10, atrH1: 10, zone: { halfWidth: 5 } };
+  const h4Bigger = { atrChart: 10, atrH4: 100, atrD1: 10, atrH1: 10, zone: { halfWidth: 5 } };
+  check(
+    cBand(chartOnly) === aBand(chartOnly) && cBand(h4Bigger) === 300,
+    "C equals A where atrChart dominates and takes the 4H ATR where 4H dominates — a floor, " +
+      "so a coarse grid is untouched by construction",
+  );
+
+  // ── D is monotonic in k; E is scale-free ──
+  // chartOnly has atrChart = 100, so the band is 100 * 3 * k = 300k: k=2 -> 600,
+  // k=32 -> 9600. Each step doubles, which is asserted against the ladder itself
+  // rather than against a hand-written list of five constants.
+  const dBands = [2, 4, 8, 16, 32].map(
+    (k) => probe.find((c) => c.id === `D${k}`).bandWidth(chartOnly),
+  );
+  check(
+    dBands.every((v, i) => i === 0 || v > dBands[i - 1]) &&
+      dBands.every((v, i) => Math.abs(v - dBands[0] * 2 ** i) < 1e-9),
+    "D widens monotonically and each step doubles: k=2 gives 600 with this input, k=32 gives 9600",
+  );
+  const eBand = (id) => probe.find((c) => c.id === id).bandWidth;
+  check(
+    eBand("E2")({ atrChart: 100, atrH4: 100, atrD1: 100, atrH1: 100, zone: { halfWidth: 7 } }) === 14 &&
+      eBand("E2")({ atrChart: 9999, atrH4: 9999, atrD1: 9999, atrH1: 9999, zone: { halfWidth: 7 } }) === 14,
+    "E is INVARIANT to every ATR by construction: a 100x change in all four ATRs leaves the band at 2 x halfWidth",
+  );
+  // The property the defect breaks: E's band can never be narrower than the body.
+  check(
+    [1, 2, 3].every((k) => eBand(`E${k}`)({ atrChart: 1, atrH4: 1, atrD1: 1, atrH1: 1, zone: { halfWidth: 900 } }) >= 900),
+    "E's band is never narrower than the zone body it must detect — the exact condition the defect breaks",
+  );
+  check(
+    eBand("E1")({ atrChart: 1, atrH4: 1, atrD1: 1, atrH1: 1, zone: { halfWidth: 0 } }) === null,
+    "a degenerate zero-width zone yields null rather than a band of zero, so E cannot flag everything",
+  );
+
+  // ── The discriminator ──
+  check(
+    discriminator({ eligible: 5, fires: 0, producible: true }).consistent === false &&
+      discriminator({ eligible: 0, fires: 0, producible: true }).consistent === true &&
+      discriminator({ eligible: 7, fires: 3, producible: true }).consistent === true,
+    "the discriminator is (eligible > 0) === (fires > 0): eligible-without-flag is a defect, " +
+      "zero-and-zero is consistent, and both-positive is consistent",
+  );
+  check(
+    discriminator({ eligible: 0, fires: 0, producible: true }).verdict === "consistent",
+    "zero eligibility with zero fires is CONSISTENT, not a defect — reading a zero as a " +
+      "broken flag is the mistake this whole diagnostic family exists to avoid",
+  );
+  check(
+    discriminator({ eligible: 0, fires: 4, producible: true }).consistent === false,
+    "a flag that fires with zero eligible pairs is a defect too, not a bonus",
+  );
+  const unmeasurable = discriminator({ eligible: 0, fires: 0, producible: false });
+  check(
+    unmeasurable.consistent === null && unmeasurable.verdict === "not measurable",
+    "an unproducible tier (4h has no 1H) is NOT MEASURABLE — never asserted consistent, never zero",
+  );
+
+  // ── The sub-30 refusal is enforced BEFORE any draw ──
+  //
+  // Exercised through the report's own gate function on synthetic counts, with a
+  // draw counter that must stay at zero: an ineligible scope produces NO number
+  // to decline to print.
+  let drawsRequested = 0;
+  const countingDraw = () => {
+    drawsRequested += 1;
+    return { lo: 10, hi: 90 };
+  };
+  const scoped29 = gateIndependent({ resolved: 29, hitRatePercent: 50 }, countingDraw, 30);
+  check(
+    scoped29.hitRatePercent === null && scoped29.interval === null &&
+      typeof scoped29.refused === "string" && scoped29.refused.includes("29") &&
+      drawsRequested === 0,
+    "29 resolved observations: the hit rate is null, the interval is null, the refusal names " +
+      "the count, and NO bootstrap was requested",
+  );
+  const scoped30 = gateIndependent({ resolved: 30, hitRatePercent: 50 }, countingDraw, 30);
+  check(
+    scoped30.hitRatePercent === 50 && scoped30.interval !== null &&
+      scoped30.interval.lo === 10 && scoped30.interval.hi === 90 && drawsRequested === 1,
+    "exactly 30 resolved observations is eligible — the floor is >= 30, not > 30",
+  );
+  check(
+    scoped29.independentObserved === 29 && scoped30.independentObserved === 30,
+    "a refused scope still reports its resolved observation count — REFUSED, not approximated",
+  );
+  const scopedZero = gateIndependent({ resolved: 0, hitRatePercent: null }, countingDraw, 30);
+  check(
+    scopedZero.hitRatePercent === null && scopedZero.interval === null && drawsRequested === 1,
+    "an all-timeout scope resolves nothing and is refused without a draw being attempted for it",
+  );
+  const scopedRaisedFloor = gateIndependent({ resolved: 30, hitRatePercent: 50 }, countingDraw, 31);
+  check(
+    scopedRaisedFloor.hitRatePercent === null && drawsRequested === 1,
+    "raising the floor above the observation count refuses again — the gate reads the floor, " +
+      "it is not hard-coded to 30 in two places",
+  );
+
+  // ── The observation floor cannot drift from ratio.mjs's ──
+  check(
+    /const MIN_OBSERVATIONS_FOR_INTERVAL = 30;/.test(bandSrc) &&
+      /const MIN_OBSERVATIONS_FOR_INTERVAL = 30;/.test(ratioSrcBand),
+    "band.mjs and ratio.mjs declare the same 30-observation floor, read from their sources",
+  );
+
+  // ── Outcome codes are the NUMERIC ones ratio.mjs compares against ──
+  check(
+    /return r\.label === "win" \? OUTCOME_WIN : r\.label === "loss" \? OUTCOME_LOSS : OUTCOME_EXCLUDED;/.test(bandSrc),
+    "band.mjs encodes win/loss/excluded as ratio.mjs's NUMERIC codes — passing label strings " +
+      "would silently yield undefinedDraws on every draw and a null interval",
+  );
+  check(
+    /const OUTCOME_WIN = 1;[\s\S]*const OUTCOME_LOSS = 2;/.test(bandSrc) &&
+      /const WIN = 1;[\s\S]*const LOSS = 2;/.test(ratioSrcBand),
+    "the outcome codes match the private constants ratio.mjs:1025-1026 uses",
+  );
+  check(
+    bandSrc.includes("undefinedDraws === bootstrap"),
+    "a run where EVERY bootstrap draw is undefined throws rather than printing a null " +
+      "interval that would read as a small sample",
+  );
+
+  // ── Fidelity to the baseline is a THROW, not a warning ──
+  check(
+    /function assertBaselineFidelity/.test(bandSrc) && /throw new Error\([\s\S]{0,400}REFUSING on/.test(bandSrc),
+    "the candidate-A fidelity check throws rather than warning — an unfaithful reference row " +
+      "invalidates every delta, so the sweep refuses instead of reporting",
+  );
+  check(
+    bandSrc.includes('from "./baseline.mjs"') &&
+      /import\s*\{[^}]*runComparison[^}]*\}\s*from\s*"\.\/baseline\.mjs"/.test(bandSrc),
+    "band.mjs reuses baseline.mjs's OWN runComparison for the fidelity check — the reference " +
+      "row is checked against the shipped runner, not against a copy of it",
+  );
+  check(
+    /const shared = \{[\s\S]{0,1600}for \(const st of states\)/.test(bandSrc),
+    "the upstream modules are evaluated ONCE per bar and shared by every candidate, so a " +
+      "difference between rows is attributable to the band and nothing else",
+  );
+  check(
+    /counterfactualNotice/.test(bandSrc) && bandSrc.includes("NOT A RECOMMENDATION"),
+    "both output modes carry the counterfactual notice and the no-recommendation statement",
+  );
+  check(
+    /notAClaim/.test(bandSrc) && /NOT A RECOMMENDATION: this report presents a set with consequences/.test(bandSrc),
+    "the JSON declares explicitly that the two-clause test is not a ranking and names no winner",
+  );
+
+  // ── Wiring: dispatched, and cannot perturb the existing subcommands ──
+  check(
+    /import\s*\{ runBand \} from "\.\/band\.mjs"/.test(runSrcBand) &&
+      runSrcBand.includes('subcommand === "band"'),
+    "run.mjs imports the band runner and dispatches `band`",
+  );
+  check(
+    runSrcBand.includes('SUBCOMMANDS = ["fetch", "validate", "baseline", "diagnose", "compare", "search"]') &&
+      runSrcBand.includes('EXTRA_SUBCOMMANDS = ["ratio"]'),
+    "the six-name SUBCOMMANDS literal and the two-name EXTRA_SUBCOMMANDS literal are untouched — " +
+      "`band` went into its own list rather than editing an assertion to admit itself",
+  );
+  check(
+    runSrcBand.includes('const LATER_SUBCOMMANDS = ["band"]') &&
+      /DISPATCHABLE = \[\.\.\.SUBCOMMANDS, \.\.\.EXTRA_SUBCOMMANDS, \.\.\.LATER_SUBCOMMANDS\]/.test(runSrcBand),
+    "band is registered through DISPATCHABLE, so a typo in it still refuses to dispatch",
+  );
+  check(
+    /runBand\(\{[\s\S]{0,140}json: process\.argv\.includes\("--json"\),[\s\S]{0,60}tf,?[\s\S]{0,30}\}\)/.test(runSrcBand),
+    "band dispatch passes --json AND the resolved timeframe, like every other data subcommand",
+  );
+  check(
+    !bandSrc.includes("writeFile") && !bandSrc.includes("from \"node:fs\""),
+    "band.mjs never writes a file — a measurement harness only reads",
+  );
+}
+
 const ORDER = [
   "session-markers",
   "liquidity-zones",
@@ -4268,6 +4535,7 @@ const ORDER = [
   "cluster-bootstrap",
   "exit-ratio",
   "horizon-sweep",
+  "band-sweep",
 ];
 console.log("section            checks");
 for (const name of ORDER) {
