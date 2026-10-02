@@ -1010,7 +1010,7 @@ to the non-tier factors, or higher-timeframe data must be used.
 | 7 | #19 | ~500 | **~1646** (336 baseline + 319 tier-diagnostic + 309 smoke + 277 run.mjs + 258 timeframes.mjs + 147 doc) |
 | 8 | #20 | ~450 | **~2167** (1261 compare + 502 smoke + 232 report + 104 doc + 31 baseline + 25 run.mjs) |
 | 9 | #21 | ~450 | **~2876** (1804 ratio + 830 smoke + 135 doc + 70 report + 37 run.mjs) |
-| 10 | #22 | ~450 | **~1712** (ratio delta + 117 smoke + doc delta + run.mjs delta) |
+| 10 | #22 | ~450 | **~1712** (842 ratio + 760 smoke + 83 doc + 27 run.mjs) |
 
 Every slice landed over its forecast.
 
