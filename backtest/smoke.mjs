@@ -91,6 +91,7 @@ import {
   labelExitAt,
   parseRatioFlags,
   requiredRatio,
+  ratioDirection,
   selectIndependent,
   stopGridPct,
   surfaceCells,
@@ -2865,6 +2866,101 @@ sec("exit-ratio");
   throws(() => breakevenHitRate(1.5, -0.1), RangeError, "a negative stop is rejected");
   throws(() => expectancyPercent(1.5, 1.5, 0.8), RangeError, "expectancyPercent wants a FRACTION");
 
+  // ── The direction of the gap: DEFICIT vs SURPLUS ─────────────────────────
+  //
+  // REGRESSION. The first version of ratio.mjs derived the word inline from
+  // `gap > 0` while PHRASING the sentence from the perspective of
+  // `shipped - required`, and shipped the INVERSE of the rule its own header
+  // documented — on every grid, in both tables. The assertion below is on the
+  // LABELLING FUNCTION, not on rendered text, so it survives any refactor of the
+  // report that leaves the function itself alone.
+  //
+  // The rule, stated once: gap = requiredRatio(h) - shippedRatio.
+  //   required > shipped -> the shipped ratio is TOO SMALL for the accuracy
+  //                        observed -> DEFICIT
+  //   required < shipped -> the shipped ratio is LARGER than the accuracy needs
+  //                        -> SURPLUS
+  //
+  // Hand-computable anchors. At h = 0.25 the required ratio is EXACTLY 3.0, so
+  // anything below 3.0 is a deficit and anything above 3.0 is a surplus.
+  check(requiredRatio(0.25) === 3, "the anchor: requiredRatio(0.25) is exactly 3.0");
+  check(
+    ratioDirection(requiredRatio(0.25) - 1.875).code === "deficit",
+    "required 3.0 vs a shipped 1.875 (below 3.0) is a DEFICIT",
+  );
+  check(
+    ratioDirection(requiredRatio(0.25) - 4).code === "surplus",
+    "required 3.0 vs a shipped 4.0 (above 3.0) is a SURPLUS",
+  );
+  // The same anchor across a spread of shipped ratios, which is the property the
+  // brief asked to be asserted: any shipped ratio below the requirement is a
+  // deficit, any above it a surplus.
+  let directionSpreadOk = true;
+  for (const shipped of [0.1, 0.5, 1, 1.875, 2, 2.9, 3.1, 5, 20]) {
+    const code = ratioDirection(requiredRatio(0.25) - shipped).code;
+    const expected = 3 - shipped > 0 ? "deficit" : 3 - shipped < 0 ? "surplus" : "balanced";
+    if (code !== expected) directionSpreadOk = false;
+  }
+  check(
+    directionSpreadOk,
+    "against required 3.0, every shipped ratio below it is a deficit and every one above it a surplus",
+  );
+
+  // The same property stated through the ALGEBRA, so it holds for any h and not
+  // only the anchor: the shipped ratio is too small exactly when h is below the
+  // break-even rate for that shipped ratio.
+  let algebraOk = true;
+  for (const shipped of [0.5, 0.8, 1.875, 3]) {
+    for (let h = 0.02; h < 1; h += 0.02) {
+      const required = requiredRatio(h);
+      const code = ratioDirection(required - shipped).code;
+      const belowBreakEven = h < 1 / (1 + shipped);
+      // A LARGER ratio demands a HIGHER hit rate: h under the rate shippedRatio
+      // demands means the shipped ratio is TOO SMALL, i.e. a deficit.
+      const expected = belowBreakEven ? "deficit" : h > 1 / (1 + shipped) ? "surplus" : "balanced";
+      if (code !== expected) algebraOk = false;
+    }
+  }
+  check(
+    algebraOk,
+    "the direction agrees with the break-even algebra at every h and every shipped ratio tested — " +
+      "a larger ratio demands a higher hit rate, so a lower h means the shipped ratio is too small",
+  );
+
+  // Sign conventions, including the boundary the first version got wrong twice.
+  check(ratioDirection(0).code === "balanced", "an exactly matched ratio is BALANCED, not a deficit");
+  check(ratioDirection(null).code === "n/a", "a null gap labels n/a rather than guessing a direction");
+  check(
+    ratioDirection(0.0000001).code === "deficit" && ratioDirection(-0.0000001).code === "surplus",
+    "the sign is honoured right up to the boundary: a hair above is a deficit, a hair below a surplus",
+  );
+  // h = 0 has an infinite requirement, which is above any shipped ratio, so it is
+  // a DEFICIT. Labelling it anything else would leave the direction to inference.
+  check(
+    ratioDirection(null, true).code === "deficit" && ratioDirection(null, true).word.startsWith("DEFICIT"),
+    "h = 0 (unbounded requirement) is labelled a DEFICIT, since infinite is above any shipped ratio",
+  );
+  check(
+    ratioDirection(null, false).code === "n/a",
+    "unbounded is an explicit flag, not inferred from a null gap — an unknown gap stays n/a",
+  );
+  // The words must carry the reasoning, not just the label, so a reader skimming
+  // the word alone cannot invert it.
+  check(
+    /TOO SMALL/.test(ratioDirection(0.5).reason) && /ABOVE/.test(ratioDirection(0.5).reason),
+    "the deficit reason states the shipped ratio is TOO SMALL and the requirement is ABOVE it",
+  );
+  check(
+    /LARGER/.test(ratioDirection(-0.5).reason) && /BELOW/.test(ratioDirection(-0.5).reason),
+    "the surplus reason states the shipped ratio is LARGER and the requirement is BELOW it",
+  );
+  check(
+    ratioDirection(0.5).label.includes("TOO SMALL") && ratioDirection(-0.5).label.includes("LARGER"),
+    "the table label repeats the reasoning in words, so the word cannot be inverted by skimming",
+  );
+  // One source of truth: the wiring section below asserts that ratio.mjs derives
+  // the direction through ratioDirection() rather than re-inferring the sign.
+
   // ── CI propagation through the required ratio ───────────────────────────
   //
   // A population of 20 known labels: 12 wins, 8 losses. Resampling WITH
@@ -3330,6 +3426,36 @@ sec("exit-ratio");
   check(
     ratioSrc.includes("SELECTION EFFECT") && ratioSrc.includes("ONE ARBITRARY"),
     "the selection effect of keeping one signal per window is stated, not implied",
+  );
+  // One source of truth for the direction word. The first version derived it
+  // inline from `gap > 0` while phrasing the sentence from `shipped - required`,
+  // and shipped the inverse of its own documented rule on every grid. The sign
+  // must now be interpreted in exactly one place.
+  check(
+    /directionCode: d\.code/.test(ratioSrc) &&
+      /return\s*\{[^}]*code: "deficit"/.test(ratioSrc) &&
+      /if \(gap > 0\)/.test(ratioSrc),
+    "ratioDirection() is the single place where the gap sign becomes a word",
+  );
+  check(
+    !/gap > 0[\s\S]{0,200}surplus/.test(ratioSrc.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "")),
+    "no branch anywhere maps a POSITIVE gap to the word surplus — that was the inversion",
+  );
+  check(
+    !/gap < 0[\s\S]{0,200}deficit/.test(ratioSrc.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "")),
+    "no branch anywhere maps a NEGATIVE gap to the word deficit",
+  );
+  // Every caller goes through the function, so a scope row, a horizon row and the
+  // verdict cannot disagree about sign.
+  check(
+    ratioSrc.includes("ratioDirection(") &&
+      (ratioSrc.match(/ratioDirection\(/g) || []).length >= 4,
+    `the scope table, the horizon table and the verdict all call ratioDirection() ` +
+      `(${(ratioSrc.match(/ratioDirection\(/g) || []).length} call sites) — one sign convention`,
+  );
+  check(
+    ratioSrc.includes("gapDefinition"),
+    "the JSON states the gap's sign convention explicitly, so a consumer cannot read it backwards",
   );
   check(
     ratioSrc.includes("0.10 round trip") || ratioSrc.includes("D4_ROUND_TRIP_COMMISSION_PCT"),

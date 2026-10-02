@@ -581,6 +581,49 @@ confirmation of it.
 comparison**, because the model comparison is indeterminate and the
 expectancy finding is not.
 
+### T17 — Exit-ratio analysis on non-overlapping samples ✅ (in progress, slice 9 · GitHub PR #21)
+
+*(Inserted after the maintainer's decision of 2026-10-01, which chose the exit
+ratio over the weight search. Numbered after T16 because the findings report
+is what made it the obvious next step.)*
+
+**Why this outranks T12.** The report's arithmetic: D.4's `1.5 / 0.8` requires
+`h ≥ 0.8 / (1.5 + 0.8) = 34.78%` to break even. On 1h the measured rates are
+31.25% (weighted) and 33.75% (binary) — **both below what their own exit rule
+requires.** The ratio may be the binding constraint, and it was never searched
+because it was treated as fixed.
+
+- [ ] Build a sample whose observations are **independent by construction**:
+  partition each grid into non-overlapping forward windows and take **at most
+  one signal per model per side per window**. A sweep over the existing
+  dependent signals would be fitting noise, which is the exact failure this
+  project exists to avoid. State which signal was selected and why — the
+  choice is itself a selection effect.
+- [ ] Report how much signal the independence costs. On 1h the ceiling is
+  roughly `bars / 288` ≈ 152 per model per side, against 307 and 1,701
+  dependent signals. **Small but honest beats large and not.**
+- [ ] Hit rate per model per side with a bootstrap CI that is now legitimately
+  computable, and a plain statement if the count falls below ~30.
+- [ ] Break-even analysis: the ratio each model's observed `h` would require,
+  with the CI propagated, so the reader gets a **range** rather than a fragile
+  point estimate. Compare it against D.4's current `T/S = 1.875`.
+- [ ] The expectancy surface over `(target, stop)` around 1.5 / 0.8, within
+  D.4's own `minval`/`maxval` bounds — **printed as a surface, with the
+  zero-crossing identified and its uncertainty given. No "best" cell, and no
+  recommendation**: choosing the best cell of a sweep evaluated on one sample
+  is the overfitting this project guards against, and a recommendation would be
+  worse than no answer. If the crossing is inside the noise, say it is not
+  identified.
+- [ ] **The ratio/hold interaction nobody has looked at:** D.4 applies one
+  fixed ratio to whatever hold the label uses, but 288 bars is 24h on 5m,
+  288h on 1h and 1,152h on 4h. A 1.5% target over a day and over twelve days
+  are different trades. If the required ratio varies materially with horizon,
+  that is the finding.
+- [ ] Extend the caveats: costs are already modelled as 0.10% round trip before
+  slippage, so every expectancy here is an upper bound; and **taking one signal
+  per window is a selection effect** — it is the model's behaviour at one
+  arbitrary point per window, not a random draw.
+
 ### T12 — Weight search
 
 - [ ] Search over weight vectors and thresholds (random or coordinate search;
@@ -666,7 +709,8 @@ numbered by GitHub.
 | 6 | T14 | Liquidity tier diagnostic — closes C0's open question before T12 | ~200 |
 | 7 | T15 | Second timeframe: 1h + 4h datasets and the three-timeframe measurement | ~500 |
 | 8 | T16 + T13 | Dependence-aware comparison + findings report | ~450 |
-| 9 | T12 | Weight search (deferred — its objective depends on T13's recommendation) | ~450 |
+| 9 | T17 | Exit-ratio analysis on non-overlapping samples | ~450 |
+| 10 | T12 | Weight search (deferred — the report says search the ratio first) | ~450 |
 
 If slice 8 exceeds ~400, it splits into T16 (analysis) and T13 (report) — the
 report is documentation and can ship on its own.
@@ -801,9 +845,20 @@ to the non-tier factors, or higher-timeframe data must be used.
       toward a bar that may be unreachable fits noise. The binding constraint
       appears to be the **exit ratio, not the weights**, and it was never
       searched because it was treated as fixed.
-- [ ] T12 — weight search (**deferred to slice 9, and the report says why**:
-      search the target/stop ratio first, or shorten the horizon so the
-      comparison is computable at all)
+- [ ] **T17 — slice 9 in progress** (exit-ratio analysis on non-overlapping
+      samples), chosen by the user over the weight search on 2026-10-01 after
+      the report showed D.4's 1.5/0.8 requires a 34.78% hit rate that neither
+      model reaches on 1h. **Orchestrator changed the method, not just the
+      scope**: a ratio sweep on the existing signals would be fitting noise,
+      because slice 8 proved those signals are one measurement repeated. The
+      sample is rebuilt as **at most one signal per forward window per model per
+      side** — on 1h roughly 152 observations instead of 1,701. Small but
+      honest. The slice is required to report the zero-crossing of the
+      expectancy surface and is **explicitly forbidden from recommending a
+      ratio**, because picking the best cell of a sweep on one sample is the
+      overfitting this project exists to prevent.
+- [ ] T12 — weight search (**deferred to slice 10, and the report says why**:
+      optimising 11 parameters toward a bar that may be unreachable fits noise)
 - [ ] T13 — findings report
 - [ ] Findings reported
 

@@ -294,6 +294,92 @@ export function currentRatio() {
   return EXIT_TARGET_PCT / EXIT_STOP_PCT;
 }
 
+// ─── The direction of the gap ────────────────────────────────────────────────
+
+/**
+ * THE RULE, IN ONE PLACE. Labels how the SHIPPED ratio compares with the ratio
+ * the observed hit rate requires.
+ *
+ * `gap` is `requiredRatio(h) - shippedRatio`. The sign convention is stated in
+ * the parameter's name rather than left to be remembered, because getting it
+ * backwards is the single easiest way to print a confident, wrong direction.
+ *
+ *   required > shipped  -> the shipped ratio is TOO SMALL for the accuracy
+ *                          observed: a DEFICIT. The shipped pair demands a hit
+ *                          rate this sample does not reach.
+ *   required < shipped  -> the shipped ratio is LARGER than this accuracy needs:
+ *                          a SURPLUS. The shipped pair demands less of this
+ *                          sample than it delivers.
+ *   required = shipped  -> exactly matched; neither word applies.
+ *
+ * `unbounded` covers the h = 0 case, where the required ratio is infinite. An
+ * infinite requirement is above any shipped ratio, so it is a DEFICIT and is
+ * labelled as one — "unbounded" alone would have left the reader to infer the
+ * direction.
+ *
+ * WHY THIS EXISTS AS A FUNCTION. The first version of this report derived the
+ * word inline from `gap > 0` while phrasing the sentence from the perspective of
+ * `shipped - required`, and shipped the INVERSE of its own documented rule on
+ * every grid. Deriving both the code and the words here makes the mapping
+ * testable in isolation (see the smoke section) rather than only visible in
+ * rendered output.
+ *
+ * @param {number|null} gap requiredRatio(h) - shippedRatio.
+ * @param {boolean} unbounded true when h = 0 and the requirement is infinite.
+ * @returns {{code: string, word: string, label: string, reason: string, short: string}}
+ */
+export function ratioDirection(gap, unbounded = false) {
+  if (unbounded) {
+    return {
+      code: "deficit",
+      word: "DEFICIT (unbounded)",
+      label: "DEFICIT (unbounded) — no finite ratio breaks even at h = 0",
+      reason:
+        "the requirement is unbounded, since no finite ratio breaks even at h = 0, so the shipped " +
+        "ratio is too small by an unbounded margin",
+      short: "cannot break even at all at h = 0, so no finite shipped ratio is enough",
+    };
+  }
+  if (gap === null || gap === undefined) {
+    return {
+      code: "n/a",
+      word: "n/a",
+      label: "n/a",
+      reason: "no required ratio is defined for this sample, so no direction can be labelled",
+      short: "no required ratio is defined for this sample",
+    };
+  }
+  if (gap > 0) {
+    return {
+      code: "deficit",
+      word: "DEFICIT",
+      label: "DEFICIT — shipped ratio is TOO SMALL for this accuracy",
+      reason:
+        "the shipped ratio is TOO SMALL for the accuracy observed, which requires a ratio ABOVE " +
+        "the shipped one",
+      short: "is TOO SMALL for the accuracy observed, which requires a ratio ABOVE the shipped one",
+    };
+  }
+  if (gap < 0) {
+    return {
+      code: "surplus",
+      word: "SURPLUS",
+      label: "SURPLUS — shipped ratio is LARGER than this accuracy needs",
+      reason:
+        "the shipped ratio is LARGER than this accuracy needs, which requires a ratio BELOW the " +
+        "shipped one",
+      short: "is LARGER than this accuracy needs, which requires a ratio BELOW the shipped one",
+    };
+  }
+  return {
+    code: "balanced",
+    word: "BALANCED",
+    label: "BALANCED — shipped ratio exactly matches this accuracy",
+    reason: "the shipped ratio exactly matches what the observed accuracy requires",
+    short: "exactly matches what the observed accuracy requires",
+  };
+}
+
 /**
  * requiredRatio() that reports UNDEFINED rather than throwing.
  *
@@ -908,17 +994,22 @@ function analyseScope(labelCandles, signals, side, maxHorizonBars, iterations, s
       mean: reqCi.mean,
       draws: reqCi.draws,
       currentRatio: round(currentRatio(), 4),
-      // Negative gap: the current ratio is SMALLER than the observed accuracy
-      // can carry, i.e. too small a reward for the risk taken.
+      // `gap` is requiredRatio(h) - shippedRatio. A POSITIVE gap therefore means
+      // the shipped ratio is TOO SMALL for the accuracy observed — a deficit.
+      // The word is NOT derived inline from the sign here; ratioDirection() owns
+      // the mapping so the rule lives in exactly one place and is testable.
       gap: gap === null ? null : round(gap, 4),
-      direction:
-        gap === null
-          ? hPoint === 0
-            ? "UNBOUNDED — no finite ratio breaks even at h = 0"
-            : "n/a"
-          : gap > 0
-            ? "current ratio EXCEEDS the required ratio (surplus)"
-            : "current ratio is BELOW the required ratio (deficit)",
+      gapDefinition: "requiredRatio(h) - currentRatio; positive means the shipped ratio is too small",
+      ...(() => {
+        const d = ratioDirection(gap, hPoint === 0);
+        return {
+          directionCode: d.code,
+          direction: d.word,
+          directionText: d.reason,
+          directionLabel: d.label,
+          directionShort: d.short,
+        };
+      })(),
       intervalEntirelyBelowCurrentRatio: reqCi.hi === null ? null : reqCi.hi < currentRatio(),
       intervalEntirelyAboveCurrentRatio: reqCi.lo === null ? null : reqCi.lo > currentRatio(),
     },
@@ -1275,20 +1366,25 @@ function buildVerdict(scopes, identifiedCrossings, byHorizon) {
     const below = s.breakeven.wholeIntervalBelowRequired;
     const req = s.requiredRatio;
     const reqSentence = req.unbounded
-      ? "This sample never won, so NO finite ratio breaks even and the requirement is unbounded."
+      ? `This sample never won, so NO finite ratio breaks even — a ${req.direction}, because ` +
+        `${req.directionText}.`
       : `The observed accuracy would carry a ratio of ${rat(req.point)} ` +
         `[${rat(req.ciLo)}, ${rat(req.ciHi)}] against the shipped ${rat(req.currentRatio)} — ` +
-        `${req.direction.toLowerCase()} of ${rat(Math.abs(req.gap))}.`;
+        `that is a ${req.direction} of ${rat(Math.abs(req.gap))}, because ${req.directionText}.`;
     lines.push(
       `${model}: expectancy ${spct(s.breakeven.expectancyPercentPerTrade)} per resolved trade gross ` +
         `(${spct(s.breakeven.expectancyAfterCommissionPercent)} after D.4's declared commission). ` +
+        // The word "deficit" below means a HIT-RATE deficit (h under the rate
+        // this ratio demands). The ratio-direction sentence above uses the same
+        // word for a RATIO deficit (the shipped ratio under what h requires).
+        // The two are named apart so a reader cannot carry one into the other.
         (below === true
-          ? `The whole 95% hit-rate interval lies BELOW the required ${be.toFixed(2)}%, so the deficit is ` +
-            "established independently of the point estimate. "
+          ? `The whole 95% hit-rate interval lies BELOW the required ${be.toFixed(2)}%, so the ` +
+            "HIT-RATE deficit is established independently of the point estimate. "
           : below === false
-            ? `The hit-rate interval OVERLAPS the required ${be.toFixed(2)}%, so the deficit is NOT ` +
-              "established at 95%. "
-            : "No interval is available, so no deficit verdict is claimed. ") +
+            ? `The hit-rate interval OVERLAPS the required ${be.toFixed(2)}%, so the HIT-RATE deficit ` +
+              "is NOT established at 95%. "
+            : "No interval is available, so no hit-rate deficit verdict is claimed. ") +
         reqSentence,
     );
   }
@@ -1319,11 +1415,24 @@ function buildVerdict(scopes, identifiedCrossings, byHorizon) {
     if (rowsForModel.length < 2) continue;
     const min = rowsForModel.reduce((a, b) => (a.requiredRatio < b.requiredRatio ? a : b));
     const max = rowsForModel.reduce((a, b) => (a.requiredRatio > b.requiredRatio ? a : b));
+    const shipped = currentRatio();
+    const lowDir = ratioDirection(min.requiredRatio - shipped);
+    const highDir = ratioDirection(max.requiredRatio - shipped);
+    // Two horizons can sit on the same side of the shipped ratio, and then
+    // there is only ONE direction to report. Saying "a deficit ... and a deficit"
+    // would read as two findings when there is one.
+    const directionSentence =
+      lowDir.code === highDir.code
+        ? `At every horizon sampled the shipped ratio is a ${lowDir.word} — it ${lowDir.short}.`
+        : `At the lowest required ratio sampled the shipped ratio is a ${lowDir.word}, and at the ` +
+          `highest a ${highDir.word}. The hold range therefore crosses the shipped ratio: this ` +
+          "accuracy needs a LARGER ratio at one end and a SMALLER one at the other, so a single " +
+          "shipped ratio suits neither end equally.";
     lines.push(
       `Hold: on ${model} the required ratio ranges from ${rat(min.requiredRatio)} at ` +
         `${int(min.horizonBars)} bars to ${rat(max.requiredRatio)} at ${int(max.horizonBars)} bars ` +
-        `across the horizons sampled, against a shipped ${rat(currentRatio())}. One fixed ratio is ` +
-        "being applied to holds that differ by an order of magnitude.",
+        `across the horizons sampled, against a shipped ${rat(shipped)}. ${directionSentence} ` +
+        "One fixed ratio is being applied to holds that differ by an order of magnitude.",
     );
   }
 
@@ -1455,7 +1564,7 @@ function printReport(r) {
   out("");
   out(
     `  ${padL("scope", 8)}${padL("model", 10)}${padR("T/S needed", 11)}${padR("95% CI", 24)}` +
-      `${padR("shipped", 9)}  ${padR("gap", 11)}  ${padR("CI below shipped?", 17)}  direction`,
+      `${padR("shipped", 9)}  ${padR("gap (req-ship)", 11)}  ${padR("req CI < shipped?", 17)}  direction`,
   );
   for (const scopeName of ["all", "long", "short"]) {
     for (const model of ["weighted", "binary"]) {
@@ -1466,27 +1575,29 @@ function printReport(r) {
           `${padR(rat(req.currentRatio), 9)}  ` +
           `${padR(req.gap === null ? "n/a" : req.gap.toFixed(3), 11)}  ` +
           `${padR(req.ciHi === null ? "n/a" : yesNo(req.intervalEntirelyBelowCurrentRatio), 17)}  ` +
-          `${req.direction ?? "n/a"}`,
+          `${req.directionLabel ?? "n/a"}`,
       );
     }
   }
   out("");
+  out("  The direction rule, stated in both directions because it is the easiest thing here to invert:");
+  out("  a LARGER target/stop ratio demands a HIGHER hit rate. So a required ratio ABOVE the shipped");
+  out("  1.875 means the shipped ratio is TOO SMALL for the accuracy observed — a DEFICIT. A required");
+  out("  ratio BELOW the shipped 1.875 means the shipped ratio is LARGER than this accuracy needs — a");
+  out("  SURPLUS. The `gap` column is (required - shipped), so a POSITIVE gap is a deficit.");
   out(
-    "  Direction matters and is easy to invert: a LARGER target/stop ratio demands a HIGHER hit " +
-      "rate, so",
+    "  Note the two uses of \"deficit\": the HIT-RATE deficit in section 2 is h below the rate this " +
+      "ratio demands, and",
   );
   out(
-    "  a required ratio ABOVE the shipped 1.875 means the shipped ratio is TOO SMALL for the " +
-      "accuracy",
+    "  the RATIO deficit here is the shipped ratio below what h requires. They are different quantities",
   );
+  out("  and neither is read off the other.");
   out(
-    "  actually observed. The CI is propagated from the bootstrap DRAWS, not from the endpoints " +
-      "of h's",
+    "  The CI is propagated from the bootstrap DRAWS, not from the endpoints of h's interval: " +
+      "(1-h)/h is",
   );
-  out(
-    "  interval: (1-h)/h is strongly convex in h, so an endpoint-wise transform would understate " +
-      "the width.",
-  );
+  out("  strongly convex in h, so an endpoint-wise transform would understate the width.");
 
   // ── 3. The expectancy surface ─────────────────────────────────────────────
   out("");
@@ -1621,10 +1732,17 @@ function printReport(r) {
   out("");
   out(
     `  ${padL("model", 10)}${padR("horizon", 9)}${padR("hold h", 9)}${padR("obs", 6)}${padR("resolved", 10)}` +
-      `${padR("h %", 9)}${padR("95% CI", 20)}${padR("E/trade", 11)}${padR("net comm.", 11)}${padR("T/S needed", 11)}${padR("CI", 22)}`,
+      `${padR("h %", 9)}${padR("95% CI", 20)}${padR("E/trade", 11)}${padR("net comm.", 11)}${padR("T/S needed", 11)}${padR("CI", 22)}${padR("  vs shipped", 12)}`,
   );
   for (const row of r.byHorizon) {
     const holdHours = (row.horizonBars * r.timeframe.minutesPerBar) / 60;
+    // The direction word comes from the SAME ratioDirection() the scope table
+    // uses, so a horizon row cannot carry the opposite sign convention to the
+    // scope above it. The gap is derived here rather than stored, and it is the
+    // identical quantity: requiredRatio(h) - shipped ratio.
+    const dir = ratioDirection(
+      row.requiredRatio === null ? null : row.requiredRatio - currentRatio(),
+    );
     out(
       `  ${padL(row.model, 10)}${padR(int(row.horizonBars), 9)}${padR(holdHours.toFixed(1), 9)}` +
         `${padR(int(row.observations), 6)}${padR(int(row.resolved), 10)}` +
@@ -1632,10 +1750,20 @@ function printReport(r) {
         `${padR(row.eligible ? ci(row.hitRateCi[0], row.hitRateCi[1]) : "not reported", 20)}` +
         `${padR(spct(row.expectancyPercent), 11)}${padR(spct(row.expectancyAfterCommissionPercent), 11)}` +
         `${padR(rat(row.requiredRatio), 11)}` +
-        `${padR(row.requiredRatioCi[0] === null ? "not reported" : `[${rat(row.requiredRatioCi[0])}, ${rat(row.requiredRatioCi[1])}]`, 22)}`,
+        `${padR(row.requiredRatioCi[0] === null ? "not reported" : `[${rat(row.requiredRatioCi[0])}, ${rat(row.requiredRatioCi[1])}]`, 22)}` +
+        `${padR(dir.word, 12)}`,
     );
   }
   out("");
+  out(
+    "  \"vs shipped\" applies the same rule as section 2 — DEFICIT means the shipped 1.875 is too " +
+      "small for",
+  );
+  out(
+    "  that hold's accuracy, SURPLUS means it is larger than that hold's accuracy needs. It is " +
+      "computed from",
+  );
+  out("  the same function, so the two tables cannot disagree about sign.");
   out(
     "  Each row re-labels at its own cap, so the resolved population CHANGES with the horizon: a " +
       "shorter",

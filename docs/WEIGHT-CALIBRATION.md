@@ -15,7 +15,7 @@ This document reports what a local harness measured. It does not change the indi
 **What *was* established, and is actionable:**
 
 1. **Both models have negative mean forward returns at every horizon measured.** On five years of 1h data, a signal from either model is followed by price moving *against* you on average. Weighted: −0.51% mean at 24 bars. Binary: −0.11% mean at 24 bars. Neither is positive anywhere on the horizon grid (section 5).
-2. **The D.4 exit rule needs a 34.78% hit rate to break even.** At a 1.5% target and a 0.8% stop, `break_even = 0.8 / (1.5 + 0.8) = 34.78%`. Neither model reached it on any timeframe (section 5).
+2. **The D.4 exit rule needs a 34.78% hit rate to break even.** At a 1.5% target and a 0.8% stop, `break_even = 0.8 / (1.5 + 0.8) = 34.78%`. On a properly independent sample **neither model is shown to sit above or below it** (section 5.2). *(Revised 2026-10-01 after slice 9: the first version of this line read "neither model reached it on any timeframe", which the dependent signal set implied and the independent sample does not support.)*
 3. **On 5-minute charts the indicator effectively never fires.** Two signals in 215 days. If it is read on a 5m chart, the shipped threshold is not a threshold — it is a wall (section 3).
 
 ---
@@ -107,38 +107,50 @@ Mean signed forward return after a signal, 1h dataset, five years. Positive mean
 
 **Neither model is positive at any horizon.** The intervals on the *difference* exclude zero in binary's favour at 12–96 bars, so binary is measurably less bad on this instrument — but "less bad" is the whole claim. Note the shorter horizons are exactly the ones that are computable, because a shorter window clusters less; that is a different measurement from the 288-bar D.4 question, not a confirmation of it.
 
-### 5.2 The exit rule needs a hit rate neither model reaches
+### 5.2 The exit rule needs 34.78% — and on an honest sample neither model is shown to miss it
 
-This is arithmetic, not measurement. With D.4's own parameters — target 1.5%, stop 0.8% — the break-even hit rate is:
+> **Revised 2026-10-01, after slice 9.** The version published with slice 8 read:
+>
+> *"On 1h — the grid where the tier is live and the sample is meaningful — **both models sit below break-even.**"*
+>
+> **That was computed on the dependent signal set, and slice 9 shows it does not hold.** The hit rates behind it (31.25% / 33.75%) carry 307 and 1,701 signals whose 288-bar forward windows overlap almost completely — section 4 established those are effectively **one observation each**. Rebuilding the sample to be independent by construction **reverses the sign**.
 
-```
-0.8 / (1.5 + 0.8) = 34.78%
-```
-
-| grid | weighted | binary | break-even |
-|---|---|---|---|
-| 5m | 0.00% *(n=2)* | 41.59% *(n=133)* | 34.78% |
-| 1h | **31.25%** *(n=307)* | **33.75%** *(n=1,701)* | 34.78% |
-| 4h | 42.22% *(n=49)* | 31.02% *(n=446)* | 34.78% |
-
-On 1h — the grid where the tier is live and the sample is meaningful — **both models sit below break-even.** Per resolved trade, before any cost:
+The arithmetic is unchanged and is not in dispute:
 
 ```
-weighted   0.3125 × 1.5%  −  0.6875 × 0.8%  =  −0.08%
-binary     0.3375 × 1.5%  −  0.6625 × 0.8%  =  −0.02%
+break-even hit rate for target 1.5% / stop 0.8%  =  0.8 / (1.5 + 0.8)  =  34.78%
 ```
 
-And D.4's own strategy declares `commission_value=0.05` and `slippage=2`, i.e. **0.10% round trip before slippage.** Every hit rate in this document is therefore an upper bound on realised performance.
+On the independent sample — at most one signal per model per side per non-overlapping 288-bar window, selecting the **earliest** entry bar (the only selection rule that cannot see the outcome):
 
-**The one place the numbers point toward binary, stated rather than buried:** on **5m**, binary's 41.59% *does* clear the 34.78% bar, implying **+0.16% per resolved trade** before costs — the only positive expectancy computed anywhere in this work. Three things stop it from being a conclusion:
+| grid | scope | weighted | binary | required |
+|---|---|---|---|---|
+| 1h | all | 30.77% [22.90, 38.93] *(130 resolved)* | **38.82% [31.37, 46.71]** *(152 resolved)* | 34.78% |
+| 1h | long | 31.58% [22.34, 41.05] | 38.00% [30.20, 45.70] | 34.78% |
+| 1h | short | 29.67% [20.65, 39.13] | 38.26% [30.61, 45.95] | 34.78% |
+| 5m | all | *not reported* *(n=1)* | 40.63% [28.79, 53.03] | 34.78% |
+| 4h | all | *not reported* *(n=20)* | 21.05% [8.33, 34.21] | 34.78% |
 
-- it rests on **133 signals over 215 days**, against 1,701 over five years on 1h;
-- 288 bars there is a **24-hour hold**, not the 12-day hold the 1h run measures, so it is not the same trade;
-- the 5m dataset is the one where the tier geometry makes the *weighted* model's score meaningless, so the row it would beat is not a meaningful comparison.
+**Binary's 1h point estimate is above the requirement; weighted's is below. Neither is established** — both intervals contain 34.78%. The only scope whose whole interval sits outside the requirement is 4h binary, and it carries 38 observations.
 
-It is a lead worth following, not evidence. Following it means re-running 5m over five years with a 24-hour label, which is cheap.
+What did survive is that **the cost of being wrong is enough to matter.** Gross expectancy per resolved trade on 1h is −0.09% (weighted) and +0.09% (binary); after D.4's own declared commission — 0.05% per side, a 0.10% round trip — **both are negative**, −0.19% and −0.01%, and `slippage=2` is not modelled on top of that.
 
-**Stated carefully:** the break-even rate is arithmetic; the observed hit rates are descriptive ratios over dependent observations whose uncertainty cannot be quantified. What can be said without hedging is that **the measured rate is below the required rate**, and that this is true of both models.
+### 5.3 The exit ratio is not the binding constraint — but the *hold* it is applied to is wrong
+
+Two results from slice 9, in opposite directions.
+
+**The ratio hypothesis did not survive.** The zero crossing of the expectancy surface was **not identified on any grid** — 0 of 24 sweeps across both models and all three timeframes, because no cell's whole interval sits below zero while its neighbour's whole interval sits above it. No ratio is recommended here and none should be read into the span printed by the tool: choosing the best cell of a sweep evaluated on one sample is precisely the overfitting this project exists to prevent.
+
+**The ratio/hold interaction did.** One fixed `T/S = 1.875` is being applied to holds that differ by an order of magnitude — 288 bars is 24h on 5m, 288h on 1h, 1,152h on 4h. The ratio the observed accuracy would require moves with the horizon:
+
+| | 6 bars | 12 | 24 | 48 | 96/288 | shipped |
+|---|---|---|---|---|---|---|
+| 1h weighted | **2.577** | 2.206 | 2.211 | **2.200** | 2.250 | 1.875 |
+| 1h binary | 1.594 | **1.533** | — | 1.576 | 1.576 | 1.875 |
+
+The **direction** is visible — a 1.5% target over six hours and a 1.5% target over two days are not the same trade — but the **magnitude is not pinned**, because the intervals at the extremes overlap heavily. Each row re-labels at its own horizon cap, so the rows are **not nested samples** and the count per row is the honest denominator.
+
+**So the ratio is not established as the problem. The absence of a single correct ratio across holds is.**
 
 ---
 
@@ -155,13 +167,15 @@ It is a lead worth following, not evidence. Following it means re-running 5m ove
 
 ---
 
-## 7. The finding nobody was looking for
+## 7. The hypothesis that was tested and did not survive — and what replaced it
 
-**The exit parameters may matter more than the weights.**
+**The claim this section originally made was: "the exit parameters may matter more than the weights."**
 
-This work held target/stop fixed at the spec's D.4 example values and treated the weights as the variable. The arithmetic above says a 1.5%/0.8% ratio demands 34.78% accuracy from a system whose observed accuracy is 31–34%. **A weight search under that ratio would be optimising against a target the signal may not be able to reach at any setting.**
+Slice 9 tested it and it did **not** survive. The arithmetic that motivated it is unchanged — a 1.5%/0.8% ratio demands 34.78% accuracy — but the accuracy it was compared against came from dependent signals. On an independent sample **neither model is established above or below 34.78%** (section 5.2), and the expectancy surface's zero crossing **could not be identified on any grid** (section 5.3). A weight search is therefore not demonstrably optimising against an unreachable target after all: **that premise is now unsupported rather than confirmed.**
 
-The ratio, not the weights, is the first thing worth revisiting — and it was never searched, because it was treated as fixed.
+**What replaced it is narrower and better supported:** not that the ratio is wrong, but that **one ratio is being applied to holds that differ by an order of magnitude.** The ratio the observed accuracy would require moves with the horizon (section 5.3). A ratio is not a property of a strategy in the abstract; it is a property of a strategy **at a given holding period**, and D.4 fixes both without ever relating them.
+
+That is a smaller claim than "the exit ratio is the problem". It is also the one the evidence actually supports, and unlike the original it does not depend on a comparison that cannot be made.
 
 ---
 
@@ -170,7 +184,7 @@ The ratio, not the weights, is the first thing worth revisiting — and it was n
 In rough order of cost:
 
 1. **Re-run the comparison with a shorter horizon.** At 48–96 bars the joint partition has 46–196 clusters and intervals become computable. That is a different question with an answerable one.
-2. **Search the target/stop ratio, not the weights** (section 7). This is where the binding constraint appears to be.
+2. **Relate the exit ratio to the holding period** (sections 5.3 and 7). The ratio the observed accuracy requires moves with the horizon, and D.4 fixes target, stop and hold independently. This is now the strongest remaining lead — not "the ratio is wrong", but "one ratio is being applied to trades that are not the same trade".
 3. **Sample non-overlapping windows** — take one signal per 288-bar window per model. Halves the sample, removes the dependence, makes the interval honest.
 4. **Route A** — the spec's own `strategy()` variant in TradingView, with real fills, real commission and real slippage. This is the only instrument in the project that reports P&L rather than a descriptive ratio, and it remains the planned verification step.
 
@@ -187,8 +201,8 @@ The spec argues for binary on *discipline* grounds — "*a missing factor means 
 What this work does justify saying plainly:
 
 - **On 5-minute charts the indicator does not function** at the shipped threshold. Two signals in 215 days. If 5m is a timeframe anyone reads it on, that is a bug report, not a tuning question.
-- **On 1h the signal's raw expectancy is negative**, for both models, at every horizon.
-- **The first thing to investigate is the 1.5%/0.8% exit ratio**, because it sets a 34.78% bar that neither model clears.
+- **On 1h the signal's raw expectancy is negative**, for both models, at every horizon, and **negative for both after D.4's own declared commission** — the one result that survived every caveat in this document.
+- **A ratio is not a property of a strategy; it is a property of a strategy at a given hold.** The ratio the observed accuracy requires moves with the horizon, and the shipped 1.875 is applied unchanged to a 24-hour trade and a 12-day one. That mismatch is the strongest remaining lead, and it was never examined because the ratio was treated as fixed.
 
 ---
 
