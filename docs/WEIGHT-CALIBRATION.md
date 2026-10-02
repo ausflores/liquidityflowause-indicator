@@ -1,8 +1,8 @@
 # Weight Calibration — findings
 
-**Date:** 2026-10-01
+**Date:** 2026-10-01 · **Closed:** 2026-10-02
 **Subject:** Do the Signal Engine's weighted scores (10 weights, max 110, threshold 70) beat the binary confluence model proposed in `technical-spec.md` D.1?
-**Status of the answer:** **the evidence does not separate them, and it separately shows both lose money on this data.** Both halves of that sentence matter, and the second one is the actionable part.
+**Status of the answer:** **the evidence does not separate them, and it separately shows both lose money on this data.** Both halves matter, and the second is the actionable part. The measurement line is closed — see §9a for why that is a result rather than an abandonment.
 
 This document reports what a local harness measured. It does not change the indicator, and it does not recommend a new weight vector, because the evidence does not support one.
 
@@ -179,16 +179,23 @@ That is a smaller claim than "the exit ratio is the problem". It is also the one
 
 ---
 
-## 8. What would settle it
+## 8. What would settle it — and what has already been ruled out
 
-In rough order of cost:
+> **Updated 2026-10-02, after slice 10.** Items 1 and 3 below were **attempted and failed**. This section now records what was tried, because the negative result is what closes the feature.
 
-1. **Re-run the comparison with a shorter horizon.** At 48–96 bars the joint partition has 46–196 clusters and intervals become computable. That is a different question with an answerable one.
-2. **Relate the exit ratio to the holding period** (sections 5.3 and 7). The ratio the observed accuracy requires moves with the horizon, and D.4 fixes target, stop and hold independently. This is now the strongest remaining lead — not "the ratio is wrong", but "one ratio is being applied to trades that are not the same trade".
-3. **Sample non-overlapping windows** — take one signal per 288-bar window per model. Halves the sample, removes the dependence, makes the interval honest.
-4. **Route A** — the spec's own `strategy()` variant in TradingView, with real fills, real commission and real slippage. This is the only instrument in the project that reports P&L rather than a descriptive ratio, and it remains the planned verification step.
+**Tried, and it does not work:**
 
-The weight search itself (`search`, still a stub) should **not** run before 1–3 narrow the question, because optimising 11 parameters toward a target that may be unreachable produces a vector that fits noise.
+1. ~~**Re-run the comparison with a shorter horizon.**~~ **Attempted.** The hypothesis was that independence cost is dominated by window length — `bars / horizon` caps the independent sample at 153 at 288 bars, but ~1,834 at 24 and ~3,667 at 12. **Refuted:** the binding limit is **signal density**, not partition width. The weighted model fires **307 times in 44,000 1h bars**, so its independent sample is capped at 307 at *every* horizon; at 12 bars it keeps all 307, the most this dataset can ever yield. Cutting the window 288 → 12 multiplies the ceiling 24× but buys only 2.3× the observations, because 3,360 windows are empty.
+3. ~~**Sample non-overlapping windows.**~~ **Done, in slices 9 and 10.** It works, and it is what made the measurement honest — and it is also what showed the answer is not coming. Detecting the ~2.5 pp gap needs **5,466 independent observations per model**; the 288-bar partition yields 130 resolved and the best horizon on the grid yields 260, **19× short**. At 288 bars, 5,466 observations is roughly **38 years** of 1h data. The tool prints the conclusion itself: the required n **exceeds the ceiling**, so the grid cannot answer this question at this horizon *however the model behaves*.
+
+**Across 5 horizons × 2 models × 3 grids, 0 of 480 expectancy-surface sweeps identify a zero crossing.** No weighted interval at any horizon excludes the 34.78% requirement. The single exclusion in the whole sweep — binary at 12 bars — is **1 hypothesis out of 10**, and it points *against* the hypothesis.
+
+**Still open, in rough order of cost:**
+
+2. **Relate the exit ratio to the holding period** (sections 5.3 and 7). Now stronger, not weaker: slice 10 showed the required ratio's **sign** flips across horizons, not only its magnitude (binary is in surplus at 288/96 bars and in deficit at 48/24/12). A ratio fitted at one horizon does not transfer to another, and D.4 fixes target, stop and hold independently.
+4. **Route A** — the spec's own `strategy()` variant in TradingView, with real fills, real commission and real slippage. The only instrument in this project that reports P&L rather than a descriptive ratio. **Remains the planned verification step and the only route to a definitive answer.**
+
+**Why the weight search (`search`, still a stub) should not run.** Not because the target may be unreachable — that premise was tested and is unsupported — but because its objective **cannot yet be measured**. Optimising 11 parameters against a comparison that is structurally indeterminate produces a vector that fits noise, and there is no instrument here that would tell us whether it did.
 
 ---
 
@@ -202,7 +209,30 @@ What this work does justify saying plainly:
 
 - **On 5-minute charts the indicator does not function** at the shipped threshold. Two signals in 215 days. If 5m is a timeframe anyone reads it on, that is a bug report, not a tuning question.
 - **On 1h the signal's raw expectancy is negative**, for both models, at every horizon, and **negative for both after D.4's own declared commission** — the one result that survived every caveat in this document.
-- **A ratio is not a property of a strategy; it is a property of a strategy at a given hold.** The ratio the observed accuracy requires moves with the horizon, and the shipped 1.875 is applied unchanged to a 24-hour trade and a 12-day one. That mismatch is the strongest remaining lead, and it was never examined because the ratio was treated as fixed.
+- **A ratio is not a property of a strategy; it is a property of a strategy at a given hold.** The ratio the observed accuracy requires moves with the horizon — **and so does its sign** — while the shipped 1.875 is applied unchanged to a 24-hour trade and a 12-day one. That mismatch is the strongest remaining lead, and it was never examined because the ratio was treated as fixed.
+
+---
+
+## 9a. Why this feature stopped here
+
+The measurement line is **bounded**, which is a stronger statement than "we ran out of ideas":
+
+| Slice | Question | Answer |
+|---|---|---|
+| 8 | Can weighted vs binary be compared at all? | **No** — binary's 1,701 signals on 1h are one cluster; +2.50 pp has no interval |
+| 9 | What if the sample is made independent? | It works — 130–307 observations — and **cannot detect a 2.5 pp gap** |
+| 10 | Does a shorter horizon supply more observations? | **No** — signal density binds; 307 is the cap at every horizon; 19× short at the best |
+
+Three slices, one per plausible lever, each closing rather than narrowing. Further horizon work has **no lever left to pull**. The only things that would change the answer are not measurements:
+
+- **A lower signal threshold.** More signals is the sole lever that raises weighted's ceiling above 307. This is a change to what the indicator *is*.
+- **≈38 years of 1h history** at the 288-bar horizon. Not a data-fetch task.
+- **A different question** — e.g. whether weighted is worse *conditional on binary firing*, which uses the windows both models share instead of comparing totals. That is a new analysis with a different estimator, not a re-run of this one.
+- **Route A.** Real fills, real commission, real slippage.
+
+The weight search stays a stub. Its premise — *"the exit target may be unreachable, so the weights cannot be tuned toward it"* — was tested in slice 9 and is **unsupported**. Its real blocker is different and worse: **the objective cannot yet be measured.** Running 11 parameters against an indeterminate comparison would produce a number, and nothing here could tell us whether it meant anything.
+
+**Closing the feature is the honest outcome.** It is not "no answer" — it is a specific, measured statement about which questions this design can and cannot answer, plus two findings that are actionable today: the 5m timeframe does not function at the shipped threshold, and negative expectancy survives costs on 1h.
 
 ---
 
@@ -215,7 +245,9 @@ node backtest/run.mjs baseline --timeframe 1h            # the grid that matters
 node backtest/run.mjs baseline --timeframe 4h
 node backtest/run.mjs diagnose --timeframe 1h            # tier reachability
 node backtest/run.mjs compare --timeframe 1h             # dependence-aware comparison
-node backtest/smoke.mjs                                  # 1,450 checks
+node backtest/run.mjs ratio --timeframe 1h               # exit ratio on an independent sample
+node backtest/run.mjs ratio --timeframe 1h --horizon 24  # power analysis at a shorter horizon
+node backtest/smoke.mjs                                  # 1,718 checks
 node scripts/build.mjs                                   # production SHA unchanged
 ```
 

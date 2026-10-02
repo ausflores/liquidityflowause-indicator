@@ -990,12 +990,26 @@ to the non-tier factors, or higher-timeframe data must be used.
       then shipped "twelve" by counting rows instead of distinct horizons,
       caught it on the next command, and fixed it. Verified at two horizon
       settings.
-- [ ] T12 — weight search (**deferred to slice 11, twice**). Its original
-      blocker — "the exit target may be unreachable" — is **no longer
-      established**, and slice 10 showed the objective still cannot be
-      *measured*. **The measurement line is now bounded**; see *Rationale*.
-- [ ] T13 — findings report
-- [ ] Findings reported
+- [x] **T12 — weight search: CONCLUDED, NOT RUN.** Deferred twice, then closed
+      on 2026-10-02 by maintainer decision. Its original blocker — *"the exit
+      target may be unreachable, so the weights cannot be tuned toward it"* —
+      was tested in slice 9 and is **unsupported**. Its real blocker is worse:
+      **the objective cannot be measured.** Optimising 11 parameters against a
+      comparison that is structurally indeterminate would produce a number, and
+      nothing in this harness could say whether it meant anything. `search`
+      stays a **stub on purpose** and is documented as such, so no future run
+      can read a placeholder as a result.
+- [x] **T13 — findings reported.** `docs/WEIGHT-CALIBRATION.md`, published at
+      slice 8 and **revised twice** (slice 9 refuted §5.2; slice 10 rewrote §8
+      and added §9a). The original text of every corrected claim is preserved
+      under a dated note rather than overwritten.
+- [x] **Feature closed 2026-10-02.** Twelve of twelve executable tasks
+      delivered, one (T12) concluded without execution. The measurement line is
+      **bounded**: slice 8 showed the comparison has no interval, slice 9 showed
+      an independent sample cannot detect a 2.5 pp gap, and slice 10 showed no
+      horizon supplies more observations. Three levers, each closed rather than
+      narrowed. **The only routes left are not measurements** — a lower signal
+      threshold, ~38 years of 1h history, a different question, or Route A.
 
 ### Forecast variance
 
@@ -1096,6 +1110,14 @@ rather than forcing a cosmetic split.
 
 ## Rationale
 
+- **Why this feature closed rather than continued.** Not "we ran out of ideas"
+  — **bounded**. Slice 8 showed the comparison has no interval, slice 9 showed
+  an independent sample of 130–307 cannot detect a 2.5 pp gap, and slice 10
+  showed no shorter horizon supplies more observations because the weighted
+  model's 307 signals cap the sample at every horizon. Three plausible levers,
+  each *closed* rather than narrowed. Continuing would mean optimising 11
+  parameters against a target this design cannot resolve, which is fitting
+  noise with extra steps.
 - **Why validate before searching:** a search that optimizes a wrong port finds
   confidently wrong weights. The gate is ordered before every calibration step
   for that reason, not as ceremony.
