@@ -78,6 +78,27 @@ import {
   resolveStatus,
   targetVerdict,
 } from "./timeframes.mjs";
+import {
+  breakevenHitRate,
+  bootstrapHitRateDraws,
+  bootstrapSurface,
+  bootstrapTransformed,
+  cellOutcomes,
+  currentRatio,
+  expectancyPercent,
+  findZeroCrossing,
+  hitRateInterval,
+  labelExitAt,
+  parseRatioFlags,
+  requiredRatio,
+  ratioDirection,
+  selectIndependent,
+  stopGridPct,
+  surfaceCells,
+  targetGridPct,
+  verifyParametricLabeller,
+  windowIndexOf,
+} from "./ratio.mjs";
 
 const counts = {};
 let section = "untitled";
@@ -2664,6 +2685,814 @@ sec("cluster-bootstrap");
   );
 }
 
+// ─── 12. exit-ratio analysis on an independent sample ────────────────────────
+//
+// backtest/ratio.mjs is the file that asks whether the EXIT RATIO, rather than
+// the weight vector, is the binding constraint. Everything it reports rests on
+// four things that could each be wrong in a way that still prints plausible
+// numbers, so each is checked here on SYNTHETIC, DATA-FREE input:
+//
+//   * the non-overlapping window selection — a known signal layout must give a
+//     known kept/discarded count;
+//   * the break-even algebra h*T - (1-h)*S and its inverse T/S = (1-h)/h, on
+//     inputs whose answer can be done by hand;
+//   * CI propagation through the required ratio, including that it is
+//     transform-the-draws and NOT transform-the-endpoints;
+//   * the surface's zero-crossing detection, including every way it must
+//     REFUSE to locate one.
+//
+// The parameterised labeller is checked against modules/label.mjs ITSELF, on
+// synthetic candles where the labels are known by hand, because a surface built
+// by a re-implementation that had drifted would print a confident wrong answer.
+
+sec("exit-ratio");
+{
+  // ── The window partition ────────────────────────────────────────────────
+  check(windowIndexOf(0, 288) === 0, "bar 0 is the first window");
+  check(windowIndexOf(287, 288) === 0, "bar 287 is still the first window (288 bars per window)");
+  check(windowIndexOf(288, 288) === 1, "bar 288 opens the second window — the boundary is exact");
+  check(windowIndexOf(575, 288) === 1, "bar 575 is inside the second window");
+  check(windowIndexOf(576, 288) === 2, "bar 576 opens the third window");
+  check(windowIndexOf(1, 1) === 1, "a one-bar window makes every bar its own window");
+  throws(() => windowIndexOf(-1, 288), RangeError, "a negative barIndex is rejected");
+  throws(() => windowIndexOf(0, 0), RangeError, "a zero window width is rejected");
+  throws(() => windowIndexOf(1.5, 288), RangeError, "a fractional barIndex is rejected");
+
+  // ── The selection: at most one per window, earliest entry bar ───────────
+  //
+  // Synthetic layout at 288 bars/window, four signals:
+  //   bars 10 and 200  -> both in window 0 (10 - 0 = 10 < 288); keep 10.
+  //   bar 600          -> window 2; nothing else there; keep it.
+  //   bars 900 and 950 -> both in window 3; keep 900.
+  // So 4 signals considered, 3 kept, 1 discarded.
+  const layout = [
+    { barIndex: 10, side: "long", price: 1 },
+    { barIndex: 200, side: "long", price: 1 },
+    { barIndex: 600, side: "short", price: 1 },
+    { barIndex: 900, side: "short", price: 1 },
+    { barIndex: 950, side: "short", price: 1 },
+  ];
+  const picked = selectIndependent(layout, 288);
+  check(
+    picked.selected.map((s) => s.barIndex).join(",") === "10,600,900",
+    `one per window, earliest wins → 10,600,900 (got ${picked.selected.map((s) => s.barIndex).join(",")})`,
+  );
+  check(picked.considered === 5 && picked.discarded === 2, "5 considered, 3 kept, 2 discarded");
+  check(picked.windowsUsed === 3, "three distinct windows occupied");
+  check(
+    selectIndependent(layout.slice().reverse(), 288).selected.map((s) => s.barIndex).join(",") ===
+      "10,600,900",
+    "selection is order-independent — the input is sorted first",
+  );
+  check(
+    selectIndependent([], 288).selected.length === 0 && selectIndependent([], 288).windowsUsed === 0,
+    "no signals → nothing kept, and zero windows rather than one empty window",
+  );
+  // Two signals on the SAME bar: still one observation, and the total-order
+  // sort makes the choice deterministic rather than input-order dependent.
+  const sameBar = [
+    { barIndex: 5, side: "short", price: 1 },
+    { barIndex: 5, side: "long", price: 1 },
+  ];
+  const samePicked = selectIndependent(sameBar, 288);
+  check(samePicked.selected.length === 1, "two signals on one bar are ONE observation");
+  check(samePicked.selected[0].side === "long", "a same-bar tie breaks on side, deterministically");
+  // Independence is the point: kept signals are never closer than one window.
+  const kept = selectIndependent(
+    Array.from({ length: 10 }, (_, i) => ({ barIndex: i * 288, side: "long", price: 1 })),
+    288,
+  ).selected;
+  check(
+    kept.length === 10 && kept.every((s, i) => s.barIndex === i * 288),
+    `ten signals one full window apart all survive — none competes for a window (kept ${kept.length})`,
+  );
+  // The adversarial case: many signals inside ONE window must collapse to the
+  // first, which is the whole mechanism the independence claim rests on.
+  const crowded = selectIndependent(
+    Array.from({ length: 40 }, (_, i) => ({ barIndex: i * 7, side: "long", price: 1 })),
+    288,
+  );
+  check(
+    crowded.selected.length === 1 && crowded.selected[0].barIndex === 0,
+    `40 signals packed inside one window collapse to the first at bar ` +
+      `${crowded.selected[0]?.barIndex} (kept ${crowded.selected.length}) — this is what removes the ` +
+      "overlapping-forward-window dependence",
+  );
+  // Boundary case: bars 287 and 288 are in ADJACENT windows and both survive,
+  // even though their forward windows abut without overlapping.
+  const abutting = selectIndependent(
+    [{ barIndex: 287, side: "long", price: 1 }, { barIndex: 288, side: "long", price: 1 }],
+    288,
+  );
+  check(
+    abutting.selected.length === 2,
+    "two signals whose windows ABUT (287 and 288) are in different windows and both survive",
+  );
+  throws(() => selectIndependent("nope", 288), TypeError, "a non-array signal list is rejected");
+
+  // ── Break-even algebra, hand-computable ─────────────────────────────────
+  //
+  // D.4's shipped 1.5 / 0.8: 0.8 / 2.3 = 0.347826086956...
+  const be1548 = breakevenHitRate(1.5, 0.8);
+  check(
+    Math.abs(be1548 - 0.8 / 2.3) < 1e-12,
+    `break-even hit rate for 1.5/0.8 is 0.8/2.3 (got ${be1548})`,
+  );
+  check(
+    Math.abs(be1548 * 100 - 34.78260869565217) < 1e-9,
+    `which is 34.78% to two decimals (got ${(be1548 * 100).toFixed(4)}%)`,
+  );
+  check(currentRatio() === 1.875, `the shipped ratio is 1.5/0.8 = 1.875 (got ${currentRatio()})`);
+  check(
+    currentRatio() === EXIT_TARGET_PCT / EXIT_STOP_PCT,
+    "the shipped ratio is read from label.mjs's own constants, not hard-coded twice",
+  );
+  // At exactly the break-even rate the expectancy is EXACTLY zero. That is the
+  // identity the whole file rests on, so it is checked at three ratios.
+  for (const [T, S] of [[1.5, 0.8], [0.5, 0.3], [3.0, 1.5]]) {
+    check(
+      Math.abs(expectancyPercent(breakevenHitRate(T, S), T, S)) < 1e-12,
+      `expectancy is exactly 0 at the break-even rate for ${T}/${S}`,
+    );
+  }
+  // Hand-computed expectations.
+  check(
+    Math.abs(expectancyPercent(0.3125, 1.5, 0.8) - -0.08125) < 1e-12,
+    `0.3125*1.5 - 0.6875*0.8 = -0.08125 (got ${expectancyPercent(0.3125, 1.5, 0.8)})`,
+  );
+  check(
+    Math.abs(expectancyPercent(0.3375, 1.5, 0.8) - -0.02375) < 1e-12,
+    `0.3375*1.5 - 0.6625*0.8 = -0.02375, which docs/WEIGHT-CALIBRATION.md 5.2 prints as -0.02% ` +
+      `(got ${expectancyPercent(0.3375, 1.5, 0.8)})`,
+  );
+  check(expectancyPercent(0.5, 1.5, 0.8) === 0.35, "a 50% hit rate earns (T-S)/2 = 0.35");
+  check(expectancyPercent(1, 1.5, 0.8) === 1.5, "a 100% hit rate earns exactly the target");
+  check(expectancyPercent(0, 1.5, 0.8) === -0.8, "a 0% hit rate loses exactly the stop");
+  check(expectancyPercent(null, 1.5, 0.8) === null, "an undefined hit rate has no expectancy");
+
+  // ── The inverse: T/S = (1-h)/h, and its direction ───────────────────────
+  check(requiredRatio(0.5) === 1, "at h = 0.5 the required ratio is exactly 1");
+  check(
+    Math.abs(requiredRatio(0.25) - 3) < 1e-12,
+    `at h = 0.25 the required ratio is exactly 3 (got ${requiredRatio(0.25)})`,
+  );
+  check(requiredRatio(0.75) === 1 / 3, "at h = 0.75 the required ratio is exactly 1/3");
+  check(requiredRatio(1) === 0, "at h = 1 the required ratio is 0 — anything wins");
+  // The two formulas must be INVERSES of one another on a sweep of ratios: a
+  // pair that disagrees would mean one of them has the sign or the slope wrong.
+  let inverseOk = true;
+  for (const ratio of [0.5, 0.8, 1, 1.5, 1.875, 2.5, 4]) {
+    const T = ratio;
+    const S = 1;
+    const h = breakevenHitRate(T, S);
+    if (Math.abs(requiredRatio(h) - T) > 1e-12) inverseOk = false;
+  }
+  check(inverseOk, "breakevenHitRate and requiredRatio are exact inverses on a sweep of ratios");
+  // DIRECTION, the thing that is easy to print backwards: a bigger ratio needs
+  // a bigger hit rate, so a required ratio ABOVE the shipped 1.875 means the
+  // shipped ratio is TOO SMALL for the observed accuracy.
+  check(
+    requiredRatio(0.3375) > currentRatio(),
+    `h = 33.75% requires ${requiredRatio(0.3375).toFixed(4)} > the shipped ${currentRatio()} — ` +
+      "a SMALLER accuracy needs a BIGGER ratio, so the shipped ratio is too small there",
+  );
+  check(
+    requiredRatio(0.4375) < currentRatio(),
+    `h = 43.75% requires ${requiredRatio(0.4375).toFixed(4)} < the shipped ${currentRatio()}`,
+  );
+  throws(() => requiredRatio(0), RangeError, "h = 0 has no finite required ratio and is rejected");
+  throws(() => requiredRatio(1.2), RangeError, "a hit rate above 1 is rejected");
+  throws(() => breakevenHitRate(0, 0.8), RangeError, "a zero target is rejected");
+  throws(() => breakevenHitRate(1.5, -0.1), RangeError, "a negative stop is rejected");
+  throws(() => expectancyPercent(1.5, 1.5, 0.8), RangeError, "expectancyPercent wants a FRACTION");
+
+  // ── The direction of the gap: DEFICIT vs SURPLUS ─────────────────────────
+  //
+  // REGRESSION. The first version of ratio.mjs derived the word inline from
+  // `gap > 0` while PHRASING the sentence from the perspective of
+  // `shipped - required`, and shipped the INVERSE of the rule its own header
+  // documented — on every grid, in both tables. The assertion below is on the
+  // LABELLING FUNCTION, not on rendered text, so it survives any refactor of the
+  // report that leaves the function itself alone.
+  //
+  // The rule, stated once: gap = requiredRatio(h) - shippedRatio.
+  //   required > shipped -> the shipped ratio is TOO SMALL for the accuracy
+  //                        observed -> DEFICIT
+  //   required < shipped -> the shipped ratio is LARGER than the accuracy needs
+  //                        -> SURPLUS
+  //
+  // Hand-computable anchors. At h = 0.25 the required ratio is EXACTLY 3.0, so
+  // anything below 3.0 is a deficit and anything above 3.0 is a surplus.
+  check(requiredRatio(0.25) === 3, "the anchor: requiredRatio(0.25) is exactly 3.0");
+  check(
+    ratioDirection(requiredRatio(0.25) - 1.875).code === "deficit",
+    "required 3.0 vs a shipped 1.875 (below 3.0) is a DEFICIT",
+  );
+  check(
+    ratioDirection(requiredRatio(0.25) - 4).code === "surplus",
+    "required 3.0 vs a shipped 4.0 (above 3.0) is a SURPLUS",
+  );
+  // The same anchor across a spread of shipped ratios, which is the property the
+  // brief asked to be asserted: any shipped ratio below the requirement is a
+  // deficit, any above it a surplus.
+  let directionSpreadOk = true;
+  for (const shipped of [0.1, 0.5, 1, 1.875, 2, 2.9, 3.1, 5, 20]) {
+    const code = ratioDirection(requiredRatio(0.25) - shipped).code;
+    const expected = 3 - shipped > 0 ? "deficit" : 3 - shipped < 0 ? "surplus" : "balanced";
+    if (code !== expected) directionSpreadOk = false;
+  }
+  check(
+    directionSpreadOk,
+    "against required 3.0, every shipped ratio below it is a deficit and every one above it a surplus",
+  );
+
+  // The same property stated through the ALGEBRA, so it holds for any h and not
+  // only the anchor: the shipped ratio is too small exactly when h is below the
+  // break-even rate for that shipped ratio.
+  let algebraOk = true;
+  for (const shipped of [0.5, 0.8, 1.875, 3]) {
+    for (let h = 0.02; h < 1; h += 0.02) {
+      const required = requiredRatio(h);
+      const code = ratioDirection(required - shipped).code;
+      const belowBreakEven = h < 1 / (1 + shipped);
+      // A LARGER ratio demands a HIGHER hit rate: h under the rate shippedRatio
+      // demands means the shipped ratio is TOO SMALL, i.e. a deficit.
+      const expected = belowBreakEven ? "deficit" : h > 1 / (1 + shipped) ? "surplus" : "balanced";
+      if (code !== expected) algebraOk = false;
+    }
+  }
+  check(
+    algebraOk,
+    "the direction agrees with the break-even algebra at every h and every shipped ratio tested — " +
+      "a larger ratio demands a higher hit rate, so a lower h means the shipped ratio is too small",
+  );
+
+  // Sign conventions, including the boundary the first version got wrong twice.
+  check(ratioDirection(0).code === "balanced", "an exactly matched ratio is BALANCED, not a deficit");
+  check(ratioDirection(null).code === "n/a", "a null gap labels n/a rather than guessing a direction");
+  check(
+    ratioDirection(0.0000001).code === "deficit" && ratioDirection(-0.0000001).code === "surplus",
+    "the sign is honoured right up to the boundary: a hair above is a deficit, a hair below a surplus",
+  );
+  // h = 0 has an infinite requirement, which is above any shipped ratio, so it is
+  // a DEFICIT. Labelling it anything else would leave the direction to inference.
+  check(
+    ratioDirection(null, true).code === "deficit" && ratioDirection(null, true).word.startsWith("DEFICIT"),
+    "h = 0 (unbounded requirement) is labelled a DEFICIT, since infinite is above any shipped ratio",
+  );
+  check(
+    ratioDirection(null, false).code === "n/a",
+    "unbounded is an explicit flag, not inferred from a null gap — an unknown gap stays n/a",
+  );
+  // The words must carry the reasoning, not just the label, so a reader skimming
+  // the word alone cannot invert it.
+  check(
+    /TOO SMALL/.test(ratioDirection(0.5).reason) && /ABOVE/.test(ratioDirection(0.5).reason),
+    "the deficit reason states the shipped ratio is TOO SMALL and the requirement is ABOVE it",
+  );
+  check(
+    /LARGER/.test(ratioDirection(-0.5).reason) && /BELOW/.test(ratioDirection(-0.5).reason),
+    "the surplus reason states the shipped ratio is LARGER and the requirement is BELOW it",
+  );
+  check(
+    ratioDirection(0.5).label.includes("TOO SMALL") && ratioDirection(-0.5).label.includes("LARGER"),
+    "the table label repeats the reasoning in words, so the word cannot be inverted by skimming",
+  );
+  // One source of truth: the wiring section below asserts that ratio.mjs derives
+  // the direction through ratioDirection() rather than re-inferring the sign.
+
+  // ── CI propagation through the required ratio ───────────────────────────
+  //
+  // A population of 20 known labels: 12 wins, 8 losses. Resampling WITH
+  // replacement does not preserve 12/8 on every draw, so the interval has real
+  // width — that is the point of a bootstrap and it is what the seed pins.
+  const twenty = Array.from({ length: 20 }, (_, i) => (i < 12 ? 1 : 2));
+  const draws20 = bootstrapHitRateDraws(twenty, 4000, 4242);
+  check(draws20.rates.length === 4000, "no draw is undefined when every observation is resolved");
+  check(draws20.undefinedDraws === 0, "an all-resolved population has no undefined draws");
+  const iv20 = hitRateInterval(draws20.rates);
+  check(iv20.hi > iv20.lo, `a resample moves the count, so the interval has width ([${iv20.lo}%, ${iv20.hi}%])`);
+  check(
+    iv20.lo < 60 && iv20.hi > 60,
+    `the interval BRACKETS the point estimate of 12/20 = 60% (got [${iv20.lo}%, ${iv20.hi}%])`,
+  );
+  check(
+    Math.abs(iv20.mean - 60) < 0.5,
+    `the bootstrap mean recovers the point estimate to under half a point (got ${iv20.mean}%) — ` +
+      "resampling with replacement is centred, not biased",
+  );
+
+  // A truly DEGENERATE population — every observation the same outcome — makes
+  // every draw identical, so the interval must have exactly zero width. That
+  // pins win/(win+loss) as the statistic: under win/total this would not hold
+  // for the mixed case above, and it pins the transform on a known answer.
+  const allWins = Array.from({ length: 20 }, () => 1);
+  const allWinIv = hitRateInterval(bootstrapHitRateDraws(allWins, 500, 11).rates);
+  check(
+    allWinIv.lo === 100 && allWinIv.hi === 100,
+    `an all-win population gives exactly 100% on every draw, zero-width (got ${allWinIv.lo}/${allWinIv.hi})`,
+  );
+  const allWinReq = bootstrapTransformed(bootstrapHitRateDraws(allWins, 500, 11).rates, requiredRatio);
+  check(
+    allWinReq.lo === 0 && allWinReq.hi === 0,
+    `and a required ratio of exactly 0 — at h = 1 any ratio breaks even (got ${allWinReq.lo})`,
+  );
+  // The mirror case: at h = 0 the required ratio is UNDEFINED (infinite). That
+  // must degrade to a null bound, not throw out of the middle of a report.
+  const allLossIv = hitRateInterval(bootstrapHitRateDraws(Array.from({ length: 20 }, () => 2), 500, 11).rates);
+  check(allLossIv.lo === 0 && allLossIv.hi === 0, "an all-loss population gives exactly 0% on every draw");
+  const allLossReq = bootstrapTransformed(
+    bootstrapHitRateDraws(Array.from({ length: 20 }, () => 2), 500, 11).rates,
+    requiredRatio,
+  );
+  check(
+    allLossReq.lo === null && allLossReq.hi === null,
+    "at h = 0 the required ratio is undefined: the bounds are null, not a throw and not an infinity",
+  );
+
+  // A population where the count VARIES, so the interval has real width.
+  const varied = Array.from({ length: 60 }, (_, i) => (i % 5 < 3 ? 1 : 2));
+  const variedDraws = bootstrapHitRateDraws(varied, 6000, 7).rates;
+  const variedIv = hitRateInterval(variedDraws);
+  check(
+    variedIv.hi > variedIv.lo,
+    `a varying population produces a non-zero-width interval ([${variedIv.lo}%, ${variedIv.hi}%])`,
+  );
+  // The propagated ratio interval must be the transform of the DRAWS, and its
+  // endpoints must therefore be WIDER than the naive endpoint transform. That
+  // is the whole reason this file transforms draws instead of endpoints:
+  // (1-h)/h is convex, so mapping the two endpoints inward loses the tails.
+  const ratioIv = bootstrapTransformed(variedDraws, requiredRatio);
+  const naiveLo = (1 - variedIv.hi / 100) / (variedIv.hi / 100);
+  const naiveHi = (1 - variedIv.lo / 100) / (variedIv.lo / 100);
+  check(
+    ratioIv.lo < naiveLo && ratioIv.hi > naiveHi,
+    `propagating the DRAWS is strictly wider than mapping h's two endpoints ` +
+      `([${ratioIv.lo}, ${ratioIv.hi}] vs the naive [${naiveLo.toFixed(4)}, ${naiveHi.toFixed(4)}])`,
+  );
+  check(
+    ratioIv.lo < ratioIv.hi && variedIv.lo < variedIv.hi,
+    "both intervals are properly ordered",
+  );
+  // Monotonicity: (1-h)/h falls as h rises. A single-draw distribution has
+  // exact endpoints, which pins the transform on known answers without any
+  // percentile interpolation in the way.
+  check(
+    bootstrapTransformed([0.5], requiredRatio).lo === 1,
+    `a single draw at h = 0.5 gives exactly T/S = 1 (got ${bootstrapTransformed([0.5], requiredRatio).lo})`,
+  );
+  check(
+    bootstrapTransformed([0.25], requiredRatio).lo === 3,
+    "a single draw at h = 0.25 gives exactly T/S = 3",
+  );
+  const monoIv = bootstrapTransformed([0.3, 0.5], requiredRatio);
+  check(
+    monoIv.lo > 1 && monoIv.lo < 2 && monoIv.hi > monoIv.lo && monoIv.hi < 7,
+    `the interval over h in [0.3, 0.5] spans the required ratios ${(1 / 0.5).toFixed(3)} down to ` +
+      `${(1 / 0.3).toFixed(3)} without inverting them (got [${monoIv.lo}, ${monoIv.hi}])`,
+  );
+  check(
+    bootstrapTransformed([0.3, 0.5], requiredRatio).lo === bootstrapTransformed([0.5, 0.3], requiredRatio).lo &&
+      bootstrapTransformed([0.3, 0.5], requiredRatio).hi === bootstrapTransformed([0.5, 0.3], requiredRatio).hi,
+    "the transform does not depend on the order of the draws",
+  );
+  // The seed makes two runs identical, and a different seed moves them.
+  const rA = bootstrapHitRateDraws(varied, 4000, 99).rates;
+  const rB = bootstrapHitRateDraws(varied, 4000, 99).rates;
+  const rC = bootstrapHitRateDraws(varied, 4000, 100).rates;
+  check(
+    hitRateInterval(rA).lo === hitRateInterval(rB).lo && hitRateInterval(rA).hi === hitRateInterval(rB).hi,
+    "the same seed reproduces the interval exactly",
+  );
+  check(
+    hitRateInterval(rA).mean !== hitRateInterval(rC).mean,
+    "a different seed moves the bootstrap distribution",
+  );
+  // An all-excluded population has no defined rate on any draw, and must be
+  // counted rather than coerced to 0 or 1.
+  const allExcluded = Array.from({ length: 12 }, () => 0);
+  const undef = bootstrapHitRateDraws(allExcluded, 50, 1);
+  check(
+    undef.rates.length === 0 && undef.undefinedDraws === 50,
+    `every draw of an all-timeout population is undefined and COUNTED (got ${undef.rates.length} kept / ` +
+      `${undef.undefinedDraws} undefined)`,
+  );
+  check(
+    hitRateInterval([]).lo === null && bootstrapTransformed([], requiredRatio).lo === null,
+    "no draws → null endpoints, never 0 and never 100",
+  );
+
+  // ── The parameterised labeller equals modules/label.mjs ─────────────────
+  //
+  // The same synthetic fixture the label section uses, driven through BOTH
+  // labellers at the shipped 1.5 / 0.8. If the surface's labeller had drifted,
+  // this is where it would show.
+  const lb = (high, low, close) => ({ high, low, close });
+  const sig = (barIndex, side, price) => ({ barIndex, side, price });
+  const synth = [
+    lb(100.5, 99.5, 100), // 0
+    lb(101.6, 99.9, 101.2), // 1 — long@0 reaches the +1.5% target (101.5) -> WIN
+    lb(100.5, 99.5, 100), // 2
+    lb(100.8, 99.1, 99.4), // 3 — long@2 reaches the -0.8% stop (99.2) -> LOSS
+    lb(100.5, 99.5, 100), // 4
+    lb(100.9, 99.5, 100.2), // 5 — short@4 reaches its +0.8% stop (100.8) -> LOSS
+    lb(100.6, 98.4, 100), // 6 — short@5 (entry 100.2, target 98.697) reaches its target -> WIN
+    lb(102.0, 98.0, 100), // 7 — long@6 touches BOTH levels on one bar -> LOSS + doubleTouch
+    lb(100.5, 99.5, 100), // 8
+    lb(100.5, 99.5, 100), // 9
+    lb(100.5, 99.5, 100), // 10
+    lb(100.5, 99.5, 100), // 11
+    lb(100.5, 99.5, 100), // 12
+    lb(100.5, 99.5, 100), // 13
+    lb(100.5, 99.5, 100), // 14
+    lb(100.5, 99.5, 100), // 15
+  ];
+  const synthSignals = {
+    weighted: [sig(0, "long", 100), sig(2, "long", 100), sig(6, "long", 100)],
+    binary: [sig(4, "short", 100), sig(5, "short", 100.2)],
+  };
+  const match = verifyParametricLabeller(synth, synthSignals, 4);
+  check(
+    match.ok && match.checks === 5,
+    `labelExitAt equals label.mjs on all ${match.checks} synthetic signals (mismatches: ` +
+      `${match.mismatches.join("; ") || "none"})`,
+  );
+  // Both labellers must also agree on the labels this fixture is built to make,
+  // so a shared bug cannot make the check above pass vacuously.
+  check(labelExitAt(synth, sig(0, "long", 100), 1.5, 0.8, 4).label === "win", "long target → win");
+  check(labelExitAt(synth, sig(2, "long", 100), 1.5, 0.8, 4).label === "loss", "long stop → loss");
+  check(labelExitAt(synth, sig(4, "short", 100), 1.5, 0.8, 4).label === "loss", "short stop → loss");
+  check(
+    labelExitAt(synth, sig(5, "short", 100.2), 1.5, 0.8, 4).label === "win",
+    "short target → win",
+  );
+  const synthStraddle = labelExitAt(synth, sig(6, "long", 100), 1.5, 0.8, 4);
+  check(
+    synthStraddle.label === "loss" && synthStraddle.doubleTouch === true,
+    "one bar touching both levels is a LOSS with the double-touch flag, as in label.mjs",
+  );
+  // The parameterisation must actually WORK: a target the price reaches and a
+  // stop it does not flips the label, and the availability-first rule survives.
+  check(
+    labelExitAt(synth, sig(0, "long", 100), 0.5, 0.8, 4).label === "win",
+    "halving the target keeps the same bar resolving as a win",
+  );
+  check(
+    labelExitAt(synth, sig(0, "long", 100), 5.0, 0.8, 4).label === "loss",
+    "a 5% target is never reached, so the stop resolves it as a loss",
+  );
+  check(
+    labelExitAt(synth, sig(9, "long", 100), 5.0, 0.8, 4).label === "timeout",
+    "with neither level reachable the label is timeout, not a forced loss",
+  );
+  check(
+    labelExitAt(synth, sig(11, "long", 100), 1.5, 0.8, 4).label === "timeout",
+    "a full horizon that touches neither level is a timeout",
+  );
+  check(
+    labelExitAt(synth, sig(15, "long", 100), 1.5, 0.8, 4).label === "insufficient_data",
+    "availability is checked before the scan: 0 bars left is insufficient_data, never a win",
+  );
+  check(
+    labelExitAt(synth, sig(14, "long", 100), 1.5, 0.8, 1).label === "timeout",
+    "one available bar that touches nothing is a timeout, not insufficient_data",
+  );
+  // Validation: the anti-miswire invariant is live on the parameterised path too.
+  throws(
+    () => labelExitAt(synth, sig(1, "long", 100), 1.5, 0.8, 4),
+    TypeError,
+    "a price that is not the signal bar's close is rejected (anti-miswire)",
+  );
+  throws(() => labelExitAt(synth, sig(99, "long", 100), 1.5, 0.8, 4), RangeError, "barIndex past the data");
+  throws(() => labelExitAt(synth, sig(0, "buy", 100), 1.5, 0.8, 4), TypeError, "side domain enforced");
+  throws(() => labelExitAt(synth, sig(0, "long", 100), 0, 0.8, 4), RangeError, "a zero target is rejected");
+  throws(() => labelExitAt(synth, sig(0, "long", 100), 1.5, 0.8, 0), RangeError, "a zero horizon is rejected");
+
+  // ── The surface axes and cells ──────────────────────────────────────────
+  const targets = targetGridPct();
+  const stops = stopGridPct();
+  check(targets.length === 11 && stops.length === 13, `11 targets x 13 stops (got ${targets.length} x ${stops.length})`);
+  check(targets[0] === 0.5 && targets[targets.length - 1] === 3.0, "the target axis runs 0.50 .. 3.00");
+  check(stops[0] === 0.3 && stops[stops.length - 1] === 1.5, "the stop axis runs 0.30 .. 1.50");
+  check(targets[4] === 1.5, `the shipped target 1.5 lands exactly on a grid index (got ${targets[4]})`);
+  check(stops[5] === 0.8, `the shipped stop 0.8 lands exactly on a grid index (got ${stops[5]})`);
+  const cells = surfaceCells(targets, stops);
+  check(cells.length === 143, `143 cells (got ${cells.length})`);
+  const d4Cell = cells.find((c) => c.targetPct === 1.5 && c.stopPct === 0.8);
+  check(d4Cell !== undefined && d4Cell.ratio === 1.875, "the shipped 1.5/0.8 cell is present with ratio 1.875");
+
+  // ── Cell outcomes and the per-cell bootstrap ───────────────────────────
+  //
+  // Eight observations in one window each, spaced a full window apart so they
+  // stay independent. Candles are flat, so a "win" is manufactured by pushing
+  // one bar's high above the target and a "loss" by pushing a low below the
+  // stop. Fixture: 800 flat bars at 100.
+  const flatCandles = Array.from({ length: 2400 }, () => ({ high: 100, low: 100, close: 100 }));
+  const obs = [];
+  for (let k = 0; k < 8; k++) {
+    const bar = k * 288;
+    obs.push(sig(bar, "long", 100));
+    // The FIRST forward bar resolves every observation, so the label is decided
+    // by one push and the rest of the window is irrelevant by construction:
+    //   even k -> high 102 touches the 1.5% target (101.5) and clears the 0.8%
+    //             stop (99.2)  => WIN
+    //   odd  k -> low  98 touches the stop and never the target     => LOSS
+    // Eight observations, one full window apart, so they stay independent.
+    flatCandles[bar + 1] =
+      k % 2 === 0 ? { high: 102, low: 100, close: 100 } : { high: 100, low: 98, close: 100 };
+  }
+  const obsCodes = cellOutcomes(flatCandles, obs, cells, 288);
+  check(
+    obsCodes.length === cells.length * obs.length,
+    `cellOutcomes covers every cell x observation (${cells.length} x ${obs.length})`,
+  );
+  const d4Index = cells.indexOf(d4Cell);
+  let d4Wins = 0;
+  let d4Losses = 0;
+  for (let j = 0; j < obs.length; j++) {
+    const o = obsCodes[d4Index * obs.length + j];
+    if (o === 1) d4Wins += 1;
+    else if (o === 2) d4Losses += 1;
+  }
+  check(
+    d4Wins === 4 && d4Losses === 4,
+    `the D.4 cell labels the fixture 4 wins / 4 losses — bar +1 wins, bar +2 loses (got ${d4Wins}W/${d4Losses}L)`,
+  );
+  // A cell whose target is out of reach can only be a win when the STOP is
+  // reached first; the same fixture at 5% / 0.8% must therefore be 0/8. This
+  // proves the cells genuinely RE-LABEL rather than re-weighting one fixed h.
+  const hardCell = cells.findIndex((c) => c.targetPct === 2.75 && c.stopPct === 0.3);
+  let hardWins = 0;
+  let hardLosses = 0;
+  for (let j = 0; j < obs.length; j++) {
+    const o = obsCodes[hardCell * obs.length + j];
+    if (o === 1) hardWins += 1;
+    else if (o === 2) hardLosses += 1;
+  }
+  check(
+    hardWins === 0 && hardLosses === 4,
+    `a tighter cell re-labels the SAME observations to 0 wins / 4 losses (got ${hardWins}W/${hardLosses}L) — ` +
+      "cells re-label, they do not re-weight one fixed hit rate (the four 102 pushes no longer " +
+      "reach a 2.75% target and turn into timeouts, while the 98 pushes still stop out)",
+  );
+
+  const tinyGrid = surfaceCells([1.5], [0.8]);
+  const tinyBoot = bootstrapSurface(cellOutcomes(flatCandles, obs, tinyGrid, 288), obs.length, tinyGrid, 500, 3);
+  check(tinyBoot.length === 1, "one cell yields one bootstrapped cell record");
+  check(tinyBoot[0].win === 4 && tinyBoot[0].loss === 4, "the point counts match the fixture");
+  check(tinyBoot[0].hitRatePercent === 50, `the point hit rate is 50% (got ${tinyBoot[0].hitRatePercent})`);
+  check(
+    tinyBoot[0].expectancyPercent === 0.35,
+    `expectancy at h = 0.5 with T = 1.5, S = 0.8 is 0.5*1.5 - 0.5*0.8 = +0.35 exactly ` +
+      `(got ${tinyBoot[0].expectancyPercent})`,
+  );
+  check(
+    tinyBoot[0].expectancyCiLoPercent < tinyBoot[0].expectancyCiHiPercent,
+    "the cell carries a propagated expectancy interval, not just a point estimate",
+  );
+  check(
+    tinyBoot[0].significantlyPositive === false && tinyBoot[0].significantlyNegative === false,
+    "an 8-observation interval straddles zero, so neither sign is established",
+  );
+  check(
+    bootstrapSurface(new Int8Array(cells.length * obs.length), obs.length, tinyGrid, 100, 1).every
+      ? bootstrapSurface(new Int8Array(cells.length * obs.length), obs.length, tinyGrid, 100, 1)[0].expectancyPercent === null
+      : false,
+    "an all-excluded cell has a null expectancy rather than a fabricated 0",
+  );
+
+  // ── Crossing detection, including every refusal ─────────────────────────
+  //
+  // A cell record is (point, ciLo, ciHi, axisValue, fixedAxisValue).
+  const cell = (point, ciLo, ciHi, axisValue, fixedAxisValue) => ({
+    expectancyPercent: point,
+    expectancyCiLoPercent: ciLo,
+    expectancyCiHiPercent: ciHi,
+    significantlyPositive: ciLo > 0,
+    significantlyNegative: ciHi < 0,
+    axisValue,
+    fixedAxisValue,
+  });
+
+  // (a) A clean, identified crossing: two negative cells then two positive.
+  const clean = [
+    cell(-0.4, -0.6, -0.2, 1.0, 0.8),
+    cell(-0.2, -0.35, -0.05, 1.25, 0.8),
+    cell(+0.1, +0.01, +0.19, 1.5, 0.8),
+    cell(+0.3, +0.2, +0.4, 1.75, 0.8),
+  ];
+  const cleanCross = findZeroCrossing(clean);
+  check(cleanCross.identified === true, "a sweep with a significant sign change IS identified");
+  check(
+    cleanCross.bracket.below === 1.25 && cleanCross.bracket.above === 1.5,
+    `the bracket is the last negative and first positive cell (${cleanCross.bracket.below} → ${cleanCross.bracket.above})`,
+  );
+  // Linear interpolation between -0.2 at 1.25 and +0.1 at 1.5 puts zero at
+  // 1.25 + 0.2 * 0.25 / 0.3 = 1.41666...
+  check(
+    Math.abs(cleanCross.crossingAxisValue - (1.25 + (0.2 * 0.25) / 0.3)) < 5e-4,
+    `the crossing interpolates linearly to ${cleanCross.crossingAxisValue} (1.4167 to 4 dp)`,
+  );
+  check(
+    Math.abs(cleanCross.crossingRatio - cleanCross.crossingAxisValue / 0.8) < 5e-4,
+    `the crossing ratio is the crossing axis value over the fixed stop (${cleanCross.crossingRatio})`,
+  );
+
+  // (b) The whole sweep inside the noise: NOTHING may be located.
+  const noisy = [
+    cell(-0.2, -0.5, +0.1, 1.0, 0.8),
+    cell(+0.1, -0.3, +0.5, 1.5, 0.8),
+  ];
+  const noisyCross = findZeroCrossing(noisy);
+  check(
+    noisyCross.identified === false && noisyCross.crossingAxisValue === null,
+    "a sweep entirely inside the noise locates NO crossing and returns null, not a guess",
+  );
+  check(noisyCross.situation === "inside-noise", "and it says so explicitly");
+
+  // (c) Established negative throughout: the crossing lies ABOVE the sampled
+  // range. Reporting "inside the noise" here would be wrong, and so would
+  // interpolating.
+  const allNeg = [
+    cell(-0.4, -0.6, -0.2, 1.0, 0.8),
+    cell(-0.2, -0.35, -0.05, 1.5, 0.8),
+  ];
+  const negCross = findZeroCrossing(allNeg);
+  check(
+    negCross.situation === "entirely-negative" && negCross.identified === false,
+    "a uniformly negative sweep is reported as entirely-negative, not as noise",
+  );
+  check(negCross.crossingAxisValue === null, "and still locates nothing");
+
+  // (d) Established positive from the first cell: the crossing lies BELOW the
+  // sampled range.
+  const allPos = [
+    cell(+0.4, +0.2, +0.6, 1.0, 0.8),
+    cell(+0.2, +0.05, +0.35, 1.5, 0.8),
+  ];
+  const posCross = findZeroCrossing(allPos);
+  check(
+    posCross.situation === "entirely-positive" && posCross.identified === false,
+    "a uniformly positive sweep is reported as entirely-positive",
+  );
+  check(posCross.crossingAxisValue === null, "and still locates nothing");
+
+  // (e) The boundary case: a positive cell whose predecessor's interval merely
+  // TOUCHES zero. That is not a significant negative, so no crossing.
+  const touching = [
+    cell(-0.2, -0.3, 0.0, 1.25, 0.8),
+    cell(+0.1, +0.01, +0.19, 1.5, 0.8),
+  ];
+  const touchingCross = findZeroCrossing(touching);
+  check(
+    touchingCross.identified === false,
+    "an interval that merely TOUCHES zero does not establish the sign below it — no crossing",
+  );
+
+  // (f) An empty sweep: no crash, no crossing.
+  check(findZeroCrossing([]).identified === false, "an empty sweep locates nothing");
+
+  // ── Wiring: the subcommand exists and cannot perturb anything ────────────
+  const ratioSrc = readFileSync(new URL("./ratio.mjs", import.meta.url), "utf8");
+  const runSrcRatio = readFileSync(new URL("./run.mjs", import.meta.url), "utf8");
+  check(
+    /import\s*\{[^}]*parseRatioFlags[^}]*\}\s*from\s*"\.\/ratio\.mjs"/.test(runSrcRatio),
+    "run.mjs imports the ratio runner and its flag parser",
+  );
+  check(
+    runSrcRatio.includes('subcommand === "ratio"'),
+    "ratio is a dispatched subcommand",
+  );
+  // The six-name SUBCOMMANDS literal is asserted VERBATIM twice above (sections
+  // 9 and 11) to prove each of those names is still registered. `ratio` is
+  // therefore registered through a separate list rather than by widening that
+  // literal, which would edit an assertion to make a new test pass.
+  check(
+    runSrcRatio.includes('SUBCOMMANDS = ["fetch", "validate", "baseline", "diagnose", "compare", "search"]'),
+    "the six-name SUBCOMMANDS literal is untouched, so the earlier assertions still mean something",
+  );
+  check(
+    runSrcRatio.includes('EXTRA_SUBCOMMANDS = ["ratio"]') && runSrcRatio.includes("DISPATCHABLE.includes(subcommand)"),
+    "ratio is registered through DISPATCHABLE, so a typo in it still refuses to dispatch",
+  );
+  check(
+    ratioSrc.includes('from "./baseline.mjs"') &&
+      /import\s*\{[^}]*runComparison[^}]*\}\s*from\s*"\.\/baseline\.mjs"/.test(ratioSrc),
+    "ratio.mjs reuses baseline's OWN runComparison — signals are not re-derived",
+  );
+  check(
+    /import\s*\{[^}]*makeRng[^}]*\}\s*from\s*"\.\/compare\.mjs"/.test(ratioSrc),
+    "ratio.mjs reuses compare.mjs's seeded RNG — one bootstrap convention",
+  );
+  check(
+    ratioSrc.includes("labelSignalsExitRule") && ratioSrc.includes("verifyParametricLabeller"),
+    "the parameterised labeller is PROVEN equal to modules/label.mjs before the surface is printed",
+  );
+  check(
+    /if \(!labellerMatch\.ok\)[\s\S]{0,400}throw new Error/.test(ratioSrc),
+    "a labeller mismatch THROWS rather than printing a surface computed over labels baseline never had",
+  );
+  check(
+    !ratioSrc.includes('from "./modules/signal-engine.mjs"') &&
+      !ratioSrc.includes('from "./modules/binary.mjs"'),
+    "ratio.mjs does NOT instantiate either model — it cannot perturb the baselines",
+  );
+  check(
+    ratioSrc.includes("MIN_OBSERVATIONS_FOR_INTERVAL") &&
+      /resolved >= MIN_OBSERVATIONS_FOR_INTERVAL/.test(ratioSrc),
+    "the observation threshold is a GATE applied before any bootstrap runs, not a formatted warning",
+  );
+  // The gate must be applied BEFORE the draws, or an ineligible scope would
+  // compute a number it then declines to print.
+  check(
+    /const draws = eligible\s*\n?\s*\?\s*bootstrapHitRateDraws/.test(ratioSrc),
+    "an ineligible scope makes NO bootstrap draws at all",
+  );
+  check(
+    ratioSrc.includes("EXCLUDED = 0") && ratioSrc.includes("WIN = 1") && ratioSrc.includes("LOSS = 2"),
+    "the outcome codes are declared as named constants, not bare literals in the loops",
+  );
+  // The CHECK, not the word: the file header legitimately NAMES Math.random
+  // while explaining why it is not used.
+  check(
+    /Math\.random\s*\(/.test(ratioSrc.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "")) === false,
+    "no Math.random CALL anywhere in ratio.mjs — every interval is seed-reproducible",
+  );
+  // The two claims this project must never make.
+  check(
+    ratioSrc.includes("NO BEST CELL IS REPORTED AND NO RATIO IS RECOMMENDED"),
+    "the surface carries an explicit refusal to report a best cell or recommend a ratio",
+  );
+  check(
+    ratioSrc.includes("SELECTION EFFECT") && ratioSrc.includes("ONE ARBITRARY"),
+    "the selection effect of keeping one signal per window is stated, not implied",
+  );
+  // One source of truth for the direction word. The first version derived it
+  // inline from `gap > 0` while phrasing the sentence from `shipped - required`,
+  // and shipped the inverse of its own documented rule on every grid. The sign
+  // must now be interpreted in exactly one place.
+  check(
+    /directionCode: d\.code/.test(ratioSrc) &&
+      /return\s*\{[^}]*code: "deficit"/.test(ratioSrc) &&
+      /if \(gap > 0\)/.test(ratioSrc),
+    "ratioDirection() is the single place where the gap sign becomes a word",
+  );
+  check(
+    !/gap > 0[\s\S]{0,200}surplus/.test(ratioSrc.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "")),
+    "no branch anywhere maps a POSITIVE gap to the word surplus — that was the inversion",
+  );
+  check(
+    !/gap < 0[\s\S]{0,200}deficit/.test(ratioSrc.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "")),
+    "no branch anywhere maps a NEGATIVE gap to the word deficit",
+  );
+  // Every caller goes through the function, so a scope row, a horizon row and the
+  // verdict cannot disagree about sign.
+  check(
+    ratioSrc.includes("ratioDirection(") &&
+      (ratioSrc.match(/ratioDirection\(/g) || []).length >= 4,
+    `the scope table, the horizon table and the verdict all call ratioDirection() ` +
+      `(${(ratioSrc.match(/ratioDirection\(/g) || []).length} call sites) — one sign convention`,
+  );
+  check(
+    ratioSrc.includes("gapDefinition"),
+    "the JSON states the gap's sign convention explicitly, so a consumer cannot read it backwards",
+  );
+  check(
+    ratioSrc.includes("0.10 round trip") || ratioSrc.includes("D4_ROUND_TRIP_COMMISSION_PCT"),
+    "the 0.10% round-trip commission D.4 itself declares is carried into the caveats",
+  );
+  check(
+    /expectancyPercent\(point, cell\.targetPct, cell\.stopPct\)/.test(ratioSrc) ||
+      /expectancyPercent\(.*targetPct.*stopPct/.test(ratioSrc),
+    "surface expectancy is computed by the SHARED h*T - (1-h)*S function, not re-derived per cell",
+  );
+
+  // ── Flag parsing is compare's, reused rather than forked ────────────────
+  check(
+    parseRatioFlags(["node", "run.mjs", "ratio", "--seed", "1"]).seed === 1,
+    "--seed <n> parses for ratio",
+  );
+  check(
+    parseRatioFlags(["node", "run.mjs", "ratio", "--bootstrap", "500"]).bootstrap === 500,
+    "--bootstrap <n> parses for ratio",
+  );
+  check(
+    parseRatioFlags(["node", "run.mjs", "ratio"]).seed === undefined &&
+      parseRatioFlags(["node", "run.mjs", "ratio"]).bootstrap === undefined,
+    "no flag → undefined, so ratio.mjs applies its own printed defaults",
+  );
+  throws(
+    () => parseRatioFlags(["node", "run.mjs", "ratio", "--seed"]),
+    Error,
+    "--seed with no value is rejected rather than swallowing the next argument",
+  );
+  throws(
+    () => parseRatioFlags(["node", "run.mjs", "ratio", "--seed", "abc"]),
+    Error,
+    "a non-integer --seed is rejected — a silently defaulted seed would break reproducibility",
+  );
+}
+
 // ─── Report ─────────────────────────────────────────────────────────────────
 
 const ORDER = [
@@ -2678,6 +3507,7 @@ const ORDER = [
   "tier-diagnostic",
   "timeframe-table",
   "cluster-bootstrap",
+  "exit-ratio",
 ];
 console.log("section            checks");
 for (const name of ORDER) {
