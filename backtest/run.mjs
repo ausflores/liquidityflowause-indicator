@@ -21,6 +21,10 @@
 //   node backtest/run.mjs compare    paired cluster bootstrap on the baseline
 //                                    difference (backtest/compare.mjs):
 //                                    --seed <n>, --bootstrap <n>, --json
+//   node backtest/run.mjs ratio      exit-ratio (target/stop) analysis on an
+//                                    INDEPENDENT sample — one signal per
+//                                    288-bar window (backtest/ratio.mjs):
+//                                    --seed <n>, --bootstrap <n>, --json
 //   node backtest/run.mjs search     T12 weight search (not implemented yet)
 //
 // Every data-reading subcommand takes `--timeframe <5m|1h|4h>` and defaults to
@@ -38,6 +42,7 @@ import { fileURLToPath } from "node:url";
 import { runGate } from "./gate.mjs";
 import { runBaseline } from "./baseline.mjs";
 import { parseCompareFlags, runCompare } from "./compare.mjs";
+import { parseRatioFlags, runRatio } from "./ratio.mjs";
 import { runTierDiagnostic } from "./tier-diagnostic.mjs";
 import {
   DEFAULT_TIMEFRAME,
@@ -642,12 +647,18 @@ function usage() {
     "  compare    paired cluster bootstrap on the baseline hit-rate difference,",
   );
   console.log(
+    "  ratio      exit-ratio (target/stop) analysis on an INDEPENDENT sample —",
+  );
+  console.log(
+    "             one signal per 288-bar window, break-even, expectancy surface.",
+  );
+  console.log(
     "             --seed <n> / --bootstrap <n> pin the RNG, --json for JSON output",
   );
   console.log("  search     weight search with holdout evaluation (T12)");
   console.log("");
   console.log(
-    `  --timeframe   native grid for fetch/baseline/diagnose/compare ` +
+    `  --timeframe   native grid for fetch/baseline/diagnose/compare/ratio ` +
       `(${TIMEFRAME_IDS.join(", ")}); default "${DEFAULT_TIMEFRAME}".`,
   );
   console.log(
@@ -713,6 +724,16 @@ function gateTimeframeRefusal(tf) {
 // ─── Dispatch ────────────────────────────────────────────────────────────────
 
 const SUBCOMMANDS = ["fetch", "validate", "baseline", "diagnose", "compare", "search"];
+
+// Subcommands added AFTER the baseline six. Kept as a separate list rather than
+// appended to SUBCOMMANDS so that the six-name literal above stays exactly what
+// it has always been: smoke.mjs asserts that literal verbatim in order to prove
+// each of those names is still registered and dispatchable. Widening it in place
+// would edit an assertion to make a new test pass, which is the one move this
+// harness must never make. `ratio` is registered through DISPATCHABLE below, so
+// a typo in it still refuses to dispatch.
+const EXTRA_SUBCOMMANDS = ["ratio"];
+const DISPATCHABLE = [...SUBCOMMANDS, ...EXTRA_SUBCOMMANDS];
 const subcommand = process.argv[2];
 
 // The flag is parsed BEFORE dispatch so an invalid --timeframe fails loudly on
@@ -733,7 +754,7 @@ try {
   }
 }
 
-if (subcommand === undefined || !SUBCOMMANDS.includes(subcommand)) {
+if (subcommand === undefined || !DISPATCHABLE.includes(subcommand)) {
   if (subcommand !== undefined) console.log(`run: unknown subcommand: ${subcommand}`);
   usage();
 } else if (tf === null) {
@@ -765,6 +786,18 @@ if (subcommand === undefined || !SUBCOMMANDS.includes(subcommand)) {
         tf,
         seed: compareFlags.seed,
         bootstrap: compareFlags.bootstrap,
+      });
+    } else if (subcommand === "ratio") {
+      // Same flag grammar as `compare` (--seed / --bootstrap, LAST occurrence
+      // wins) so one bootstrap convention covers every seeded report in the
+      // harness; parseRatioFlags is that parser, re-exported under this
+      // subcommand's name rather than reimplemented so the two cannot drift.
+      const ratioFlags = parseRatioFlags(process.argv);
+      process.exitCode = await runRatio({
+        json: process.argv.includes("--json"),
+        tf,
+        seed: ratioFlags.seed,
+        bootstrap: ratioFlags.bootstrap,
       });
     } else if (subcommand === "diagnose") {
       process.exitCode = await runTierDiagnostic({
