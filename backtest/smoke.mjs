@@ -85,14 +85,24 @@ import {
   bootstrapTransformed,
   cellOutcomes,
   currentRatio,
+  defaultHorizon,
+  dependentSampleGapPp,
   expectancyPercent,
   findZeroCrossing,
   hitRateInterval,
   labelExitAt,
+  minimumDetectableDifferencePp,
+  normalCdf,
+  normalQuantile,
+  observationsNeededForGapPp,
   parseRatioFlags,
+  parseRatioHorizonFlag,
+  pooledHitRate,
+  powerBlock,
   requiredRatio,
   ratioDirection,
   selectIndependent,
+  shortfallText,
   stopGridPct,
   surfaceCells,
   targetGridPct,
@@ -3493,6 +3503,755 @@ sec("exit-ratio");
   );
 }
 
+// ─── 13. horizon sweep: does a shorter hold buy a computable comparison? ─────
+//
+// The question this section exists to protect is the one the maintainer has to
+// decide on: "independence costs sample size, and the cost is dominated by the
+// window length — so if we shorten the horizon, does the comparison become
+// computable?" Every assertion below is DATA-FREE and hand-computable, because
+// the honest answer to that question is allowed to be "no", and a negative
+// result must be as well-founded as a positive one.
+//
+// Four things could each be wrong while still printing plausible numbers:
+//   * the partition at a NON-DEFAULT horizon — the sweep's whole premise is that
+//     a shorter window keeps more observations, so a partition that silently
+//     ignored the new width would fake the result;
+//   * the flag grammar — accepting 0, a float, or a missing value would measure
+//     a different trade than the caller asked for, silently;
+//   * the minimum-detectable-difference arithmetic — a wrong constant here would
+//     either promise power the sample does not have or hide power it does;
+//   * the DEFAULT PATH — the whole feature is worthless if running without the
+//     flag changed a byte of the report already on the record.
+
+sec("horizon-sweep");
+{
+  // Read locally rather than reusing a `const` from another section: those are
+  // block-scoped, and a shared name that silently resolved to `undefined` would
+  // make every source assertion below vacuously FALSE rather than loudly broken.
+  const ratioSrc = readFileSync(new URL("./ratio.mjs", import.meta.url), "utf8");
+  const runSrcRatio = readFileSync(new URL("./run.mjs", import.meta.url), "utf8");
+  const compareSrc = readFileSync(new URL("./compare.mjs", import.meta.url), "utf8");
+
+  // ── The partition at a non-default horizon ─────────────────────────────
+  //
+  // The same five signals the section above uses at 288 bars, now at 48:
+  //   bar  10 -> window 0
+  //   bar 200 -> window 4   (200 / 48 = 4.17 -> 4)
+  //   bar 600 -> window 12  (600 / 48 = 12.5  -> 12)
+  //   bar 900 -> window 18  (900 / 48 = 18.75 -> 18)
+  //   bar 950 -> window 19  (950 / 48 = 19.79 -> 19)
+  // At 48 bars the 200 and 950 signals are no longer crowded out by 10 and 900
+  // — they open windows of their own — so the SAME signals yield 5 kept instead
+  // of 3. That is the entire mechanism the hypothesis rests on, and it is the
+  // thing a stale 288-bar partition would have hidden.
+  const layout48 = [
+    { barIndex: 10, side: "long", price: 1 },
+    { barIndex: 200, side: "long", price: 1 },
+    { barIndex: 600, side: "short", price: 1 },
+    { barIndex: 900, side: "short", price: 1 },
+    { barIndex: 950, side: "short", price: 1 },
+  ];
+  const at48 = selectIndependent(layout48, 48);
+  check(
+    at48.selected.map((s) => s.barIndex).join(",") === "10,200,600,900,950",
+    `a 48-bar partition keeps all five (got ${at48.selected.map((s) => s.barIndex).join(",")}) — ` +
+      "the same signals that collapse to three at 288 bars stay independent when the window is short",
+  );
+  check(
+    at48.considered === 5 && at48.discarded === 0 && at48.windowsUsed === 5,
+    `5 considered, 5 kept, 0 discarded at 48 bars (got ${at48.considered}/${at48.discarded}/${at48.windowsUsed})`,
+  );
+  // The same layout at 288 is the section-12 answer, restated here so the two
+  // horizons are compared side by side rather than across two files.
+  const at288 = selectIndependent(layout48, 288);
+  check(
+    at288.selected.length === 3 && at288.discarded === 2,
+    `the SAME layout collapses to 3 kept / 2 discarded at 288 bars (got ${at288.selected.length}/${at288.discarded})`,
+  );
+  // The partition genuinely RESPONDS to the width: same signals, different n.
+  check(
+    at48.selected.length > at288.selected.length,
+    "a shorter window yields strictly more independent observations from the same signals",
+  );
+  // Window boundaries land exactly at multiples of the WIDTH, not of 288 — a
+  // partition that still used 288 internally would put bar 48 in window 0.
+  check(windowIndexOf(48, 48) === 1, "bar 48 opens the second 48-bar window");
+  check(windowIndexOf(47, 48) === 0, "bar 47 is still inside the first 48-bar window");
+  check(windowIndexOf(96, 48) === 2, "bar 96 opens the third 48-bar window");
+  check(windowIndexOf(48, 288) === 0, "and bar 48 is still inside the first 288-bar window");
+  // Crowding still collapses at a short width — the rule is not disabled by a
+  // smaller number, which is what "the horizon drives the partition" must mean.
+  // Forty signals at stride 1 occupy bars 0..39, which is genuinely inside ONE
+  // 48-bar window. (Stride 3 would have spanned 118 bars and filled three, which
+  // is a fixture that tests nothing about collapsing.)
+  const crowded48 = selectIndependent(
+    Array.from({ length: 40 }, (_, i) => ({ barIndex: i, side: "long", price: 1 })),
+    48,
+  );
+  check(
+    crowded48.selected.length === 1 && crowded48.selected[0].barIndex === 0,
+    `40 signals packed into one 48-bar window still collapse to the first (kept ${crowded48.selected.length})`,
+  );
+  // And the complementary case: the same 40 signals, one per window, all
+  // survive — so the collapse above is the window rule, not an artefact of count.
+  check(
+    selectIndependent(
+      Array.from({ length: 10 }, (_, i) => ({ barIndex: i * 48, side: "long", price: 1 })),
+      48,
+    ).selected.length === 10,
+    "ten signals exactly one 48-bar window apart all survive — the collapse is the window rule",
+  );
+  // Independence still holds at the short width: no two survivors are closer
+  // than one window.
+  check(
+    at48.selected.every((s, i) => i === 0 || s.barIndex - at48.selected[i - 1].barIndex >= 48),
+    "survivors at 48 bars are never closer than one 48-bar window",
+  );
+  // The width must be a POSITIVE INTEGER here too, or a caller reaching this
+  // function directly could partition by a meaningless width.
+  throws(() => selectIndependent(layout48, 0), RangeError, "a zero window width is rejected at any horizon");
+  throws(() => selectIndependent(layout48, 48.5), RangeError, "a fractional window width is rejected");
+  throws(() => selectIndependent(layout48, -48), RangeError, "a negative window width is rejected");
+  // Selection stays order-independent at the new width, as it is at 288.
+  check(
+    selectIndependent([...layout48].reverse(), 48).selected.map((s) => s.barIndex).join(",") ===
+      "10,200,600,900,950",
+    "selection at 48 bars is order-independent, as at 288",
+  );
+
+  // ── The --horizon flag grammar ──────────────────────────────────────────
+  //
+  // 48 and 1 parse; 0, a negative, a float, an exponent form, junk and a missing
+  // value are all refused. A silently-defaulted horizon would measure a
+  // different trade than the caller asked for and report it under this
+  // subcommand's name, which is the failure mode this parser exists to stop.
+  check(parseRatioHorizonFlag(["node", "run.mjs", "ratio", "--horizon", "48"]) === 48, "--horizon 48 parses");
+  check(parseRatioHorizonFlag(["node", "run.mjs", "ratio", "--horizon=48"]) === 48, "--horizon=48 parses");
+  check(parseRatioHorizonFlag(["node", "run.mjs", "ratio", "--horizon", "1"]) === 1, "--horizon 1 is legal");
+  check(
+    parseRatioHorizonFlag(["node", "run.mjs", "ratio", "--horizon", "100000"]) === 100000,
+    "a horizon larger than the dataset is the caller's business, not the parser's",
+  );
+  check(
+    parseRatioHorizonFlag(["node", "run.mjs", "ratio"]) === undefined,
+    "no --horizon → undefined, so the default path is distinguishable from an explicit 288",
+  );
+  check(
+    parseRatioHorizonFlag(["node", "run.mjs", "ratio", "--seed", "1", "--bootstrap", "500"]) === undefined,
+    "--horizon is absent when only the compare-shared flags are present",
+  );
+  check(
+    parseRatioHorizonFlag(["node", "run.mjs", "ratio", "--horizon", "24", "--horizon", "48"]) === 48,
+    "LAST occurrence wins, matching --seed and --bootstrap",
+  );
+  // THE REJECTION THE BRIEF ASKS FOR, spelled out both ways.
+  throws(
+    () => parseRatioHorizonFlag(["node", "run.mjs", "ratio", "--horizon", "0"]),
+    Error,
+    "--horizon 0 is REFUSED — a zero-bar hold is not a trade, and silently falling back to 288 would " +
+      "report the default under a flag that asked for something else",
+  );
+  throws(
+    () => parseRatioHorizonFlag(["node", "run.mjs", "ratio", "--horizon", "-48"]),
+    Error,
+    "--horizon -48 is refused: the hyphen makes it a non-digit string, not a number",
+  );
+  throws(
+    () => parseRatioHorizonFlag(["node", "run.mjs", "ratio", "--horizon", "48.5"]),
+    Error,
+    "--horizon 48.5 is refused rather than rounded to a bar the caller did not ask for",
+  );
+  throws(
+    () => parseRatioHorizonFlag(["node", "run.mjs", "ratio", "--horizon", "4.8e1"]),
+    Error,
+    "--horizon 4.8e1 is refused: a horizon arriving as a string is a wrapper quoting it wrong",
+  );
+  throws(
+    () => parseRatioHorizonFlag(["node", "run.mjs", "ratio", "--horizon", "abc"]),
+    Error,
+    "--horizon abc is refused",
+  );
+  throws(
+    () => parseRatioHorizonFlag(["node", "run.mjs", "ratio", "--horizon", ""]),
+    Error,
+    "--horizon with an empty value is refused, not read as 0 and defaulted",
+  );
+  throws(
+    () => parseRatioHorizonFlag(["node", "run.mjs", "ratio", "--horizon"]),
+    Error,
+    "--horizon with no value is refused rather than swallowing the next argument",
+  );
+  throws(
+    () => parseRatioHorizonFlag(["node", "run.mjs", "ratio", "--horizon", "--json"]),
+    Error,
+    "--horizon followed by another flag is refused rather than consuming it as a value",
+  );
+  // A 0 horizon and a 0 seed must be treated DIFFERENTLY: 0 is a legal seed and
+  // a legal draw count, and only the horizon is forbidden from it. Sharing one
+  // parser would have forced one of those rules to be loosened.
+  check(
+    parseRatioFlags(["node", "run.mjs", "ratio", "--seed", "0"]).seed === 0,
+    "--seed 0 is still LEGAL — the shared parser was not loosened to accommodate the horizon rule",
+  );
+  check(
+    parseRatioFlags(["node", "run.mjs", "ratio", "--bootstrap", "0"]).bootstrap === 0,
+    "--bootstrap 0 is still legal under the same parser",
+  );
+  // The default is READ from label.mjs rather than restated, so it cannot drift.
+  check(
+    defaultHorizon() === EXIT_RULE_DEFAULTS.maxHorizonBars,
+    "the default horizon is read from label.mjs's own constant, not hard-coded a second time",
+  );
+  check(defaultHorizon() === 288, `and that constant is still 288 (got ${defaultHorizon()})`);
+
+  // ── The power arithmetic, on hand-computable inputs ─────────────────────
+  //
+  // The normal quantiles are the whole basis of the design, so they are pinned
+  // against their published values FIRST. A wrong quantile here would silently
+  // inflate or deflate every power statement in the report.
+  //
+  // The tolerance is 1e-8, and that is the MEASURED accuracy of the shipped
+  // algorithm rather than a wish: Acklam's approximation, used unrefined, is
+  // 1.6e-9 from the published value at p = 0.975. The tolerance is five times
+  // that, so it pins the value to eight decimals — six orders of magnitude
+  // tighter than the 0.01 pp the report prints.
+  //
+  // This assertion is also the guard against re-introducing a "polish" step.
+  // Refining Acklam with Halley against normalCdf() is the obvious improvement
+  // and it makes the answer a THOUSAND TIMES worse (1.2e-6 instead of 1.6e-9),
+  // because Halley converges to the root of the approximate CDF it is handed.
+  // A tightened-looking change that silently degrades a constant is exactly what
+  // a value-pinned assertion is for.
+  check(
+    Math.abs(normalQuantile(0.975) - 1.959963985) < 1e-8,
+    `z for a two-sided 95% interval is 1.959964 to 8 decimals (got ${normalQuantile(0.975)}) — ` +
+      "and this tolerance FAILS if a Halley refinement is added back",
+  );
+  check(
+    Math.abs(normalQuantile(0.8) - 0.841621234) < 1e-8,
+    `z for 80% power is 0.841621 to 8 decimals (got ${normalQuantile(0.8)})`,
+  );
+  // The CDF itself, against published values, at the accuracy it has.
+  let cdfAccuracyOk = true;
+  for (const [x, published] of [
+    [0.5, 0.6914624612740131],
+    [1, 0.8413447460685429],
+    [1.5, 0.9331927987311419],
+    [2, 0.9772498680518208],
+    [3, 0.9986501019683699],
+    [1.959963985, 0.975],
+    [0.841621234, 0.8],
+  ]) {
+    if (Math.abs(normalCdf(x) - published) > 1e-7) cdfAccuracyOk = false;
+  }
+  check(
+    cdfAccuracyOk,
+    "the CDF matches published Phi values to 1e-7 across 0.5..3 — the algorithm's real accuracy, " +
+      "measured rather than assumed",
+  );
+  // The quantile must be a genuine inverse of the CDF it will be used with.
+  // The tolerance is the CDF's own 7e-8 floor: no quantile can invert an
+  // approximation more precisely than that approximation is defined, and
+  // asserting tighter would be asserting a property the function cannot have.
+  let quantileRoundTrip = true;
+  for (const p of [0.001, 0.01, 0.025, 0.1, 0.2, 0.5, 0.8, 0.9, 0.975, 0.99, 0.999]) {
+    const z = normalQuantile(p);
+    if (Math.abs(normalCdf(z) - p) > 1e-7) quantileRoundTrip = false;
+  }
+  check(
+    quantileRoundTrip,
+    "Φ(normalQuantile(p)) === p to 1e-7 across the range — the quantile inverts the CDF to within " +
+      "the CDF's own error, which is the strongest property it can have",
+  );
+  check(Math.abs(normalCdf(0) - 0.5) < 1e-8, "Φ(0) is 0.5 to 8 decimal places");
+  check(normalCdf(8) > 0.999999999 && normalCdf(-8) < 1e-9, "the CDF saturates in both tails");
+  check(
+    Math.abs(normalCdf(0.7) + normalCdf(-0.7) - 1) < 1e-7,
+    "Φ is symmetric about zero: Phi(x) + Phi(-x) = 1, so a sign slip cannot hide",
+  );
+  // Monotone in p — a quantile function that is not monotone would make
+  // "higher confidence needs a larger z" false somewhere. The sweep is built
+  // from integer percentages rather than by repeated addition, because
+  // accumulating 0.01 in binary floating point overshoots 1.0 and asks for a
+  // quantile outside the domain.
+  let quantileMonotone = true;
+  for (let i = 1; i < 99; i++) {
+    const p = i / 100;
+    if (normalQuantile(p) >= normalQuantile((i + 1) / 100)) quantileMonotone = false;
+  }
+  check(
+    quantileMonotone,
+    "the quantile is strictly increasing in p, so a larger confidence or power always demands a larger z",
+  );
+  throws(() => normalQuantile(0), RangeError, "a quantile at 0 is rejected, not infinite");
+  throws(() => normalQuantile(1), RangeError, "a quantile at 1 is rejected, not infinite");
+  throws(() => normalQuantile(1.5), RangeError, "a quantile above 1 is rejected");
+  throws(() => normalQuantile(-0.1), RangeError, "a quantile below 0 is rejected");
+
+  // MDD, hand-computed. At p̄ = 0.5, n₁ = n₂ = 100, 95% two-sided and 80% power:
+  //   (1.959963985 + 0.841621234) * sqrt( 0.25 * (1/100 + 1/100) ) * 100
+  // = 2.801585219 * sqrt(0.005) * 100
+  // = 2.801585219 * 0.0707106781 * 100  = 19.8102
+  // The published z values are used in the expected figure, NOT this file's own
+  // quantiles — otherwise the assertion would be circular and would pass even if
+  // both the quantiles and the formula were wrong together.
+  const mdd100 = minimumDetectableDifferencePp(100, 100, 0.5);
+  check(
+    Math.abs(mdd100 - (1.959963985 + 0.841621234) * Math.sqrt(0.005) * 100) < 1e-4,
+    `MDD at n=100 per arm, p=0.5 is 19.8102 pp (got ${mdd100.toFixed(4)})`,
+  );
+  check(
+    mdd100 > 19.8 && mdd100 < 19.82,
+    `the same figure to two decimals, 19.81 pp (got ${mdd100.toFixed(2)})`,
+  );
+  // The variance factor is 1/n1 + 1/n2, so unequal arms are handled and the
+  // result sits between the two equal-arm cases it is bounded by.
+  const mddUneq = minimumDetectableDifferencePp(50, 200, 0.5);
+  check(
+    mddUneq > minimumDetectableDifferencePp(100, 100, 0.5) &&
+      mddUneq < minimumDetectableDifferencePp(50, 50, 0.5),
+    "an uneven pair (50/200) gives a wider MDD than (100/100) and a narrower one than (50/50)",
+  );
+  // Quadrupling n halves the MDD — the sqrt(n) scaling, asserted as a property
+  // rather than a value so it holds for any p and any arm split.
+  check(
+    Math.abs(
+      minimumDetectableDifferencePp(400, 400, 0.3) / minimumDetectableDifferencePp(100, 100, 0.3) - 0.5,
+    ) < 1e-9,
+    "4x the observations halves the minimum detectable difference (sqrt(n) scaling)",
+  );
+  // The binomial variance is maximal at p = 0.5, so the worst case must bound
+  // every other pooled rate from above at the same n.
+  let worstCaseHolds = true;
+  for (const n of [30, 131, 249, 1000]) {
+    const worst = minimumDetectableDifferencePp(n, n, 0.5);
+    for (const p of [0.05, 0.2, 0.3478, 0.5, 0.7, 0.95]) {
+      if (minimumDetectableDifferencePp(n, n, p) > worst + 1e-12) worstCaseHolds = false;
+    }
+  }
+  check(
+    worstCaseHolds,
+    "p = 0.5 bounds every pooled rate from above, so the worst-case column is a real bound",
+  );
+  // Degenerate inputs return null — "this sample can detect nothing" is a fact,
+  // and a very large number would read like a measurement.
+  check(minimumDetectableDifferencePp(0, 100, 0.35) === null, "zero observations → null, not a huge number");
+  check(minimumDetectableDifferencePp(100, 0, 0.35) === null, "a zero-sized second arm → null");
+  check(minimumDetectableDifferencePp(100, 100, 0) === null, "a pooled rate of 0 → null (no variance to use)");
+  check(minimumDetectableDifferencePp(100, 100, 1) === null, "a pooled rate of 1 → null");
+  check(minimumDetectableDifferencePp(100, 100, null) === null, "an undefined pooled rate → null");
+  throws(
+    () => minimumDetectableDifferencePp(100, 100, 0.35, 1.5, 0.8),
+    RangeError,
+    "a confidence outside (0, 1) is rejected rather than silently producing a z",
+  );
+  throws(
+    () => minimumDetectableDifferencePp(100, 100, 0.35, 0.95, 0),
+    RangeError,
+    "a power of 0 is rejected rather than asking for infinite n",
+  );
+
+  // n needed, hand-computed and INVERSE of the MDD above. For a 2.5 pp gap at
+  // p̄ = 0.5: 2 * (2.801585)^2 * 0.25 / 0.025^2 = 2 * 7.848879 * 0.25 / 0.000625
+  // = 3.924440 / 0.000625 = 6279.1  ->  6280 per arm.
+  const nFor25 = observationsNeededForGapPp(2.5, 0.5);
+  check(
+    Math.abs(nFor25 - Math.ceil((2 * 2.801585219 ** 2 * 0.25) / 0.025 ** 2)) < 1,
+    `n for a 2.5 pp gap at p=0.5 is 6,280 per arm (got ${nFor25})`,
+  );
+  check(nFor25 === 6280, `exactly 6,280 (got ${nFor25})`);
+  // THE INVERSE PROPERTY, and it is the one that matters: feeding n back into
+  // the MDD must land within rounding of the gap we asked for. If these two
+  // formulas ever drifted apart the report would print a shortfall against a
+  // target it could not itself have reached.
+  let inverseHolds = true;
+  for (const gap of [1, 2.5, 5, 8, 10]) {
+    for (const p of [0.2, 0.3478, 0.5]) {
+      const n = observationsNeededForGapPp(gap, p);
+      const mdd = minimumDetectableDifferencePp(n, n, p);
+      // Ceil() can leave the MDD a hair BELOW the gap; a hair ABOVE would mean
+      // the "n needed" is one short, which is a real defect.
+      if (mdd > gap + 1e-6) inverseHolds = false;
+    }
+  }
+  check(
+    inverseHolds,
+    "observationsNeededForGapPp(n) inverts minimumDetectableDifferencePp(n): the n it reports is never " +
+      "one short of what its own MDD formula would require",
+  );
+  // And the two together are monotone in the direction the hypothesis needs:
+  // a smaller gap demands more observations, a shorter-horizon sample with the
+  // same rate demands the same n. Asserted as orderings, not values.
+  check(
+    observationsNeededForGapPp(1, 0.35) > observationsNeededForGapPp(2.5, 0.35) &&
+      observationsNeededForGapPp(2.5, 0.35) > observationsNeededForGapPp(5, 0.35),
+    "a SMALLER gap needs MORE observations, at every pooled rate tested",
+  );
+  // VARIANCE, and its direction, which is easy to state backwards: p(1-p) is
+  // MAXIMAL at p = 0.5, so p = 0.5 is the rate that needs the MOST observations
+  // and rates near 0 or 1 need the fewest. (The first draft of this assertion
+  // claimed the opposite and failed — the arithmetic was right and the
+  // sentence was wrong.)
+  check(
+    observationsNeededForGapPp(2.5, 0.1) < observationsNeededForGapPp(2.5, 0.5),
+    "p = 0.1 needs FEWER observations than p = 0.5 for the same gap: the binomial variance p(1-p) is " +
+      "maximal at 0.5, and 0.1 needs 2,261 against 0.5's 6,280",
+  );
+  check(
+    observationsNeededForGapPp(2.5, 0.32) < observationsNeededForGapPp(2.5, 0.5),
+    "and the same holds at 0.32, the rate slice 9 actually measured on 1h",
+  );
+  // The 2.5 pp figure the whole exercise turns on. At the pooled rate slice 9
+  // measured (~0.32 on 1h) the requirement is 5,466 per model — against the 130
+  // resolved observations the 288-bar partition actually yields, a 42x
+  // shortfall. This is the number that decides the exercise, so it is pinned.
+  const nFor25at32 = observationsNeededForGapPp(2.5, 0.32);
+  check(
+    nFor25at32 === 5466,
+    `a 2.5 pp gap at p̄ = 0.32 needs exactly 5,466 independent observations per model (got ${nFor25at32})`,
+  );
+  check(
+    nFor25at32 / 130 > 40,
+    `that is ${(nFor25at32 / 130).toFixed(0)}x the 130 resolved observations the 288-bar partition ` +
+      "yields — the shortfall is structural, not marginal",
+  );
+  check(
+    observationsNeededForGapPp(0, 0.5) === Infinity,
+    "a zero gap needs UNBOUNDED n, not a number that would suggest a sample size exists",
+  );
+  check(observationsNeededForGapPp(null, 0.5) === null, "an undefined gap → null");
+  check(observationsNeededForGapPp(2.5, 0) === null, "a pooled rate of 0 → null, not a divide-by-zero");
+  throws(() => observationsNeededForGapPp(-1, 0.5), RangeError, "a negative gap is rejected");
+  throws(
+    () => observationsNeededForGapPp(2.5, 0.5, 2, 0.8),
+    RangeError,
+    "a confidence outside (0, 1) is rejected",
+  );
+
+  // Pooling: every win over every resolved observation, both models. A weighted
+  // and a binary scope of 40 wins over 100 resolved each pool to 0.40, NOT to
+  // the average of the two rates weighted equally by SCOPE — the variance a
+  // difference test sees is around the pooled mean, and pooling by count is what
+  // makes that true when the arms differ in size.
+  const scopeA = { counts: { win: 30, loss: 70 }, resolved: 100 };
+  const scopeB = { counts: { win: 50, loss: 50 }, resolved: 100 };
+  check(
+    Math.abs(pooledHitRate(scopeA, scopeB) - 0.4) < 1e-12,
+    `pooled rate is (30+50)/(100+100) = 0.40 (got ${pooledHitRate(scopeA, scopeB)})`,
+  );
+  const smallA = { counts: { win: 1, loss: 9 }, resolved: 10 };
+  const bigB = { counts: { win: 50, loss: 50 }, resolved: 100 };
+  check(
+    Math.abs(pooledHitRate(smallA, bigB) - 51 / 110) < 1e-12,
+    "pooling weights by OBSERVATION COUNT, not equally by scope — an unequal pair does not average to 0.5",
+  );
+  check(pooledHitRate({ counts: { win: 0, loss: 0 }, resolved: 0 }, scopeB) === 0.5, "a scope with nothing resolved contributes nothing");
+  check(
+    pooledHitRate({ counts: { win: 0, loss: 0 }, resolved: 0 }, { counts: { win: 0, loss: 0 }, resolved: 0 }) === null,
+    "two empty scopes pool to null rather than 0, which would read as a real rate of zero",
+  );
+
+  // The power block, on a pair whose answer can be checked by hand.
+  const pw = powerBlock(
+    { counts: { win: 40, loss: 60 }, resolved: 100, hitRatePercent: 40 },
+    { counts: { win: 50, loss: 50 }, resolved: 100, hitRatePercent: 50 },
+    2.5,
+  );
+  check(
+    Math.abs(pw.minimumDetectableDifferencePp - minimumDetectableDifferencePp(100, 100, 0.45)) < 1e-4,
+    "the block's MDD is the standalone MDD on the POOLED rate, not on either arm's own rate",
+  );
+  check(pw.observedGapPp === 10, `the observed gap is binary minus weighted (got ${pw.observedGapPp})`);
+  check(pw.observations.weighted === 100 && pw.observations.binary === 100, "both arms' n are carried");
+  check(
+    pw.sampleAdequateForReferenceGap === false,
+    "a 100/arm sample is NOT adequate for a 2.5 pp gap — MDD 18.2 pp is far above it",
+  );
+  check(
+    /COULD NOT have detected/.test(pw.verdict),
+    "the verdict says the sample could not have detected the reference gap, in those words",
+  );
+  // The mirror case: a large n and a large reference gap flips the verdict, so
+  // the wording is not hard-wired to the negative.
+  const pwBig = powerBlock(
+    { counts: { win: 4900, loss: 5100 }, resolved: 10000, hitRatePercent: 49 },
+    { counts: { win: 5100, loss: 4900 }, resolved: 10000, hitRatePercent: 51 },
+    2.5,
+  );
+  check(
+    pwBig.sampleAdequateForReferenceGap === true && /COULD have detected/.test(pwBig.verdict),
+    "10,000 observations per arm IS adequate for a 2.5 pp gap, and the verdict flips to say so",
+  );
+  // The shortfall names the multiple, and flags a requirement the grid's ceiling
+  // structurally cannot reach.
+  const pwShort = powerBlock(
+    { counts: { win: 40, loss: 60 }, resolved: 100, hitRatePercent: 40 },
+    { counts: { win: 50, loss: 50 }, resolved: 100, hitRatePercent: 50 },
+    2.5,
+  );
+  check(
+    pwShort.referenceGapShortfallObservations > 0 && pwShort.referenceGapShortfallMultiple > 60,
+    `the shortfall is reported in both observations and multiples (${pwShort.referenceGapShortfallObservations}, ` +
+      `${pwShort.referenceGapShortfallMultiple}x)`,
+  );
+  // A shortfall the grid's ceiling could NOT close is flagged, because "fetch
+  // more data" and "no more data exists on this grid" are different decisions.
+  check(
+    /CEILING/.test(shortfallText(pwShort, 100, 200)),
+    "a requirement above the grid's structural ceiling is flagged > CEILING, because no amount of " +
+      "history on this grid can close it",
+  );
+  check(
+    !/CEILING/.test(shortfallText(pwShort, 100, 100000)),
+    "and it is NOT flagged when the ceiling is far above the requirement — a fetch problem and a " +
+      "structural one must not read the same",
+  );
+  check(
+    /surplus/.test(shortfallText(pwBig, 10000, 20000)),
+    "a sample larger than needed reports a surplus rather than a shortfall",
+  );
+  check(shortfallText({ observationsNeededForReferenceGap: Infinity }, 10, 100) === "needs unbounded n", "a zero gap prints 'needs unbounded n'");
+  check(shortfallText({ observationsNeededForReferenceGap: null, referenceGapShortfallObservations: null }, 10, 100) === "n/a", "no requirement → n/a, never a fabricated 0");
+
+  // ── The default path is unchanged ───────────────────────────────────────
+  //
+  // Not a re-run of the report — that is the maintainer's byte diff, and this
+  // suite has no data. What IS asserted here is every mechanism by which the
+  // default could have moved: the default horizon is label.mjs's own constant,
+  // an absent flag is distinguishable from an explicit one, and the new
+  // sections are GATED on that distinction rather than on a value comparison.
+  check(
+    /const horizon = options\.horizon \?\? EXIT_RULE_DEFAULTS\.maxHorizonBars;/.test(ratioSrc),
+    "the horizon falls back to label.mjs's OWN default, so the no-flag run cannot drift from it",
+  );
+  check(
+    /const horizonRequested = options\.horizon !== undefined && options\.horizon !== null;/.test(ratioSrc),
+    "'was --horizon asked for' is tracked SEPARATELY from the horizon value, so an explicit 288 and an " +
+      "absent flag are not the same thing",
+  );
+  check(
+    /if \(r\.horizon\.requested\) \{\s*\n\s*printHorizonBanner\(r\);\s*\n\s*printPower\(r\);/.test(ratioSrc),
+    "BOTH new report sections are gated on horizon.requested, so the default report prints neither",
+  );
+  check(
+    ratioSrc.includes("HORIZON OVERRIDE") && /r\.horizon\.requested\) \{/.test(ratioSrc),
+    "the config-line horizon override is gated too — the default report's config block is untouched",
+  );
+  check(
+    /r\.horizon\.requested\s*\?\s*""\s*:\s*" That ceiling is the reason the interval below is wide\."/.test(ratioSrc),
+    "the ceiling sentence is emitted verbatim on the default path and only extended under --horizon, so " +
+      "the shipped report keeps its original wording",
+  );
+  check(
+    ratioSrc.includes("TRUNCATES every trade that would have reached"),
+    "the truncation bias is stated in the report BODY, not only in a closing caveat — it is the single " +
+      "most likely misreading of a horizon sweep",
+  );
+  check(
+    ratioSrc.includes("MULTIPLE TESTING") && /NO multiplicity correction is applied/.test(ratioSrc),
+    "the multiple-testing caveat names itself AND names the absence of a correction, rather than leaving " +
+      "a reader to assume one was applied",
+  );
+  check(
+    ratioSrc.includes("A RATIO FITTED AT ONE HORIZON DOES NOT TRANSFER TO ANOTHER"),
+    "the non-transferability of a per-horizon ratio is stated, so the required-ratio table cannot be " +
+      "read as a list of candidates",
+  );
+  check(
+    /!Number\.isInteger\(horizon\) \|\| horizon < 1/.test(ratioSrc),
+    "the run itself re-validates the horizon, so a caller bypassing the flag parser cannot pass 0",
+  );
+  check(
+    ratioSrc.includes("slippageTicks: 2") && !/slippage.*ticks.*percent|percent.*ticks/.test(
+      ratioSrc.replace(/^\s*\/\/.*$/gm, ""),
+    ),
+    "no percentage is ever invented for the two slippage ticks — the ticks stay ticks at every horizon",
+  );
+  // The ceiling is a NUMBER in the JSON, not only a formatted sentence, so a
+  // consumer can compare horizons without parsing prose.
+  check(
+    /maxObservationsPerScope: Math\.ceil\(candles\.length \/ horizon\)/.test(ratioSrc),
+    "the bars/horizon ceiling is carried as a number in the JSON, not only in a printed line",
+  );
+  check(
+    /normalQuantile\(1 - \(1 - confidence\) \/ 2\)/.test(ratioSrc) &&
+      /normalQuantile\(power\)/.test(ratioSrc),
+    "the design's two quantiles are read from ONE normalQuantile, so confidence and power cannot be " +
+      "hard-coded to inconsistent tables",
+  );
+  // run.mjs must pass the parsed horizon through rather than swallow it.
+  check(
+    /import\s*\{[^}]*parseRatioHorizonFlag[^}]*\}\s*from\s*"\.\/ratio\.mjs"/.test(runSrcRatio),
+    "run.mjs imports the horizon parser from ratio.mjs",
+  );
+  check(
+    /horizon: parseRatioHorizonFlag\(process\.argv\)/.test(runSrcRatio),
+    "run.mjs passes the parsed horizon into runRatio — the flag reaches the analysis",
+  );
+  // parseCompareFlags must NOT have been widened: a shared parser carrying a
+  // flag only `ratio` accepts would be a test edit made to fit a new feature.
+  check(
+    !/parseCompareFlags[\s\S]{0,600}horizon/.test(compareSrc),
+    "compare.mjs's shared flag parser was NOT widened to carry --horizon; the new flag has its own parser",
+  );
+  check(
+    /return \{\s*\n\s*seed: readInt\("--seed"\),\s*\n\s*bootstrap: readInt\("--bootstrap"\),\s*\n\s*\};/.test(
+      compareSrc,
+    ),
+    "parseCompareFlags still returns exactly { seed, bootstrap } — the literal smoke asserts verbatim is intact",
+  );
+  check(
+    /if \(horizon > maxHorizonBars\) continue;/.test(ratioSrc),
+    "a hold LONGER than the partition is dropped from the horizon table: at a short --horizon it would " +
+      "otherwise re-introduce exactly the shared-forward-bar dependence the partition exists to remove",
+  );
+  // The reference gap is COMPUTED from the signals, never hard-coded, so it
+  // cannot be a stale number from another report at another horizon or grid.
+  // Comments are stripped first: the file's own docstrings legitimately NAME the
+  // 1h value while explaining why it must not be baked in, and asserting on
+  // prose would fail for the right reason.
+  const ratioCode = ratioSrc.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+  check(
+    ratioSrc.includes("dependentSampleGapPp") &&
+      /const referenceGap = dependentSampleGapPp\(labelCandles, signals, horizon\);/.test(ratioCode),
+    "the reference gap is COMPUTED from this run's signals at this horizon, not passed in",
+  );
+  check(
+    !/referenceGapPp\s*[:=]\s*2\.5|2\.5\b(?=[^)]*referenceGap)/.test(ratioCode),
+    "no 2.5 pp literal is assigned to the reference gap anywhere in the code",
+  );
+  // The note that reaches a JSON consumer must carry the VALUE, because the
+  // value is negative on 4h and a fixed "+2.50 pp" would misdescribe it there.
+  const noteBlock = powerBlock(
+    { counts: { win: 40, loss: 60 }, resolved: 100, hitRatePercent: 40 },
+    { counts: { win: 50, loss: 50 }, resolved: 100, hitRatePercent: 50 },
+    -12.5,
+  );
+  check(
+    noteBlock.design.referenceGapNote.includes("-12.5 pp") &&
+      !noteBlock.design.referenceGapNote.includes("+2.50"),
+    "the JSON's reference-gap note interpolates the computed value AND its sign, so a negative gap on " +
+      "4h is described as negative rather than as a remembered +2.50 pp",
+  );
+  check(
+    powerBlock(
+      { counts: { win: 40, loss: 60 }, resolved: 100, hitRatePercent: 40 },
+      { counts: { win: 50, loss: 50 }, resolved: 100, hitRatePercent: 50 },
+      2.5,
+    ).design.referenceGapNote.includes("+2.5 pp"),
+    "and a positive gap is described with an explicit + sign, so direction is never left to inference",
+  );
+  // The dependent gap itself, on a fixture whose answer is known by hand.
+  //
+  // The exit scan starts on the bar AFTER the signal, so a signal on bar b is
+  // decided by bar b+1. The function takes ONE candle array for both models, so
+  // the two models are separated by PARITY rather than by a second series: even
+  // bars resolve as losses and odd bars as wins, and each model's signals sit on
+  // the parity whose FORWARD bar is the outcome that model should have.
+  //   a loss bar: low 98, which touches the -0.8% stop (99.2) and never the
+  //             +1.5% target (101.5)
+  //   a win bar:  high 102, which touches the target and clears the stop
+  const lossBar = { high: 100, low: 98, close: 100 };
+  const winBar = { high: 102, low: 100, close: 100 };
+  const flatBar = { high: 100, low: 100, close: 100 };
+  /** evenBarResolvesAsWin: true -> bar 0 loses, bar 1 wins. */
+  const depSeries = (n, evenBarResolvesAsWin) =>
+    Array.from({ length: n }, (_, i) =>
+      (i % 2 === 0) === evenBarResolvesAsWin ? winBar : lossBar,
+    );
+  const at = (...bars) => bars.map((barIndex) => ({ barIndex, side: "long", price: 100 }));
+  const evenBars = at(0, 2, 4, 6);
+  const oddBars = at(1, 3, 5, 7);
+
+  // Even bars LOSE, odd bars WIN: weighted's even-bar signals scan odd bars and
+  // win; binary's odd-bar signals scan even bars and lose -> 100% vs 0% -> -100.
+  const depDown = dependentSampleGapPp(depSeries(24, false), { weighted: evenBars, binary: oddBars }, 4);
+  check(
+    depDown.weighted.hitRatePercent === 100 && depDown.binary.hitRatePercent === 0 && depDown.gapPp === -100,
+    `the gap is binary MINUS weighted over every signal (got ${depDown.gapPp} pp from ` +
+      `${depDown.weighted.hitRatePercent}% / ${depDown.binary.hitRatePercent}%) — negative when ` +
+      "weighted wins more, which is the 4h situation",
+  );
+  // Swapping the parity flips the sign to +100: the direction is data, not a
+  // constant, and a note that hard-coded "+2.50 pp" would misdescribe this case.
+  const depUp = dependentSampleGapPp(depSeries(24, true), { weighted: evenBars, binary: oddBars }, 4);
+  check(
+    depUp.weighted.hitRatePercent === 0 && depUp.binary.hitRatePercent === 100 && depUp.gapPp === 100,
+    `and +100 pp when binary wins more (got ${depUp.gapPp} pp) — the same fixture with the parity swapped`,
+  );
+  // A non-degenerate mixed case, with the arithmetic written out rather than
+  // asserted from memory — the first draft of this check miscounted the forward
+  // bars and expected -41.67 pp where the fixture produces -16.67.
+  //   series: even bars LOSE, odd bars WIN
+  //   weighted signals at bars 0, 1, 4 -> scan bars 1 (W), 2 (L), 5 (W) = 2/3
+  //   binary   signals at bars 1, 2, 4 -> scan bars 2 (L), 3 (W), 5 (W) = 2/3
+  // Both land on 2 of 3, so this one checks the COUNTS rather than the gap. The
+  // gap is checked just below with a fixture whose two rates actually differ.
+  const mixedWeighted = at(0, 1, 4);
+  const mixedBinary = at(1, 2, 4);
+  const mixed = dependentSampleGapPp(
+    depSeries(24, false),
+    { weighted: mixedWeighted, binary: mixedBinary },
+    4,
+  );
+  check(
+    mixed.weighted.win === 2 && mixed.weighted.loss === 1 && mixed.weighted.resolved === 3 &&
+      mixed.binary.win === 2 && mixed.binary.resolved === 3 && mixed.gapPp === 0,
+    `a mixed fixture resolves 2W/1L per model -> both 66.67% -> gap 0 (got ` +
+      `${mixed.weighted.win}W/${mixed.weighted.loss}L vs ${mixed.binary.win}W/${mixed.binary.loss}L ` +
+      `= ${mixed.gapPp} pp)`,
+  );
+  // And a fixture whose two rates genuinely differ, so the subtraction is
+  // exercised on non-identical inputs: weighted 1 of 3 = 33.33%, binary 2 of 3
+  // = 66.67% -> -33.33 pp.
+  const diff = dependentSampleGapPp(
+    depSeries(24, false),
+    { weighted: at(0, 1, 2), binary: at(0, 2, 4) },   // 0->1 W, 1->2 L, 2->3 W | 0->1 W, 2->3 W, 4->5 W
+    4,
+  );
+  check(
+    Math.abs(diff.weighted.hitRatePercent - 66.6667) < 1e-3 &&
+      diff.binary.hitRatePercent === 100 &&
+      Math.abs(diff.gapPp - 33.3333) < 1e-3,
+    `unequal rates subtract correctly: 66.67% vs 100.00% = +33.33 pp (got ` +
+      `${diff.weighted.hitRatePercent}% vs ${diff.binary.hitRatePercent}% = ${diff.gapPp} pp)`,
+  );
+  // Timeout and insufficient_data are EXCLUDED, so an all-flat series resolves
+  // nothing and both rates are null — never 0, which would read as "lost every
+  // trade" and would silently become a gap of zero.
+  const depNone = dependentSampleGapPp(
+    Array.from({ length: 24 }, () => flatBar),
+    { weighted: evenBars, binary: oddBars },
+    4,
+  );
+  check(
+    depNone.gapPp === null && depNone.weighted.resolved === 0 && depNone.binary.resolved === 0,
+    "an all-timeout series gives a NULL gap, not 0 — the two are different statements",
+  );
+  check(
+    depUp.weighted.signals === 4 && depUp.binary.signals === 4 && depUp.note.includes("DEPENDENT"),
+    "it counts every signal with no partitioning, and says in the JSON that it is dependent",
+  );
+  check(
+    depUp.horizonBars === 4,
+    "it echoes the horizon it was measured at, so a consumer can tell which trade it describes",
+  );
+  // No partitioning: signals one bar apart all count, which is the whole
+  // difference from the independent sample and the reason this number is
+  // labelled dependent. At a 288-bar window those same signals collapse to one.
+  const adjacent = at(0, 1, 2, 3, 4, 5);
+  check(
+    dependentSampleGapPp(depSeries(24, false), { weighted: adjacent, binary: adjacent }, 4)
+      .weighted.signals === 6,
+    "six signals one bar apart are all counted — this function does NOT partition, which is exactly " +
+      "why its number is not an interval",
+  );
+  check(
+    selectIndependent(adjacent, 288).selected.length === 1,
+    "and the independent sample collapses those same six to one — the difference this gap records",
+  );
+}
+
 // ─── Report ─────────────────────────────────────────────────────────────────
 
 const ORDER = [
@@ -3508,6 +4267,7 @@ const ORDER = [
   "timeframe-table",
   "cluster-bootstrap",
   "exit-ratio",
+  "horizon-sweep",
 ];
 console.log("section            checks");
 for (const name of ORDER) {
