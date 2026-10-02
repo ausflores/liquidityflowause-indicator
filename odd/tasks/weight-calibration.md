@@ -581,7 +581,7 @@ confirmation of it.
 comparison**, because the model comparison is indeterminate and the
 expectancy finding is not.
 
-### T17 — Exit-ratio analysis on non-overlapping samples ✅ (in progress, slice 9 · GitHub PR #21)
+### T17 — Exit-ratio analysis on non-overlapping samples ✅ (delivered in slice 9 · GitHub PR #21)
 
 *(Inserted after the maintainer's decision of 2026-10-01, which chose the exit
 ratio over the weight search. Numbered after T16 because the findings report
@@ -619,10 +619,61 @@ because it was treated as fixed.
   288h on 1h and 1,152h on 4h. A 1.5% target over a day and over twelve days
   are different trades. If the required ratio varies materially with horizon,
   that is the finding.
-- [ ] Extend the caveats: costs are already modelled as 0.10% round trip before
+- [x] Extend the caveats: costs are already modelled as 0.10% round trip before
   slippage, so every expectancy here is an upper bound; and **taking one signal
   per window is a selection effect** — it is the model's behaviour at one
   arbitrary point per window, not a random draw.
+
+**The method change is the result's precondition.** On 1h the independent
+sample keeps **131 of 307** weighted signals (57.3% discarded) and **153 of
+1,701** binary signals (91.0% discarded), hitting the `bars / 288 ≈ 153`
+ceiling. Selection rule: **earliest entry bar within each window** — the only
+rule that cannot see the outcome, since "highest score" selects on the thing
+under test and "closest to a level" needs zone state and biases toward grazing
+setups.
+
+**The motivating hypothesis did not survive.** On the independent sample:
+
+| 1h | hit rate | 95% CI | resolved | required for 1.5/0.8 |
+|---|---|---|---|---|
+| weighted | 30.77% | [22.90, 38.93] | 130 | 34.78% |
+| binary | **38.82%** | [31.37, 46.71] | 152 | 34.78% |
+
+**The sign reversed** against the dependent-sample reading in the findings
+report, which had both models below break-even. Binary is now above the
+requirement on the point estimate and weighted below — but **both intervals
+contain 34.78%**, so neither is established. The premise that the exit ratio
+binds harder than the weights is **unsupported, not confirmed**.
+
+**The zero crossing is NOT identified on any grid** — 0 of 24 sweeps, both
+models, all three timeframes. A crossing is reported only where one cell's
+whole interval sits below zero while its neighbour's whole interval sits above
+it, and that never happens. **No ratio is recommended and no best cell is
+reported.**
+
+**What did survive, and is the stronger finding:** the required `T/S` is **not
+constant in the hold**. On 1h weighted it runs 2.577 at 6 bars → 2.200 at 48,
+against a shipped 1.875; 4h binary runs 5.167 → 3.750. The **direction** is
+visible — one fixed ratio is being applied to trades that are not the same
+trade — but the **magnitude is not pinned**, because the extremes' intervals
+overlap heavily. Each horizon row re-labels at its own cap, so the rows are
+**not nested samples** and the count per row is the honest denominator.
+
+**Two bugs caught in this slice's own new code by its own smoke suite**, both
+fixed rather than papered over: the anti-drift check compared against
+`label.mjs`'s default 288-bar horizon instead of the horizon it was asked to
+match, and `requiredRatio(0)` threw and crashed the entire 5m run.
+
+**One defect the orchestrator caught after delivery:** the report's
+surplus/deficit label was **inverted on every grid, scope and horizon row** —
+`gap` is defined `requiredRatio(h) − shippedRatio` while the sentence was
+phrased from `shipped − required`, and the two ends were never reconciled. It
+told readers that weighted (which needs 2.250 against a shipped 1.875) was in
+surplus. Root-caused, fixed, and the word now lives in one function
+(`ratioDirection()`) with 18 data-free checks asserting it — **mutation-tested
+by reverting the function and confirming 7 checks fail.** A second collision
+surfaced: `deficit` already meant *hit-rate* deficit two tables above, so the
+two are now named `HIT-RATE deficit` and `RATIO deficit`.
 
 ### T12 — Weight search
 
@@ -845,20 +896,30 @@ to the non-tier factors, or higher-timeframe data must be used.
       toward a bar that may be unreachable fits noise. The binding constraint
       appears to be the **exit ratio, not the weights**, and it was never
       searched because it was treated as fixed.
-- [ ] **T17 — slice 9 in progress** (exit-ratio analysis on non-overlapping
-      samples), chosen by the user over the weight search on 2026-10-01 after
-      the report showed D.4's 1.5/0.8 requires a 34.78% hit rate that neither
-      model reaches on 1h. **Orchestrator changed the method, not just the
-      scope**: a ratio sweep on the existing signals would be fitting noise,
-      because slice 8 proved those signals are one measurement repeated. The
-      sample is rebuilt as **at most one signal per forward window per model per
-      side** — on 1h roughly 152 observations instead of 1,701. Small but
-      honest. The slice is required to report the zero-crossing of the
-      expectancy surface and is **explicitly forbidden from recommending a
-      ratio**, because picking the best cell of a sweep on one sample is the
-      overfitting this project exists to prevent.
-- [ ] T12 — weight search (**deferred to slice 10, and the report says why**:
-      optimising 11 parameters toward a bar that may be unreachable fits noise)
+- [x] **T17 — slice 9 delivered** (exit-ratio analysis on non-overlapping
+      samples) → shipped as **GitHub PR #21**. **The orchestrator's motivating
+      hypothesis did not survive.** Rebuilding the sample to be independent by
+      construction (one signal per non-overlapping 288-bar window, earliest
+      entry bar) discards **57% of weighted signals and 91% of binary** on 1h —
+      small but honest beats large and not — and **reverses the sign**: binary
+      measures **38.82% [31.37, 46.71]** against the 34.78% the shipped 1.5/0.8
+      requires, where the dependent sample had it below. **Both intervals
+      contain 34.78%**, so neither model is established above or below its own
+      exit requirement, and the premise that the ratio binds harder than the
+      weights is **unsupported rather than confirmed**. The expectancy
+      surface's zero crossing **could not be identified anywhere** (0 of 24
+      sweeps), so no ratio is recommended. **What is robust:** the required
+      `T/S` is not constant in the hold (weighted 2.577 → 2.200 on 1h;
+      4h binary 5.167 → 3.750), so one fixed 1.875 is being applied to trades
+      that differ by an order of magnitude. Two bugs were caught in the
+      writer's own new code by its own suite, and **one inverted
+      surplus/deficit label was caught by the orchestrator on every row** —
+      fixed, root-caused, and covered by 18 mutation-tested checks.
+      `docs/WEIGHT-CALIBRATION.md` §5.2 was **refuted by this slice and
+      corrected**, with the original text preserved under a dated note.
+- [ ] T12 — weight search (**deferred to slice 10**). Its original blocker —
+      "the exit target may be unreachable" — is **no longer established**, so
+      the search's objective has to be restated before it runs.
 - [ ] T13 — findings report
 - [ ] Findings reported
 
@@ -874,6 +935,7 @@ to the non-tier factors, or higher-timeframe data must be used.
 | 6 | #18 | ~200 | **~1695** (1373 diagnostic + 224 smoke + 8 run.mjs + 90 doc) |
 | 7 | #19 | ~500 | **~1646** (336 baseline + 319 tier-diagnostic + 309 smoke + 277 run.mjs + 258 timeframes.mjs + 147 doc) |
 | 8 | #20 | ~450 | **~2167** (1261 compare + 502 smoke + 232 report + 104 doc + 31 baseline + 25 run.mjs) |
+| 9 | #21 | ~450 | **~2876** (1804 ratio + 830 smoke + 70 report + 63 doc + 37 run.mjs) |
 
 Every slice landed over its forecast.
 
@@ -942,6 +1004,16 @@ lines because it must refuse to print a number where none is meaningful, print
 why each cell was refused, cross-check its own candidate and label counts
 against `baseline` on three grids, and re-derive its cluster counts with a
 second wiring and a different algorithm. The 232-line report is the cheap half.
+
+**Slice 9** — ~6× over a ~450 forecast, for the same reason as slice 8 plus
+one addition. The forecast costed a ratio sweep. It did not know the sweep had
+to run on a **rebuilt independent sample**, because slice 8 had already proven
+the existing signals were one measurement repeated — so the estimate omitted
+the entire hard part before writing a line of it. The addition on top: `ratio.mjs`
+is 1,804 lines because it has to **refuse three times** — no interval below 30
+observations, no zero-crossing unless two adjacent cells straddle it with whole
+intervals, and no recommendation at all. Analysis whose honest output is "not
+identified" is expensive to build and the cheapest thing in the report to write.
 
 The per-slice ~400 figure is an advisory planning heuristic stated as such in
 this document, not an acceptance criterion, so every variance is recorded
