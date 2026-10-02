@@ -675,6 +675,50 @@ by reverting the function and confirming 7 checks fail.** A second collision
 surfaced: `deficit` already meant *hit-rate* deficit two tables above, so the
 two are now named `HIT-RATE deficit` and `RATIO deficit`.
 
+### T18 — Power analysis at shorter horizons ✅ (delivered in slice 10 · GitHub PR #22)
+
+*(Inserted after the maintainer's decision of 2026-10-01. **This is the last
+measurement before the maintainer decides whether to stop**, so it is
+structured to be able to end the feature, not only to continue it.)*
+
+**The hypothesis.** Independence costs sample size, and the cost is dominated
+by the window length: `bars / horizon` is the ceiling on independent
+observations, which is 153 at 288 bars on 1h but roughly **917 at 48** and
+roughly **1,833 at 24**. If that ceiling is what binds, shortening the horizon
+makes the comparison computable. It may be false — signal density could fall
+with the window, or the intervals could stay wide for another reason.
+
+- [ ] Add `--horizon <bars>` to `ratio`, **default 288, with the no-flag output
+  byte-identical to today.**
+- [ ] At each of 12/24/48/96/288 bars, report signals kept, discarded, resolved
+  and the `bars / horizon` ceiling, so the reader can see how close to the
+  ceiling the sample actually gets. The selection rule stays **earliest entry
+  bar** across every horizon, because a rule that changes between horizons
+  would make the sweep incomparable with itself.
+- [ ] Hit rate with bootstrap CI per horizon, and **which horizons, if any, have
+  an interval excluding D.4's 34.78%**.
+- [ ] **Minimum detectable difference** at each horizon's actual n, against the
+  ~2.5 pp gap observed — *this is the deliverable that decides whether to
+  continue*. It converts "we cannot tell" into "we would need n observations
+  to tell, and here is n".
+- [ ] Expectancy surface per horizon, and whether the zero crossing becomes
+  identifiable at any of them, reported as identified/total including zero.
+- [ ] Required `T/S` per horizon with its CI, extending slice 9's finding.
+
+**Two biases that more observations do not fix, and that must be in the report
+rather than in a footnote:**
+
+- **A shorter horizon is a different trade.** Forcing an exit at H bars
+  *truncates* setups that would have reached target later. That bias does not
+  wash out with sample size.
+- **Sweeping horizons is multiple testing.** One significant horizon out of six
+  is 1 of 6 hypotheses, not a finding. Report all six; never lead with the best.
+
+**If the answer is that shorter horizons do not help, that is a success.** The
+task is explicitly instructed not to look for a way to make them help, because
+a negative here tells the maintainer to stop — which is the most valuable
+outcome available at this point.
+
 ### T12 — Weight search
 
 - [ ] Search over weight vectors and thresholds (random or coordinate search;
@@ -761,7 +805,8 @@ numbered by GitHub.
 | 7 | T15 | Second timeframe: 1h + 4h datasets and the three-timeframe measurement | ~500 |
 | 8 | T16 + T13 | Dependence-aware comparison + findings report | ~450 |
 | 9 | T17 | Exit-ratio analysis on non-overlapping samples | ~450 |
-| 10 | T12 | Weight search (deferred — the report says search the ratio first) | ~450 |
+| 10 | T18 | Power analysis: does a shorter horizon make the comparison computable? | ~450 |
+| 11 | T12 | Weight search (deferred twice; its blocker is gone and its objective unstated) | ~450 |
 
 If slice 8 exceeds ~400, it splits into T16 (analysis) and T13 (report) — the
 report is documentation and can ship on its own.
@@ -917,9 +962,38 @@ to the non-tier factors, or higher-timeframe data must be used.
       fixed, root-caused, and covered by 18 mutation-tested checks.
       `docs/WEIGHT-CALIBRATION.md` §5.2 was **refuted by this slice and
       corrected**, with the original text preserved under a dated note.
-- [ ] T12 — weight search (**deferred to slice 10**). Its original blocker —
-      "the exit target may be unreachable" — is **no longer established**, so
-      the search's objective has to be restated before it runs.
+- [x] **T18 — slice 10 delivered** (power analysis at shorter horizons) →
+      shipped as **GitHub PR #22**. **The hypothesis is refuted, and not for
+      the reason it assumed.** The orchestrator expected window length to be
+      the binding limit; it is **signal density**. The weighted model fires
+      **307 times in 44,000 1h bars**, so its independent sample is capped at
+      307 at *every* horizon — at 12 bars it keeps all 307, the most this
+      dataset can ever yield. Cutting the window from 288 to 12 multiplies the
+      ceiling 24× (153 → 3,667) but buys only 2.3× the observations
+      (131 → 307), because 3,360 of those windows are empty.
+      **The number that decides it:** detecting the ~2.5 pp gap needs **5,466
+      independent observations per model**. The 288-bar partition gives 130 and
+      the best horizon on the grid (24 bars) gives 260 — **19× short**. At 288
+      bars, 5,466 observations is roughly **38 years** of 1h data. The tool
+      prints the conclusion itself: the required n *exceeds the ceiling*, so
+      the grid cannot answer the question at this horizon however the model
+      behaves. **0 of 480** expectancy-surface sweeps identify a zero crossing
+      at any horizon on any grid. **No weighted interval at any horizon
+      excludes 34.78%.** The single exclusion in the whole sweep — binary at
+      12 bars — is 1 hypothesis of 10 and points *against* the hypothesis.
+      **New information:** binary's required-ratio **sign flips** across the
+      sweep (SURPLUS at 288/96, DEFICIT at 48/24/12) — slice 9 found the
+      magnitude moves with the hold, and the sign moves too.
+      **Orchestrator contributed one fix and one bug of its own:** released the
+      three-slice byte-identity lock on a report heading known to be wrong
+      (hardcoded "five" over a six-row table) and derived it from the table —
+      then shipped "twelve" by counting rows instead of distinct horizons,
+      caught it on the next command, and fixed it. Verified at two horizon
+      settings.
+- [ ] T12 — weight search (**deferred to slice 11, twice**). Its original
+      blocker — "the exit target may be unreachable" — is **no longer
+      established**, and slice 10 showed the objective still cannot be
+      *measured*. **The measurement line is now bounded**; see *Rationale*.
 - [ ] T13 — findings report
 - [ ] Findings reported
 
@@ -936,6 +1010,7 @@ to the non-tier factors, or higher-timeframe data must be used.
 | 7 | #19 | ~500 | **~1646** (336 baseline + 319 tier-diagnostic + 309 smoke + 277 run.mjs + 258 timeframes.mjs + 147 doc) |
 | 8 | #20 | ~450 | **~2167** (1261 compare + 502 smoke + 232 report + 104 doc + 31 baseline + 25 run.mjs) |
 | 9 | #21 | ~450 | **~2876** (1804 ratio + 830 smoke + 135 doc + 70 report + 37 run.mjs) |
+| 10 | #22 | ~450 | **~1712** (842 ratio + 760 smoke + 83 doc + 27 run.mjs) |
 
 Every slice landed over its forecast.
 

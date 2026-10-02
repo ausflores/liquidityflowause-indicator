@@ -25,6 +25,8 @@
 //                                    INDEPENDENT sample — one signal per
 //                                    288-bar window (backtest/ratio.mjs):
 //                                    --seed <n>, --bootstrap <n>, --json
+//                                    --horizon <bars> re-runs the analysis at a
+//                                    different hold (default 288 = shipped)
 //   node backtest/run.mjs search     T12 weight search (not implemented yet)
 //
 // Every data-reading subcommand takes `--timeframe <5m|1h|4h>` and defaults to
@@ -42,7 +44,7 @@ import { fileURLToPath } from "node:url";
 import { runGate } from "./gate.mjs";
 import { runBaseline } from "./baseline.mjs";
 import { parseCompareFlags, runCompare } from "./compare.mjs";
-import { parseRatioFlags, runRatio } from "./ratio.mjs";
+import { parseRatioFlags, parseRatioHorizonFlag, runRatio } from "./ratio.mjs";
 import { runTierDiagnostic } from "./tier-diagnostic.mjs";
 import {
   DEFAULT_TIMEFRAME,
@@ -655,6 +657,22 @@ function usage() {
   console.log(
     "             --seed <n> / --bootstrap <n> pin the RNG, --json for JSON output",
   );
+  console.log(
+    "             --horizon <bars> re-runs the whole analysis at a different hold",
+  );
+  console.log(
+    "             (default 288, which is the shipped Definition A). One number drives",
+  );
+  console.log(
+    "             BOTH the exit scan and the window partition. A shorter horizon is a",
+  );
+  console.log(
+    "             DIFFERENT TRADE, not a bigger sample: it truncates trades that would",
+  );
+  console.log(
+    "             have resolved later. Omitting the flag reproduces the 288-bar report",
+  );
+  console.log("             exactly and adds no power or horizon section.");
   console.log("  search     weight search with holdout evaluation (T12)");
   console.log("");
   console.log(
@@ -792,12 +810,19 @@ if (subcommand === undefined || !DISPATCHABLE.includes(subcommand)) {
       // wins) so one bootstrap convention covers every seeded report in the
       // harness; parseRatioFlags is that parser, re-exported under this
       // subcommand's name rather than reimplemented so the two cannot drift.
+      //
+      // --horizon is parsed by its OWN parser rather than by the shared one,
+      // because the two flags have opposite validity rules: a seed of 0 and a
+      // draw count of 0 are legal, a horizon of 0 is not. Widening
+      // parseCompareFlags to carry it would have loosened a tested parser shared
+      // with `compare` to accommodate a rule only this subcommand needs.
       const ratioFlags = parseRatioFlags(process.argv);
       process.exitCode = await runRatio({
         json: process.argv.includes("--json"),
         tf,
         seed: ratioFlags.seed,
         bootstrap: ratioFlags.bootstrap,
+        horizon: parseRatioHorizonFlag(process.argv),
       });
     } else if (subcommand === "diagnose") {
       process.exitCode = await runTierDiagnostic({
