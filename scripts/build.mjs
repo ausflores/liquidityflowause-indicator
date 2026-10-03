@@ -20,6 +20,16 @@
 //   node scripts/build.mjs --check         # validate only, write nothing
 //   node scripts/build.mjs --diagnostic    # append every diagnostic overlay
 //   node scripts/build.mjs --diagnostic=a,b  # append only sections a and b
+//   node scripts/build.mjs --strategy      # the strategy variant (spec D.4)
+//
+// Route A, the strategy variant: a SECOND main source file
+// (src/liquidityflowause-strategy.pine) assembled from the SAME SOURCES array,
+// with a strategy() declaration in place of the indicator() one. The module
+// logic is not re-implemented, re-derived or copy-pasted anywhere: both targets
+// read the same files in the same order. That equivalence is ASSERTED, not
+// assumed — see assertModuleParity below, which fails the build rather than
+// warning, because a strategy that drifts from the indicator would trade
+// something the user does not.
 //
 // Pine caps plot-family calls (plot, bgcolor, alertcondition, ...) at 64 per
 // script. Every build runs a plot-budget preflight and refuses to write a file
@@ -30,39 +40,59 @@ import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, resolve, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { MARKER, SOURCES, assertModuleParity, readModuleParts } from "./assemble.mjs";
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const MAIN = join(ROOT, "src", "liquidityflowause.pine");
 
-// ORDER IS SEMANTIC. Pine v5 has no forward declarations: every input, const
-// and function must be declared before its first use. The documented order in
-// docs/technical-spec.md section 12.3 lists modules BEFORE the main file,
-// which cannot compile — //@version=5 and indicator() must come first.
+// Route A. The strategy's main file owns the strategy() declaration, the
+// strategy-only inputs, the D.3 spread filter and the entry/exit rules. It is
+// assembled from the SAME SOURCES array as the indicator — imported above, not
+// re-declared here — so the five modules are read from the same bytes in the
+// same order, and there is no second list to drift.
 //
-// Missing entries are reported as warnings, not failures. The remaining
-// modules are not written yet, and a build that hard-fails on planned files
-// would block every increment until the last module lands.
-const SOURCES = [
-  "src/lib/colors.pine",
-  "src/lib/utils.pine",
-  "src/lib/inputs.pine",
-  "src/modules/liquidity-zones.pine",
-  "src/modules/session-markers.pine",
-  "src/modules/imbalance-detector.pine",
-  "src/modules/structure-break.pine",
-  "src/modules/signal-engine.pine",
-];
-
-const MARKER = "[CONCATENATION POINT]";
+// Missing SOURCES entries are reported as warnings, not failures: the three
+// src/lib/ files are planned and not written yet, and a build that hard-failed
+// on planned files would block every increment until the last module lands.
 const DEFAULT_OUT = join(ROOT, "dist", "liquidityflowause.pine");
 const DIAGNOSTIC_OUT = join(ROOT, "dist", "liquidityflowause-diag.pine");
+const STRATEGY_OUT = join(ROOT, "dist", "liquidityflowause-strategy.pine");
+
+// Route A's main source. It carries the strategy() declaration, the D.3 spread
+// filter, the selectable entry model and the entry/exit rules — and NOTHING
+// else. Every line of module logic lives in src/modules/ and reaches both
+// artifacts through the shared SOURCES array imported above.
+const STRATEGY_MAIN = join(ROOT, "src", "liquidityflowause-strategy.pine");
+
+// Route A's main source. It carries the strategy() declaration, the D.3 spread
+// filter, the selectable entry model and the entry/exit rules — and NOTHING
+// else. Every line of module logic lives in src/modules/ and reaches both
+// artifacts through the shared SOURCES array imported above.
+
+// The shipped indicator's SHA256, pinned so a build that moved it cannot pass
+// silently. This file is the product; the strategy is a measuring instrument
+// built beside it and must never be able to rewrite the artifact it measures.
+//
+// Recorded from dist/liquidityflowause.pine at commit 4097ee4.
+export const SHIPPED_INDICATOR_SHA256 =
+  "1dd6f536ae4f50c2f669e9c1a2b34a0fb97a7d51428905b9e18f8616d1582ce2";
+
+// The D.4 exit levels, cross-checked against backtest/modules/label.mjs at
+// build time so the strategy cannot drift from the definition the whole
+// investigation used. label.mjs exports EXIT_TARGET_PCT / EXIT_STOP_PCT; those
+// are read from the module rather than restated here, so there is one number.
+const EXIT_ARITHMETIC_SOURCE = join(ROOT, "backtest", "modules", "label.mjs");
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 const args = process.argv.slice(2);
 const checkOnly = args.includes("--check");
+
+// --strategy builds the Route A variant.
+const STRATEGY_FLAG = "--strategy";
+const strategyMode = args.includes(STRATEGY_FLAG);
 
 // --diagnostic is either bare (all sections) or carries a comma-separated
 // section list: --diagnostic=structure-break,signal-engine. Only the raw value
@@ -79,7 +109,25 @@ const diagnosticValue =
 const outFlag = args.indexOf("--out");
 const outPath = outFlag !== -1 && args[outFlag + 1]
   ? resolve(ROOT, args[outFlag + 1])
-  : (diagnostic ? DIAGNOSTIC_OUT : DEFAULT_OUT);
+  : strategyMode
+    ? STRATEGY_OUT
+    : (diagnostic ? DIAGNOSTIC_OUT : DEFAULT_OUT);
+
+// --strategy and --diagnostic are mutually exclusive, and the clash is a hard
+// error rather than a silent precedence rule. The diagnostic overlays are
+// INDICATOR overlays: they plot the indicator's own series and read its
+// globals. Appending them to a strategy() script produces a file that is
+// neither an indicator nor a strategy, and a caller who asked for both and got
+// one would never learn which one they got.
+if (strategyMode && diagnostic) {
+  console.error(
+    `build: ${STRATEGY_FLAG} cannot be combined with ${DIAG_FLAG}. The diagnostic ` +
+      "overlays are indicator overlays: they plot the indicator's series and read " +
+      "its globals. Build the production strategy script, or build a diagnostic " +
+      "indicator — not a file that is neither.",
+  );
+  process.exit(1);
+}
 
 const warnings = [];
 const errors = [];
@@ -94,58 +142,32 @@ function fail(message) {
 
 const BANNER = "// " + "=".repeat(75);
 
-/**
- * Strips a module's entire header banner, prose included, plus blank edges.
- *
- * Each module opens with a decorative box comment describing itself. Once
- * concatenated, that box is misleading: it reads like a section of the
- * indicator but sits mid-file with no scope boundary.
- *
- * The WHOLE box is removed, not just its frame. An earlier version of this
- * docstring claimed the descriptive prose survived; the implementation never
- * did that, and the docstring was wrong rather than the code. The prose inside
- * the banner duplicates what the spec already documents, and the module body
- * carries its own section comments.
- *
- * The box cannot be matched by "lines until the first non-box character",
- * because the prose lines are inside it. It is delimited by its two rules of
- * '=' characters and ends at the closing rule.
- */
-function stripBanner(source) {
-  const lines = source.split(/\r?\n/);
-
-  // Opening rule: a comment line that is mostly '=' padding.
-  const isRule = (l) => /^\/\/ ={10,}\s*$/.test(l);
-  if (!isRule(lines[0] ?? "")) return source;
-
-  // Closing rule: the next line of '=' padding.
-  let end = -1;
-  for (let i = 1; i < lines.length; i++) {
-    if (isRule(lines[i])) {
-      end = i;
-      break;
-    }
-  }
-
-  // No closing rule found: leave the file untouched rather than guess.
-  if (end === -1) return source;
-
-  return lines.slice(end + 1).join("\n").replace(/^\n+/, "");
-}
-
 // ─── Assemble ────────────────────────────────────────────────────────────────
 
-async function build() {
-  if (!existsSync(MAIN)) {
-    console.error(`build: main file not found at ${MAIN}`);
+/**
+ * Concatenates ONE main file with the shared module list.
+ *
+ * Both targets call this with a different main path and nothing else. The
+ * module list, the module order and the banner stripping all live in
+ * scripts/assemble.mjs: there is no second place where a module's bytes are
+ * decided, so there is no second place where they can diverge. `label` is used
+ * only for the report.
+ *
+ * The module-declaration guard is routed through `fail()` rather than
+ * duplicated here, so a module that declares its own script fails BOTH builds
+ * identically.
+ */
+async function build(mainPath, label) {
+  if (!existsSync(mainPath)) {
+    console.error(`build: main file not found at ${mainPath}`);
     process.exit(1);
   }
 
-  const mainSource = await readFile(MAIN, "utf8");
+  const mainSource = await readFile(mainPath, "utf8");
 
   if (!mainSource.includes(MARKER)) {
     console.error(
-      `build: ${MAIN} has no ${MARKER} marker.\n` +
+      `build: ${mainPath} has no ${MARKER} marker.\n` +
         "The marker is where modules are spliced in. Without it there is no " +
         "safe insertion point.",
     );
@@ -170,38 +192,310 @@ async function build() {
   }
 
   parts.push({
-    label: "src/liquidityflowause.pine (header)",
+    label: `${label} (header)`,
+    module: false,
     text: mainLines.slice(0, blockEnd + 1).join("\n").replace(/\n+$/, "\n"),
   });
 
-  // 2. Modules, in declared order.
-  for (const rel of SOURCES) {
-    const abs = join(ROOT, rel);
-
-    if (!existsSync(abs)) {
-      warn(`module not built yet, skipped: ${rel}`);
-      continue;
-    }
-
-    const raw = await readFile(abs, "utf8");
-
-    // Structural invariant: a module that declares its own indicator() would
-    // produce a script with two declarations.
-    if (/^\s*(indicator|study)\s*\(/m.test(raw)) {
-      fail(`${rel} declares indicator()/study(). Modules must not; the main ` +
-        "file owns the single declaration.");
-    }
-
-    parts.push({ label: rel, text: stripBanner(raw).replace(/\n+$/, "\n") });
-  }
+  // 2. Modules, in declared order. Read by scripts/assemble.mjs so the two
+  //    targets cannot differ here even by accident.
+  parts.push(
+    ...(await readModuleParts(ROOT, SOURCES, {
+      onMissing: (rel) => warn(`module not built yet, skipped: ${rel}`),
+      // Structural invariant: a module that declares its own script declaration
+      // would produce a script with two of them. Indicators AND strategies are
+      // both refused: the main file owns the single declaration either way.
+      onForbidden: (rel) =>
+        fail(
+          `${rel} declares indicator()/study()/strategy(). Modules must not; the main ` +
+            "file owns the single declaration.",
+        ),
+    })),
+  );
 
   // 3. Main file footer: the marker block's continuation, if any.
   const footer = mainLines.slice(blockEnd + 1).join("\n").replace(/^\n+/, "");
   if (footer.trim()) {
-    parts.push({ label: "src/liquidityflowause.pine (footer)", text: footer });
+    parts.push({ label: `${label} (footer)`, module: false, text: footer });
   }
 
   return parts;
+}
+
+// ─── Module Parity (Route A) ─────────────────────────────────────────────────
+
+/**
+ * Asserts that the module text embedded in the STRATEGY build is byte-identical
+ * to the module text embedded in the INDICATOR build.
+ *
+ * This is the load-bearing check of the whole Route A design. The strategy is
+ * only useful if it trades what the indicator signals, and the only thing that
+ * makes that true is that both artifacts were concatenated from the same
+ * module bytes in the same order. Asserting it is stronger than relying on the
+ * shared SOURCES array: it also catches a future edit that adds a second module
+ * list, a build path that skips banner stripping, or a transform applied to
+ * only one target.
+ *
+ * It FAILS the build rather than warning. A warning here would produce a
+ * strategy file that looks fine and trades something else, and nothing
+ * downstream would report it.
+ *
+ * Returns the per-module result so the build can print it: "verified" must be
+ * visible, not merely not-false.
+ *
+ * A parity assertion that has never been seen to FAIL is not known to work,
+ * only known not to have been triggered. scripts/assemble.mjs therefore
+ * returns its findings rather than throwing, and backtest/smoke.mjs drives it
+ * with a deliberately divergent pair to prove it can fail. This wrapper is the
+ * build's half of that contract: findings become build errors here.
+ */
+function checkModuleParity(indicatorParts, strategyParts) {
+  const { report, errors: parityErrors } = assertModuleParity(indicatorParts, strategyParts);
+  for (const e of parityErrors) fail(e);
+  return report;
+}
+
+// ─── Strategy Structural Checks ──────────────────────────────────────────────
+
+/**
+ * The checks that are decidable from the strategy's text alone.
+ *
+ * These are NOT a Pine parser and do not claim to be. They cannot verify types,
+ * builtins or runtime behavior — only the Pine Editor can, and this repository
+ * has no Pine compiler. What they do catch is the class of mistake that would
+ * make the file wrong in a way no one would notice: a missing declaration, an
+ * indicator() left in, an input that nothing reads, an exit that was never
+ * written.
+ */
+function validateStrategy(assembled) {
+  const text = assembled.join("\n");
+  const lines = text.split(/\r?\n/);
+
+  // 1. //@version=5 first, exactly once. A strategy that falls behind the
+  //    indicator on the version line is a strategy that may not compile.
+  const versionLines = lines
+    .map((l, i) => ({ l, i }))
+    .filter(({ l }) => /^\s*\/\/@version=/.test(l));
+
+  if (versionLines.length !== 1) {
+    fail(
+      `strategy: found ${versionLines.length} //@version= directives; expected ` +
+        "exactly 1 (Pine v5 requires it, and the indicator declares it once).",
+    );
+  } else if (!/^\/\/@version=5\s*$/.test(versionLines[0].l)) {
+    fail(`strategy: the version directive is "${versionLines[0].l}"; expected //@version=5`);
+  } else if (lines[0] !== "//@version=5") {
+    fail(
+      `strategy: //@version=5 is on line ${versionLines[0].i + 1}, not line 1. ` +
+        "TradingView requires it in the first line of the script.",
+    );
+  }
+
+  // 2. Exactly one strategy() declaration, and NO indicator()/study(). A
+  //    strategy that also declares an indicator is rejected by Pine, and the
+  //    pasted-over-the-product failure mode this project cares about most
+  //    starts with the two being confused.
+  const strategyDecls = lines.filter((l) => /^\s*strategy\s*\(/.test(l));
+  if (strategyDecls.length === 0) {
+    fail("strategy: no strategy() declaration found");
+  } else if (strategyDecls.length > 1) {
+    fail(`strategy: found ${strategyDecls.length} strategy() declarations; expected exactly 1`);
+  }
+
+  const indicatorDecls = lines.filter((l) => /^\s*(indicator|study)\s*\(/.test(l));
+  if (indicatorDecls.length > 0) {
+    fail(
+      `strategy: found ${indicatorDecls.length} indicator()/study() declaration(s) in a ` +
+        "strategy build. This file must never be pasted over the shipped indicator.",
+    );
+  }
+
+  // The declaration must precede the first input call, and — unlike the
+  // indicator — there may be no code at all before it beyond comments.
+  const firstInput = lines.findIndex((l) => /^\s*\w+\s*=\s*input\./.test(l));
+  if (strategyDecls.length === 1 && firstInput !== -1) {
+    const declIdx = lines.findIndex((l) => /^\s*strategy\s*\(/.test(l));
+    if (firstInput < declIdx) {
+      fail(
+        `strategy: input.* call at line ${firstInput + 1} precedes the strategy() ` +
+          `declaration at line ${declIdx + 1}`,
+      );
+    }
+  }
+
+  // 3. Both entry calls and both exit calls are present. D.4 writes four calls
+  //    and a strategy missing one of them silently trades one side forever or
+  //    never exits — neither is visible without reading the tester output.
+  const code = stripLineComments(text);
+  const entryCalls = (code.match(/(?<![\w.])strategy\.entry\s*\(/g) ?? []).length;
+  if (entryCalls !== 2) {
+    fail(
+      `strategy: found ${entryCalls} strategy.entry() call(s); expected 2 (one per ` +
+        "side). A missing one trades that side never.",
+    );
+  }
+
+  const exitCalls = (code.match(/(?<![\w.])strategy\.exit\s*\(/g) ?? []).length;
+  if (exitCalls !== 2) {
+    fail(
+      `strategy: found ${exitCalls} strategy.exit() call(s); expected 2 (one per ` +
+        "side). A missing one leaves that side open until the tester ends.",
+    );
+  }
+
+  if (!/strategy\.entry\s*\(\s*"LONG"/.test(code) || !/strategy\.entry\s*\(\s*"SHORT"/.test(code)) {
+    fail('strategy: the entry IDs must be "LONG" and "SHORT" — the exit calls reference them by name');
+  }
+  if (!/strategy\.exit\s*\(\s*"Exit Long"/.test(code) || !/strategy\.exit\s*\(\s*"Exit Short"/.test(code)) {
+    fail('strategy: the exit IDs must be "Exit Long" and "Exit Short"');
+  }
+
+  // 4. Target and stop are present and referenced, not merely declared. A
+  //    declared-but-unread exit input is a silent return to breakeven.
+  const targetPct = lines.find((l) => /^\s*targetPct\s*=/.test(l));
+  const stopPct = lines.find((l) => /^\s*stopPct\s*=/.test(l));
+
+  if (!targetPct) {
+    fail("strategy: no `targetPct` declaration — D.4's target input is missing");
+  } else if ((code.match(/\btargetPct\b/g) ?? []).length < 3) {
+    fail(
+      "strategy: targetPct is declared but barely referenced — check that both exit " +
+        "levels are computed from it",
+    );
+  }
+
+  if (!stopPct) {
+    fail("strategy: no `stopPct` declaration — D.4's stop input is missing");
+  } else if ((code.match(/\bstopPct\b/g) ?? []).length < 3) {
+    fail(
+      "strategy: stopPct is declared but barely referenced — check that both exit " +
+        "levels are computed from it",
+    );
+  }
+
+  // 5. Every declared input is READ somewhere. This is the check that catches
+  //    an input added and then forgotten: the entry-mode switch, the
+  //    flat-only switch and the spread filter each control behaviour, and a
+  //    control that nothing reads is a lie in the input panel.
+  const declarations = [
+    ...code.matchAll(/^\s*(\w+)\s*=\s*input\.\w+\(/gm),
+  ].map((m) => m[1]);
+
+  for (const name of new Set(declarations)) {
+    const uses = (code.match(new RegExp(`\\b${name}\\b`, "g")) ?? []).length;
+    // One occurrence is the declaration itself.
+    if (uses < 2) {
+      fail(
+        `strategy: input "${name}" is declared but never read. An input that ` +
+          "controls nothing must not appear in the input panel.",
+      );
+    }
+  }
+
+  // 6. The defaults this file ships are the defaults the brief fixes. They are
+  //    read from the source rather than asserted twice, so a later edit that
+  //    changes one of them has to change this line too.
+  const defaults = {
+    entryModel: /input\.string\(\s*"Weighted"/,
+    onlyWhenFlat: /onlyWhenFlat\s*=\s*input\.bool\(true/,
+    spreadFilterEnabled: /spreadFilterEnabled\s*=\s*input\.bool\(false/,
+    target: /targetPct\s*=\s*input\.float\(\s*1\.5\b/,
+    stop: /stopPct\s*=\s*input\.float\(\s*0\.8\b/,
+  };
+  for (const [name, re] of Object.entries(defaults)) {
+    if (!re.test(code)) {
+      fail(
+        `strategy: the ${name} default does not match the documented one. The ` +
+          "defaults are the contract: entry model WEIGHTED, only-when-flat ON, " +
+          "spread filter OFF, target 1.5, stop 0.8.",
+      );
+    }
+  }
+
+  // 7. The strategy's own D.4 parameters, so a strategy that quietly dropped
+  //    them is caught rather than discovered on someone's chart.
+  const strategyDecl = strategyDecls[0] ?? "";
+  const requiredDeclArgs = {
+    default_qty_type: /default_qty_type\s*=\s*strategy\.percent_of_equity/,
+    default_qty_value: /default_qty_value\s*=\s*10\b/,
+    commission_type: /commission_type\s*=\s*strategy\.commission\.percent/,
+    commission_value: /commission_value\s*=\s*0\.05\b/,
+    slippage: /slippage\s*=\s*2\b/,
+  };
+  for (const [arg, re] of Object.entries(requiredDeclArgs)) {
+    if (!re.test(strategyDecl + text.slice(text.indexOf(strategyDecl) + strategyDecl.length, text.indexOf(strategyDecl) + 2000))) {
+      // The declaration spans several lines; fall back to the whole script,
+      // which is safe because these argument names exist nowhere else.
+      if (!re.test(code)) {
+        fail(`strategy: the strategy() declaration is missing ${arg}`);
+      }
+    }
+  }
+
+  return { lineCount: lines.length };
+}
+
+// ─── Exit Arithmetic Cross-Check ─────────────────────────────────────────────
+
+/**
+ * Asserts that the target and stop this file ships are the numbers
+ * backtest/modules/label.mjs uses.
+ *
+ * Why this matters more than it looks: label.mjs is the definition the whole
+ * investigation measured against. If the strategy shipped 2.0 / 1.0, its curve
+ * would be measuring a DIFFERENT TRADE from every number already on the record,
+ * and nothing would say so. The constants are read out of label.mjs — not
+ * restated here — so there is exactly one place they can be wrong.
+ */
+async function checkExitArithmetic(assembled) {
+  const text = assembled.join("\n");
+  const code = stripLineComments(text);
+
+  let labelSource;
+  try {
+    labelSource = await readFile(EXIT_ARITHMETIC_SOURCE, "utf8");
+  } catch {
+    fail(
+      `exit arithmetic could not be cross-checked: ${EXIT_ARITHMETIC_SOURCE} is ` +
+        "unreadable. The harness's definition of D.4's exit rule is the thing the " +
+        "strategy must not drift from, so its absence is a failure, not a skip.",
+    );
+    return null;
+  }
+
+  const target = Number(/export const EXIT_TARGET_PCT\s*=\s*([0-9.]+)/.exec(labelSource)?.[1]);
+  const stop = Number(/export const EXIT_STOP_PCT\s*=\s*([0-9.]+)/.exec(labelSource)?.[1]);
+
+  if (!Number.isFinite(target) || !Number.isFinite(stop)) {
+    fail(
+      "exit arithmetic cross-check could not read EXIT_TARGET_PCT / EXIT_STOP_PCT " +
+        `from ${EXIT_ARITHMETIC_SOURCE}`,
+    );
+    return null;
+  }
+
+  const shippedTarget = Number(/targetPct\s*=\s*input\.float\(\s*([0-9.]+)/.exec(code)?.[1]);
+  const shippedStop = Number(/stopPct\s*=\s*input\.float\(\s*([0-9.]+)/.exec(code)?.[1]);
+
+  if (shippedTarget !== target) {
+    fail(
+      `exit arithmetic FAILED: the strategy ships targetPct=${shippedTarget} but ` +
+        `backtest/modules/label.mjs uses EXIT_TARGET_PCT=${target}. The strategy ` +
+        "would measure a different trade from the one the investigation recorded.",
+    );
+  }
+
+  if (shippedStop !== stop) {
+    fail(
+      `exit arithmetic FAILED: the strategy ships stopPct=${shippedStop} but ` +
+        `backtest/modules/label.mjs uses EXIT_STOP_PCT=${stop}. The strategy would ` +
+        "measure a different trade from the one the investigation recorded.",
+    );
+  }
+
+  // The ratio is what every expectancy figure in the investigation is quoted
+  // against, so it is reported rather than left to the reader to divide.
+  return { target, stop, ratio: target / stop };
 }
 
 // ─── Validate ────────────────────────────────────────────────────────────────
@@ -955,13 +1249,183 @@ function validate(assembled) {
 
 // ─── Report ──────────────────────────────────────────────────────────────────
 
-const parts = await build();
-let assembled = parts.map((p) => p.text);
+const MAIN_LABEL = "src/liquidityflowause.pine";
+const STRATEGY_LABEL = "src/liquidityflowause-strategy.pine";
+
+/** SHA256 of a UTF-8 string. Used for the shipped-artifact guard. */
+async function sha256(text) {
+  const { createHash } = await import("node:crypto");
+  return createHash("sha256").update(text, "utf8").digest("hex");
+}
+
+let parts;
+let assembled;
+let lineCount;
+
+// The indicator build, assembled FIRST and ALWAYS — including under
+// --strategy. It is not the thing being written in strategy mode; it is the
+// REFERENCE the strategy's module text is compared against, and its digest is
+// what proves the shipped artifact did not move. Assembling it here rather than
+// reading dist/ means the comparison is between the two builds' own output, not
+// between one build and a file on disk that may be stale.
+const indicatorParts = await build(MAIN, MAIN_LABEL);
+
+// The strategy build assembles BOTH targets, so the "module not built yet"
+// notices are raised twice. They are deduplicated for the report rather than
+// printed as pairs: a repeated line reads as two problems where there is one,
+// and it trains a reader to skim past warnings.
+const warningsOnce = [...new Set(warnings)];
+
+if (strategyMode) {
+  parts = await build(STRATEGY_MAIN, STRATEGY_LABEL);
+  assembled = parts.map((p) => p.text);
+
+  ({ lineCount } = validateStrategy(assembled));
+
+  // ── Module parity: the load-bearing check ──
+  const parity = checkModuleParity(indicatorParts, parts);
+
+  // ── Exit arithmetic vs the harness's own definition ──
+  const exitArithmetic = await checkExitArithmetic(assembled);
+
+  // ── The shipped artifact must not have moved ──
+  //
+  // Compared by RECOMPUTING the indicator from source rather than by trusting
+  // the file in dist/. If the two disagree, the file is stale or was edited by
+  // hand; either way, a strategy build must not bless a repository whose
+  // shipped artifact is not what its source produces.
+  const indicatorText = indicatorParts.map((p) => p.text).join("\n");
+  const indicatorDigest = await sha256(indicatorText);
+
+  let shippedOnDisk = null;
+  if (existsSync(DEFAULT_OUT)) {
+    shippedOnDisk = await sha256(await readFile(DEFAULT_OUT, "utf8"));
+  }
+
+  if (shippedOnDisk === null) {
+    warn(
+      `dist/liquidityflowause.pine does not exist yet; the SHA guard compared ` +
+        "the recomputed source only. Run `node scripts/build.mjs` to produce it.",
+    );
+  } else if (shippedOnDisk !== SHIPPED_INDICATOR_SHA256) {
+    fail(
+      `the shipped indicator has moved. dist/liquidityflowause.pine is ` +
+        `${shippedOnDisk}, expected ${SHIPPED_INDICATOR_SHA256}. A strategy build ` +
+        "must not certify a repository whose shipped artifact is not the one on " +
+        "record — check whether src/modules/ or src/liquidityflowause.pine " +
+        "changed.",
+    );
+  }
+
+  if (indicatorDigest !== SHIPPED_INDICATOR_SHA256) {
+    fail(
+      `the INDICATOR BUILD no longer reproduces the shipped artifact: recomputed ` +
+        `${indicatorDigest}, expected ${SHIPPED_INDICATOR_SHA256}.`,
+    );
+  }
+
+  const plotCount = checkPlotBudget(assembled, []);
+
+  console.log(BANNER);
+  console.log("// LiquidityFlowAuse build — STRATEGY (Route A, spec D.4)");
+  console.log(BANNER);
+  console.log("");
+
+  for (const part of parts) {
+    const n = part.text.split(/\r?\n/).length;
+    console.log(`  ${part.label.padEnd(44)} ${String(n).padStart(5)} lines`);
+  }
+  console.log("");
+  console.log(`  ${"TOTAL".padEnd(44)} ${String(lineCount).padStart(5)} lines`);
+  console.log(`plot budget: ${plotCount} / ${PLOT_LIMIT}`);
+
+  // ── The parity result, printed in full ──
+  //
+  // Printed whether it passed or failed, because "verified" is a claim a reader
+  // is entitled to see rather than infer from the absence of an error.
+  console.log("");
+  console.log("// Module parity — strategy build vs indicator build");
+  for (const m of parity) {
+    console.log(
+      `  ${m.identical ? "IDENTICAL" : "DIFFERS  "}  ${m.label.padEnd(38)} ${String(m.bytes).padStart(6)} bytes`,
+    );
+  }
+  const parityOk = parity.length > 0 && parity.every((m) => m.identical);
+  console.log(
+    `  ${parity.length === 0 ? "NO MODULES COMPARED — this is a failure" : `${parity.length - parity.filter((m) => !m.identical).length}/${parity.length} byte-identical`}`,
+  );
+  console.log(
+    "  This is what guarantees the strategy trades what the indicator signals:",
+  );
+  console.log("  both targets embed the same module text, read from the same files.");
+
+  // ── Exit arithmetic ──
+  if (exitArithmetic) {
+    console.log("");
+    console.log("// Exit arithmetic — cross-checked against backtest/modules/label.mjs");
+    console.log(
+      `  target ${exitArithmetic.target}% / stop ${exitArithmetic.stop}%  (ratio ${exitArithmetic.ratio})`,
+    );
+    console.log("  Same numbers the investigation's labels used, so the curve");
+    console.log("  measures the same trade rather than a lookalike.");
+  }
+
+  // ── The shipped artifact's identity ──
+  console.log("");
+  console.log("// Shipped indicator (must not move)");
+  console.log(`  dist/liquidityflowause.pine  ${shippedOnDisk ?? "(absent)"}`);
+  console.log(`  expected                     ${SHIPPED_INDICATOR_SHA256}`);
+  console.log(`  indicator build reproduces   ${indicatorDigest}`);
+
+  if (warningsOnce.length) {
+    console.log("");
+    for (const w of warningsOnce) console.log(`  warning: ${w}`);
+  }
+
+  if (errors.length) {
+    console.log("");
+    for (const e of errors) console.log(`  ERROR: ${e}`);
+    console.log("");
+    console.log("build failed — nothing written");
+    process.exit(1);
+  }
+
+  if (checkOnly) {
+    console.log("");
+    console.log("  checks passed (--check: nothing written)");
+    process.exit(0);
+  }
+
+  await mkdir(dirname(outPath), { recursive: true });
+  await writeFile(outPath, assembled.join("\n"), "utf8");
+
+  console.log("");
+  console.log(`  written: ${outPath}`);
+
+  console.log("");
+  console.log("  NEXT:");
+  console.log("    Add this as a SEPARATE script in TradingView. It is not a");
+  console.log("    replacement for the indicator and must never be pasted over it.");
+  console.log("");
+  console.log("    NOT VERIFIED HERE. There is no Pine compiler in this repository.");
+  console.log("    Every check above is structural: declaration shape, module");
+  console.log("    parity, exit arithmetic. Types, builtins and runtime behaviour");
+  console.log("    are unverified, and the data is TradingView's, not ours.");
+  console.log("");
+  console.log("  See docs/ROUTE-A.md before reading any number off the tester.");
+  console.log("");
+  process.exit(0);
+}
+
+// ── Indicator build (the default path, unchanged in behaviour) ──
+
+parts = indicatorParts;
+assembled = parts.map((p) => p.text);
 
 // Validation runs on the production assembly. The diagnostic overlay is
 // appended afterwards so a defect in the overlay itself cannot mask a defect
 // in the module, and so the reported line count stays comparable.
-const { lineCount } = validate(assembled);
+({ lineCount } = validate(assembled));
 
 // Sections actually appended ([] on the production build). Resolved before the
 // overlays go on, so an unknown --diagnostic name exits before any work is

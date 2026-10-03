@@ -1961,8 +1961,27 @@ if shortSignalStrict and spreadOK
 float targetPct = input.float(1.5, "Target (%)", minval=0.5, maxval=5.0, group="Exit")
 float stopPct   = input.float(0.8, "Stop Loss (%)", minval=0.3, maxval=2.0, group="Exit")
 
-strategy.exit("Exit Long", "LONG", profit=targetPct, loss=stopPct)
-strategy.exit("Exit Short", "SHORT", profit=targetPct, loss=stopPct)
+// ⚠️ CORRECTION (Route A, 2026-10-02). The two lines below were WRONG as
+// originally written here, with `profit=targetPct, loss=stopPct`.
+//
+// TradingView's own v5 reference states that `profit` and `loss` "accept
+// relative values in TICKS from the entry price", while `limit` and `stop`
+// "accept absolute price levels". With BTC/USD near 80,000 a 1.5% target is
+// roughly 1,200 points, so `profit = 1.5` is a 1.5-TICK target — about 0.002%.
+// Both exits would fire almost immediately, and the strategy would show a
+// spectacular equity curve that means nothing at all. Anyone implementing D.4
+// from this text as written ships stops and targets two to three orders of
+// magnitude too tight.
+//
+// The working form computes absolute price levels from the entry price:
+//   entryPx = strategy.position_avg_price
+//   long  → limit = entryPx * (1 + targetPct/100), stop = entryPx * (1 - stopPct/100)
+//   short → limit = entryPx * (1 - targetPct/100), stop = entryPx * (1 + stopPct/100)
+//
+// Shipped that way in src/liquidityflowause-strategy.pine and cross-checked
+// against backtest/modules/label.mjs, which implements the same rule.
+strategy.exit("Exit Long",  "LONG",  limit = entryPx * (1 + targetPct / 100), stop = entryPx * (1 - stopPct / 100))
+strategy.exit("Exit Short", "SHORT", limit = entryPx * (1 - targetPct / 100), stop = entryPx * (1 + stopPct / 100))
 ```
 
 **Why:** Open-source credibility requires verifiable results. A `strategy` file lets anyone validate signal quality.
