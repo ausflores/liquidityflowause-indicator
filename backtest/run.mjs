@@ -29,6 +29,9 @@
 //                                    different hold (default 288 = shipped)
 //   node backtest/run.mjs band       proximity-band counterfactual sweep
 //                                    (backtest/band.mjs), --json too
+//   node backtest/run.mjs concept    the maintainer's OWN STATED concept
+//                                    counted as a per-variant matrix
+//                                    (backtest/concept.mjs), --json too
 //   node backtest/run.mjs search     T12 weight search (not implemented yet)
 //
 // Every data-reading subcommand takes `--timeframe <5m|1h|4h>` and defaults to
@@ -49,6 +52,7 @@ import { parseCompareFlags, runCompare } from "./compare.mjs";
 import { parseRatioFlags, parseRatioHorizonFlag, runRatio } from "./ratio.mjs";
 import { runTierDiagnostic } from "./tier-diagnostic.mjs";
 import { runBand } from "./band.mjs";
+import { runConcept } from "./concept.mjs";
 import {
   DEFAULT_TIMEFRAME,
   TIMEFRAME_IDS,
@@ -682,10 +686,23 @@ function usage() {
   console.log(
     "             what-if, nothing under src/ changes and nothing is recommended",
   );
+  console.log(
+    "  concept    the maintainer's OWN stated concept — liquidity + hours +",
+  );
+  console.log(
+    "             (imbalance AND structure change) — counted as a matrix over",
+  );
+  console.log(
+    "             session strength, structure arm, imbalance arm, AND-vs-OR and",
+  );
+  console.log(
+    "             the score gate. Every row but the shipped one is a",
+  );
+  console.log("             counterfactual; nothing is recommended.",  );
   console.log("  search     weight search with holdout evaluation (T12)");
   console.log("");
   console.log(
-    `  --timeframe   native grid for fetch/baseline/diagnose/compare/ratio/band ` +
+    `  --timeframe   native grid for fetch/baseline/diagnose/compare/ratio/band/concept ` +
       `(${TIMEFRAME_IDS.join(", ")}); default "${DEFAULT_TIMEFRAME}".`,
   );
   console.log(
@@ -767,6 +784,16 @@ const SUBCOMMANDS = ["fetch", "validate", "baseline", "diagnose", "compare", "se
 // smoke.mjs says they mean.
 const EXTRA_SUBCOMMANDS = ["ratio"];
 const LATER_SUBCOMMANDS = ["band"];
+// `concept` arrived after `band` and is registered through its OWN list for the
+// same reason `band` got one: appending to LATER_SUBCOMMANDS in place would edit
+// the literal smoke.mjs asserts verbatim, and editing an assertion to admit a new
+// subcommand is precisely what that assertion exists to prevent. It is unioned
+// into the dispatch guard below rather than folded into DISPATCHABLE, so all
+// three existing literals — and the `DISPATCHABLE = [...SUBCOMMANDS,
+// ...EXTRA_SUBCOMMANDS, ...LATER_SUBCOMMANDS]` shape smoke.mjs asserts — keep
+// meaning exactly what they mean today. A typo in any of the four lists still
+// refuses to dispatch.
+const CONCEPT_SUBCOMMANDS = ["concept"];
 const DISPATCHABLE = [...SUBCOMMANDS, ...EXTRA_SUBCOMMANDS, ...LATER_SUBCOMMANDS];
 const subcommand = process.argv[2];
 
@@ -788,7 +815,10 @@ try {
   }
 }
 
-if (subcommand === undefined || !DISPATCHABLE.includes(subcommand)) {
+if (
+  subcommand === undefined ||
+  !(DISPATCHABLE.includes(subcommand) || CONCEPT_SUBCOMMANDS.includes(subcommand))
+) {
   if (subcommand !== undefined) console.log(`run: unknown subcommand: ${subcommand}`);
   usage();
 } else if (tf === null) {
@@ -852,6 +882,18 @@ if (subcommand === undefined || !DISPATCHABLE.includes(subcommand)) {
       });
     } else if (subcommand === "diagnose") {
       process.exitCode = await runTierDiagnostic({
+        json: process.argv.includes("--json"),
+        tf,
+      });
+    } else if (subcommand === "concept") {
+      // Counterfactual only, exactly like `band`. `concept` counts the
+      // maintainer's own stated setup as an explicit, parameterisable predicate
+      // over the SAME per-bar state every other subcommand reads, and reports
+      // what each gating choice costs. It writes nothing, changes nothing under
+      // src/, recommends nothing, and THROWS if its one shipped row fails to
+      // reproduce the real Signal Engine's output on every bar — which is what
+      // makes any of its other rows mean anything.
+      process.exitCode = await runConcept({
         json: process.argv.includes("--json"),
         tf,
       });
