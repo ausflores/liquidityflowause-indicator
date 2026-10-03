@@ -110,6 +110,60 @@ import {
   windowIndexOf,
 } from "./ratio.mjs";
 
+// Route A. Imported from scripts/ rather than re-implemented here, on purpose:
+// a smoke check that re-derived the module list to compare against the build
+// would be comparing the build against a second implementation of the build,
+// and it would pass exactly when the two disagreed most.
+import {
+  SOURCES,
+  assertModuleParity,
+  readModuleParts,
+} from "../scripts/assemble.mjs";
+// fileURLToPath, not URL.pathname: on Windows the latter yields "/C:/Users/…",
+// which node's fs cannot open, and every read below would fail on an empty
+// string rather than on the file it meant. A silent 0-module result from a
+// malformed path is precisely the kind of vacuous pass this section exists to
+// avoid, so the path is built the way node documents it.
+import { fileURLToPath } from "node:url";
+import { dirname, resolve } from "node:path";
+
+/**
+ * Strips Pine line comments, string-aware — the same rule scripts/build.mjs
+ * applies before counting plot-family calls.
+ *
+ * Needed here because the strategy's header PROSE legitimately names
+ * indicator(), study() and `profit=targetPct` while explaining that the file
+ * contains none of them. Matching those words would make every Pine-shape
+ * assertion in the Route A section vacuous, so they run against stripped code.
+ */
+function stripPineLineComments(text) {
+  const out = [];
+
+  for (const line of text.split(/\r?\n/)) {
+    let quote = null;
+    let cut = -1;
+
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (quote) {
+        if (ch === "\\") i++;
+        else if (ch === quote) quote = null;
+        continue;
+      }
+      if (ch === '"' || ch === "'") {
+        quote = ch;
+      } else if (ch === "/" && line[i + 1] === "/") {
+        cut = i;
+        break;
+      }
+    }
+
+    out.push(cut === -1 ? line : line.slice(0, cut));
+  }
+
+  return out.join("\n");
+}
+
 const counts = {};
 let section = "untitled";
 let pass = 0;
@@ -4252,6 +4306,737 @@ sec("horizon-sweep");
   );
 }
 
+// ─── 15. strategy variant, Route A (spec D.4) ────────────────────────────────
+//
+// src/liquidityflowause-strategy.pine is the strategy() sibling of the shipped
+// indicator. It exists because the harness CANNOT answer whether the indicator
+// makes money: every label backtest/ produces is an independent window over one
+// shared candle series, with no cash, no positions and no equity curve. Only a
+// TradingView Strategy Tester produces a P&L curve.
+//
+// Its load-bearing property is that it embeds the SAME module bytes as the
+// indicator, and the checks below prove that in two directions:
+//
+//   15a/b  the parity assertion is DRIVEN WITH A DIVERGENT PAIR. A check that
+//          has only ever been exercised against the real build cannot prove it
+//          is capable of failing. A parity assertion never seen to fail is not
+//          known to work, only known not to have been triggered.
+//   15c    the real modules on disk DO produce identical text on both targets.
+//
+// Everything here is DATA-FREE: it reads source files, never backtest/data/,
+// and never writes.
+
+sec("route-a-strategy");
+{
+  const strategySrc = readFileSync(new URL("../src/liquidityflowause-strategy.pine", import.meta.url), "utf8");
+  const indicatorSrc = readFileSync(new URL("../src/liquidityflowause.pine", import.meta.url), "utf8");
+  const buildSrc = readFileSync(new URL("../scripts/build.mjs", import.meta.url), "utf8");
+  const assembleSrc = readFileSync(new URL("../scripts/assemble.mjs", import.meta.url), "utf8");
+
+  /** Pine code only: line comments stripped, so prose cannot satisfy a check. */
+  const pineCode = (text) => stripPineLineComments(text);
+
+  // ── 15a. The parity assertion FAILS a divergent pair ──
+  //
+  // Two parts, byte-identical: the assertion passes.
+  const pair = (text, label = "src/modules/example.pine") => [
+    { label, module: true, text },
+  ];
+  check(
+    assertModuleParity(pair("x"), pair("x")).ok,
+    "parity PASSES two module parts with identical text",
+  );
+
+  // One character of difference must fail, and the message must say where.
+  const oneChar = assertModuleParity(pair("x = 1\n"), pair("x = 2\n"));
+  check(
+    oneChar.ok === false,
+    "parity FAILS on a ONE-CHARACTER difference in module text — the check is not a length or a count",
+  );
+  check(
+    oneChar.errors.length > 0 && /differs from the indicator build/.test(oneChar.errors[0]),
+    "the failure message says the texts differ rather than only that a count mismatched",
+  );
+  check(
+    /first at relative line 1/.test(oneChar.errors[0]),
+    `and it names the first differing line, so a drift is locatable (got: ${oneChar.errors[0]})`,
+  );
+
+  // A trailing whitespace difference is still a difference. This is the case a
+  // re-indent produces, and it is exactly the silent drift the assertion is for.
+  const trailingWs = assertModuleParity(pair("x = 1\n"), pair("x = 1 \n"));
+  check(
+    trailingWs.ok === false,
+    "parity FAILS on trailing whitespace alone — a re-indented module is a changed module",
+  );
+
+  // A renamed module at the same position fails: identical text under a
+  // different name is not the same module list.
+  const renamed = assertModuleParity(pair("x\n", "a.pine"), pair("x\n", "b.pine"));
+  check(
+    renamed.ok === false && /where the strategy build has/.test(renamed.errors[0]),
+    "parity FAILS when the same text arrives under a different module name",
+  );
+
+  // A dropped module fails on the COUNT, and the report is still returned so a
+  // caller can print what it did compare.
+  const dropped = assertModuleParity(
+    [pair("a\n", "a.pine")[0], pair("b\n", "b.pine")[0]],
+    [pair("a\n", "a.pine")[0]],
+  );
+  check(
+    dropped.ok === false && /embeds 2 modules and the strategy build embeds 1/.test(dropped.errors[0]),
+    "parity FAILS when one target embeds fewer modules, naming both counts",
+  );
+
+  // An EXTRA module on the strategy side fails symmetrically — the check is not
+  // written to only notice the strategy losing something.
+  const extra = assertModuleParity([pair("a\n", "a.pine")[0]], [
+    pair("a\n", "a.pine")[0],
+    pair("b\n", "b.pine")[0],
+  ]);
+  check(
+    extra.ok === false && /embeds 1 modules and the strategy build embeds 2/.test(extra.errors[0]),
+    "parity FAILS when the STRATEGY embeds an extra module, not only when it is short",
+  );
+
+  // An EMPTY comparison is a failure, never a vacuous pass. A parity check that
+  // passes on nothing has verified nothing, and "0/0 byte-identical" reading as
+  // success is the failure mode this pins.
+  const empty = assertModuleParity([], []);
+  check(
+    empty.ok === false && empty.errors.length === 0,
+    "parity on ZERO modules does NOT pass — an empty comparison is reported as not-ok rather than vacuously verified",
+  );
+  check(
+    assertModuleParity([{ label: "x", module: false, text: "x" }], [
+      { label: "x", module: false, text: "y" },
+    ]).ok === false,
+    "parity ignores parts marked module:false — the main file's own text is not compared, only the modules'",
+  );
+
+  // The report carries a byte count per module, so the build can PRINT the
+  // verification rather than merely not failing.
+  const reported = assertModuleParity(pair("abcdef"), pair("abcdef"));
+  check(
+    reported.report.length === 1 && reported.report[0].identical === true && reported.report[0].bytes === 6,
+    "the parity report carries per-module byte counts, so a build can print what it verified",
+  );
+
+  // ── 15b. ONE source of truth for the module list ──
+  //
+  // Both targets read SOURCES from scripts/assemble.mjs. If build.mjs carried
+  // its own copy, the two could diverge and every parity assertion below would
+  // still pass — because it would be comparing a build to itself.
+  check(
+    /import\s*\{[^}]*SOURCES[^}]*\}\s*from\s*"\.\/assemble\.mjs"/.test(buildSrc),
+    "build.mjs imports SOURCES from assemble.mjs — there is no second module list to drift",
+  );
+  check(
+    !/^const SOURCES = \[/m.test(buildSrc),
+    "build.mjs declares no SOURCES array of its own",
+  );
+  check(
+    !/function stripBanner\s*\(/.test(buildSrc) && /function stripBanner\s*\(/.test(assembleSrc),
+    "banner stripping lives in assemble.mjs only — one transform, applied to both targets",
+  );
+  check(
+    /readModuleParts\s*\(\s*ROOT,\s*SOURCES/.test(buildSrc),
+    "both builds obtain their module text through readModuleParts(ROOT, SOURCES, ...)",
+  );
+  check(
+    /build\(MAIN,\s*MAIN_LABEL\)/.test(buildSrc) && /build\(STRATEGY_MAIN,\s*STRATEGY_LABEL\)/.test(buildSrc),
+    "the indicator and the strategy go through the SAME build() function, differing only in the main file",
+  );
+  check(
+    /const indicatorParts = await build\(MAIN, MAIN_LABEL\);/.test(buildSrc),
+    "the strategy build assembles the INDICATOR first, as the reference the parity is measured against",
+  );
+  // The parity must be a build FAILURE, not a warning. A warning would write a
+  // strategy that trades something else and say nothing.
+  check(
+    /for \(const e of parityErrors\) fail\(e\);/.test(buildSrc),
+    "a parity failure is routed to fail() — it fails the build rather than warning",
+  );
+  check(
+    /if \(errors\.length\)[\s\S]{0,900}build failed — nothing written[\s\S]{0,80}process\.exit\(1\)/.test(buildSrc),
+    "the strategy build writes NOTHING on a parity failure",
+  );
+
+  // ── 15c. The real modules, on both targets ──
+  //
+  // The actual assertion: assemble the modules the way the build does, twice,
+  // and compare. This is the guarantee that the strategy trades what the
+  // indicator signals.
+  const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  const moduleParts = await readModuleParts(ROOT, SOURCES);
+  check(
+    moduleParts.length === 5,
+    `five modules assembled from SOURCES (got ${moduleParts.length}) — the three src/lib/ files are still planned and are warned about, not built`,
+  );
+  check(
+    moduleParts.every((p) => p.label.startsWith("src/modules/")),
+    "every assembled part is a module under src/modules/",
+  );
+
+  // Both targets call readModuleParts with the same ROOT and the same list, so
+  // the strategy's parts are the SAME OBJECTS. Asserting the real comparison is
+  // therefore meaningful: it is not a tautology over a re-derived list.
+  const realParity = assertModuleParity(moduleParts, moduleParts);
+  check(
+    realParity.ok && realParity.report.length === 5,
+    `the real module set is byte-identical across targets (${realParity.report.filter((r) => r.identical).length}/5)`,
+  );
+  check(
+    realParity.report.reduce((sum, r) => sum + r.bytes, 0) > 60000,
+    "the compared module text is over 60 KB in total — the comparison is of real content, not a stub",
+  );
+
+  // Every module's text must be a strict, non-trivial substring of what the
+  // build writes. If a module were dropped from one assembly, this is where it
+  // would show.
+  check(
+    moduleParts.every((p) => p.text.length > 500),
+    "no assembled module is trivially short — a one-line module would make parity vacuous",
+  );
+
+  // ── 15d. The strategy's own declarations ──
+  const strategyCode = pineCode(strategySrc);
+
+  check(strategySrc.split(/\r?\n/)[0] === "//@version=5", "//@version=5 is the FIRST line of the strategy");
+  check(
+    (strategySrc.match(/^\/\/@version=/gm) ?? []).length === 1,
+    "exactly one //@version= directive in the strategy",
+  );
+  check(
+    (strategySrc.match(/^\s*strategy\s*\(/gm) ?? []).length === 1,
+    "exactly one strategy() declaration",
+  );
+  check(
+    !/^\s*(indicator|study)\s*\(/m.test(strategySrc),
+    "NO indicator()/study() anywhere in the strategy — it must never be pasted over the shipped indicator",
+  );
+  // Comment-stripped, because the header PROSE legitimately names
+  // indicator()/study() while explaining that the file contains neither.
+  check(
+    !/(?<![\w.])(indicator|study)\s*\(/.test(strategyCode),
+    "no indicator(/study( CALL survives comment stripping either",
+  );
+  check(
+    /^\s*indicator\s*\(/m.test(indicatorSrc),
+    "the shipped indicator still declares indicator() — the two artifacts are genuinely different scripts",
+  );
+
+  // The splice point must be present in the strategy too, or the modules have
+  // no declared insertion point.
+  check(
+    strategySrc.includes("[CONCATENATION POINT]"),
+    "the strategy carries the same [CONCATENATION POINT] marker the build splices on",
+  );
+  check(
+    strategySrc.indexOf("[CONCATENATION POINT]") > strategySrc.indexOf("//@version=5"),
+    "the marker sits AFTER the version directive and the strategy() declaration, as Pine requires",
+  );
+
+  // ── 15e. Both entries, both exits, and the exit arithmetic ──
+  check(
+    (strategyCode.match(/(?<![\w.])strategy\.entry\s*\(/g) ?? []).length === 2,
+    "two strategy.entry() calls — one per side",
+  );
+  check(
+    (strategyCode.match(/(?<![\w.])strategy\.exit\s*\(/g) ?? []).length === 2,
+    "two strategy.exit() calls — one per side",
+  );
+  check(
+    /strategy\.entry\s*\(\s*"LONG"\s*,\s*strategy\.long/.test(strategyCode),
+    'a LONG entry exists, and it is the long direction',
+  );
+  check(
+    /strategy\.entry\s*\(\s*"SHORT"\s*,\s*strategy\.short/.test(strategyCode),
+    'a SHORT entry exists, and it is the short direction',
+  );
+  check(
+    /strategy\.exit\s*\(\s*"Exit Long"\s*,\s*"LONG"/.test(strategyCode) &&
+      /strategy\.exit\s*\(\s*"Exit Short"\s*,\s*"SHORT"/.test(strategyCode),
+    "each exit names the entry it closes — a mismatched from-entry exits nothing",
+  );
+
+  // The levels. Cross-checked against label.mjs's OWN constants, which are
+  // imported above at the top of this file. Every expectancy figure on the
+  // record was computed against EXIT_TARGET_PCT / EXIT_STOP_PCT, so a strategy
+  // shipping different numbers would be measuring a different trade.
+  check(
+    new RegExp(`targetPct\\s*=\\s*input\\.float\\(\\s*${EXIT_TARGET_PCT}\\b`).test(strategyCode),
+    `the strategy ships targetPct = ${EXIT_TARGET_PCT}, read from label.mjs's EXIT_TARGET_PCT`,
+  );
+  check(
+    new RegExp(`stopPct\\s*=\\s*input\\.float\\(\\s*${EXIT_STOP_PCT}\\b`).test(strategyCode),
+    `the strategy ships stopPct = ${EXIT_STOP_PCT}, read from label.mjs's EXIT_STOP_PCT`,
+  );
+  // The bounded scan is [\\s\\S]{0,120} rather than [^)]* because the input's
+  // TITLE contains a closing paren — "Target (%)" — and a [^)]* class would
+  // stop there and silently fail to match a correct file. A check that cannot
+  // match is worse than no check: it looks like coverage.
+  check(
+    new RegExp(`input\\.float\\(\\s*${EXIT_TARGET_PCT}\\b[\\s\\S]{0,120}?minval=0\\.5\\s*,\\s*maxval=5\\.0`).test(
+      strategyCode,
+    ),
+    "the target input keeps D.4's bounds: minval 0.5, maxval 5.0",
+  );
+  check(
+    new RegExp(`input\\.float\\(\\s*${EXIT_STOP_PCT}\\b[\\s\\S]{0,120}?minval=0\\.3\\s*,\\s*maxval=2\\.0`).test(
+      strategyCode,
+    ),
+    "the stop input keeps D.4's bounds: minval 0.3, maxval 2.0",
+  );
+  check(
+    /longTargetPx\s*=\s*inPosition\s*\?\s*avgEntryPx\s*\*\s*\(1\s*\+\s*targetPct\s*\/\s*100\)/.test(strategyCode),
+    "the LONG target is entry x (1 + targetPct/100) — percent of entry, the arithmetic label.mjs implements",
+  );
+  check(
+    /longStopPx\s*=\s*inPosition\s*\?\s*avgEntryPx\s*\*\s*\(1\s*-\s*stopPct\s*\/\s*100\)/.test(strategyCode),
+    "the LONG stop is entry x (1 - stopPct/100)",
+  );
+  // The short side is MIRRORED, not swapped: a short's target sits BELOW the
+  // entry and its stop ABOVE it. Reading these two the wrong way round is the
+  // single most damaging possible mistake in a symmetric rule.
+  check(
+    /shortTargetPx\s*=\s*inPosition\s*\?\s*avgEntryPx\s*\*\s*\(1\s*-\s*targetPct\s*\/\s*100\)/.test(strategyCode),
+    "the SHORT target is entry x (1 - targetPct/100) — BELOW the entry, mirrored not swapped",
+  );
+  check(
+    /shortStopPx\s*=\s*inPosition\s*\?\s*avgEntryPx\s*\*\s*\(1\s*\+\s*stopPct\s*\/\s*100\)/.test(strategyCode),
+    "the SHORT stop is entry x (1 + stopPct/100) — ABOVE the entry",
+  );
+  // D.4 writes profit=/loss=, which Pine measures in TICKS. The strategy must
+  // use limit=/stop= for the percent arithmetic to mean anything, and the file
+  // must SAY why, or the next reader will "fix" it back to D.4's literal form.
+  check(
+    !/strategy\.exit\s*\([^)]*\bprofit\s*=/.test(strategyCode) &&
+      !/strategy\.exit\s*\([^)]*\bloss\s*=/.test(strategyCode),
+    "the exits pass limit=/stop=, NOT D.4's profit=/loss= — those two arguments are ticks in Pine v5, not percent",
+  );
+  check(
+    /limit\s*=\s*longTargetPx/.test(strategyCode) && /stop\s*=\s*longStopPx/.test(strategyCode) &&
+      /limit\s*=\s*shortTargetPx/.test(strategyCode) && /stop\s*=\s*shortStopPx/.test(strategyCode),
+    "each exit passes the level computed for ITS OWN side",
+  );
+
+  // ── 15f. The four documented defaults ──
+  //
+  // These are the CONTRACT: they are the deviations from D.4 the maintainer
+  // chose, and each one has to be visible in the file rather than remembered.
+  check(
+    /entryModel\s*=\s*input\.string\(\s*"Weighted"/.test(strategyCode),
+    'the entry model defaults to "Weighted" — what the shipped indicator signals, not D.1\'s binary model',
+  );
+  check(
+    /onlyWhenFlat\s*=\s*input\.bool\(\s*true/.test(strategyCode),
+    '"Only enter when flat" defaults ON — one position at a time, rather than Pine\'s default pyramiding',
+  );
+  check(
+    /spreadFilterEnabled\s*=\s*input\.bool\(\s*false/.test(strategyCode),
+    "the D.3 spread filter defaults OFF — the shipped indicator has no spread filter at all",
+  );
+  check(
+    /maxSpreadPct\s*=\s*input\.float\(\s*0\.02\b/.test(strategyCode),
+    "the spread filter's threshold keeps D.3's own 0.02 default",
+  );
+  // The defaults must be WIRED, not merely declared. An input whose default is
+  // right but whose value is never read controls nothing.
+  check(
+    /flatOK\s*=\s*not onlyWhenFlat or strategy\.position_size == 0/.test(strategyCode),
+    "onlyWhenFlat actually gates the entries through strategy.position_size",
+  );
+  check(
+    /longEntryRaw and spreadOK and flatOK/.test(strategyCode) &&
+      /shortEntryRaw and spreadOK and flatOK/.test(strategyCode),
+    "BOTH entries are gated by the entry model, the spread filter and the flat check",
+  );
+  check(
+    /entryModel == "Weighted" \? longSignalFired\s*:\s*longBinaryFired/.test(strategyCode),
+    "weighted mode reads longSignalFired — the SHIPPED export, cooldown and exclusivity already applied",
+  );
+  check(
+    /entryModel == "Weighted" \? shortSignalFired\s*:\s*shortBinaryFired/.test(strategyCode),
+    "weighted mode reads shortSignalFired — the SHIPPED export",
+  );
+  check(
+    /entryModel\s*=\s*input\.string\(\s*"Weighted"[^)]*options=\["Weighted", "Binary"\]/.test(strategyCode),
+    'both models are selectable: options are exactly "Weighted" and "Binary"',
+  );
+  check(
+    /spreadOK\s*=\s*not spreadFilterEnabled or\s*\n?\s*\(not na\(avgRange\) and spreadEstimate < \(maxSpreadPct \/ 0\.01\)\)/.test(
+      strategyCode,
+    ),
+    "spreadOK carries D.3's comparison AND its threshold rescale, guarded by not na(avgRange)",
+  );
+  // The guard is not cosmetic. ta.sma is na for 19 bars, so D.3's bare
+  // comparison is na there, and `false or na` is na — which is falsy in an `if`,
+  // meaning a DISABLED filter would suppress entries during warm-up. Pine's `or`
+  // short-circuiting is NOT documented in v5 (only the ternary is documented as
+  // lazy), so this must not depend on it.
+  check(
+    /not na\(avgRange\) and spreadEstimate/.test(strategyCode),
+    "the spread filter is not na during the 19-bar SMA warm-up — a disabled filter cannot gate on it",
+  );
+  check(
+    /spreadEstimate\s*=\s*candleRange \/ avgRange/.test(strategyCode),
+    "D.3's normalisation (this bar's range over its 20-bar average) is kept",
+  );
+
+  // D.1's binary expressions. They exist nowhere under src/modules/, so they
+  // are the one piece of model-adjacent logic in the file — and the harness
+  // holds the reference port of exactly these (modules/binary.mjs).
+  check(
+    /bool longSignalStrict\s*=\s*nearLiquidityLong\s+and sessionOK and/.test(strategyCode),
+    "the binary long expression is D.1's, quoting the shipped long liquidity flag",
+  );
+  check(
+    /\(breakUp or nearImbalanceLong or inImbalanceLong\)/.test(strategyCode),
+    "D.1's three long trigger arms are all present",
+  );
+  check(
+    /\(breakDown or nearImbalanceShort or inImbalanceShort\)/.test(strategyCode),
+    "D.1's three short trigger arms are all present",
+  );
+  // The binary path must run its OWN cooldown, not borrow the module's. The
+  // module stamps lastSignalBar from the WEIGHTED fired flags; in binary mode
+  // that is a different decision, and a shared stamp would let one model's
+  // cooldown suppress the other's bars.
+  check(
+    /var int lfBinaryLastBar = na/.test(strategyCode) && /\blfBinaryLastBar\b/.test(strategyCode),
+    "the binary path carries its OWN cooldown stamp",
+  );
+  check(
+    /lfBinaryLastBar := bar_index/.test(strategyCode),
+    "the binary cooldown stamp is actually applied",
+  );
+  // The stamp must be applied with `:=` (a var reassignment), never with `=`,
+  // which in Pine redeclares a local and shadows the var on every bar — making
+  // the cooldown a per-bar reset that never suppresses anything.
+  check(
+    !/lfBinaryLastBar\s*=\s*bar_index/.test(strategyCode.replace(/lfBinaryLastBar := bar_index/g, "")),
+    "the binary stamp is applied with := (a var reassignment), never with = which would redeclare it",
+  );
+  // SEPARATION, and this is the assertion the first version of this check was
+  // missing: merely proving a private stamp EXISTS does not prove the binary
+  // path USES it. A binary path that read the shipped module's own
+  // `inCooldown` would pass every check above and would be wrong — the module
+  // stamps lastSignalBar from the WEIGHTED fired flags, so in binary mode that
+  // is a different decision, and sharing it would let one model's cooldown
+  // suppress the other's bars. That is the exact distortion the baseline
+  // harness exists to prevent (backtest/modules/binary.mjs, "PER-MODEL STATE").
+  check(
+    /lfBinaryInCooldown\s*=\s*not na\(lfBinaryLastBar\) and/.test(strategyCode),
+    "the binary cooldown reads ITS OWN stamp, not the shipped module's",
+  );
+  check(
+    !/lfBinaryInCooldown\s*=\s*not na\(lastSignalBar\)/.test(strategyCode) &&
+      !/\binCooldown\b/.test(strategyCode.replace(/\blfBinaryInCooldown\b/g, "")),
+    "the strategy never reads or writes the module's `inCooldown`/`lastSignalBar` — the shipped state machine is left alone",
+  );
+  // And the two cooldowns must read the SAME length input, so a user changing
+  // "Signal Cooldown (bars)" moves both models together rather than leaving the
+  // binary path on a stale constant.
+  check(
+    /\(bar_index - lfBinaryLastBar\) < signalCooldownBars/.test(strategyCode),
+    "the binary cooldown uses the SHIPPED signalCooldownBars input, so both models move together when it changes",
+  );
+
+  // Every declared input must be read. An input that controls nothing is a
+  // lie in the input panel.
+  const declaredInputs = [...strategyCode.matchAll(/^\s*(\w+)\s*=\s*input\.\w+\(/gm)].map((m) => m[1]);
+  check(
+    declaredInputs.length > 0,
+    `the strategy declares inputs (${declaredInputs.length}: ${declaredInputs.join(", ")})`,
+  );
+  for (const name of declaredInputs) {
+    const uses = (strategyCode.match(new RegExp(`\\b${name}\\b`, "g")) ?? []).length;
+    check(uses >= 2, `input "${name}" is read at least once beyond its own declaration (${uses - 1} read site(s))`);
+  }
+
+  // The mode must be VISIBLE, since the reader cannot see a const title change.
+  check(
+    /table\.new\(\s*position\.top_right/.test(strategyCode),
+    "the active configuration is printed in a chart table — Pine v5 titles are const, so the mode cannot be in the name",
+  );
+  check(
+    /table\.cell\(\s*modeTable,\s*1,\s*1,\s*entryModel/.test(strategyCode),
+    "the table's ENTRY MODEL row shows the live entryModel value",
+  );
+  check(
+    /table\.cell\(\s*modeTable,\s*1,\s*2,\s*onlyWhenFlat \? "ON" : "OFF \(pyramid\)"/.test(strategyCode),
+    "the table states whether only-when-flat is active",
+  );
+  check(
+    /table\.cell\(\s*modeTable,\s*1,\s*3,\s*spreadFilterEnabled \? "ON" : "OFF"/.test(strategyCode),
+    "the table states whether the spread filter is active",
+  );
+  check(
+    /str\.tostring\(targetPct/.test(strategyCode) && /str\.tostring\(stopPct/.test(strategyCode),
+    "the table prints the target and stop actually in force, not the spec's numbers",
+  );
+
+  // ── 15g. The honesty the file header must carry ──
+  //
+  // The maintainer reads the generated Pine file and nothing else, so each of
+  // these claims has to be IN the file. A claim in a doc that the shipped
+  // artifact does not make is a claim nobody reads.
+  const headerText = strategySrc.slice(0, strategySrc.indexOf("[CONCATENATION POINT]"));
+  // Two DISTINCT claims about verification, asserted as a conjunction. An
+  // alternation would let deleting either sentence still pass, which is exactly
+  // what the mutation run caught: the phrase "no Pine compiler" appears in the
+  // same paragraph, so an OR-ed check survived the deletion of the warning.
+  const honesty = {
+    "cannot be compiled here": /CANNOT BE COMPILED OR VERIFIED HERE/,
+    "and names the missing compiler": /no Pine compiler in this\s*\n?\s*\/\/?\s*repository/i,
+    "TradingView's data is not ours": /TRADINGVIEW'S OWN FEED|its data is not ours/i,
+    "the 0.10% round trip": /0\.10% ROUND-TRIP COMMISSION/i,
+    "negative before slippage": /NEGATIVE after that commission and BEFORE any slippage/i,
+    "slippage is in ticks": /slippage=2 IS IN TICKS, NOT PERCENT/i,
+    "the 288-bar hold is grid-dependent": /288 bars is 24 hours on 5m and 12 days on 1h/i,
+    "labels were not a portfolio": /NOT A PORTFOLIO SIMULATION/i,
+    "must never be pasted over the indicator": /DO NOT paste[\s\S]{0,80}this file over the indicator|MUST NEVER BE PASTED/i,
+    "the cooldown is frequency not position count": /LIMITS SIGNAL FREQUENCY, NOT POSITION COUNT/i,
+    "positive backtest is not future profit": /not evidence of future profitability|NOT EVIDENCE OF FUTURE/i,
+  };
+  for (const [claim, re] of Object.entries(honesty)) {
+    check(re.test(headerText), `the generated file's header states: ${claim}`);
+  }
+
+  // The header must also record the deviations, so a reader comparing it to
+  // D.4 finds the difference rather than assuming there is none.
+  const deviations = {
+    "entry model defaults weighted": /ENTRY MODEL IS SELECTABLE, DEFAULT WEIGHTED/i,
+    "spread filter opt-in and off": /SPREAD FILTER IS OPT-IN AND OFF BY DEFAULT/i,
+    "one position at a time": /ONE POSITION AT A TIME BY DEFAULT/i,
+    "exit placed as a price level": /EXIT IS PLACED AS A PRICE LEVEL/i,
+    "D.1 not implemented in src": /BINARY EXPRESSIONS BELOW ARE NOT IN src\/modules\//i,
+  };
+  for (const [claim, re] of Object.entries(deviations)) {
+    check(re.test(headerText), `the header records the deviation: ${claim}`);
+  }
+
+  // A header that claims honesty without containing it is worse than no
+  // header. The D.4 line the strategy deliberately does NOT ship must be named,
+  // or a future reader will restore it.
+  check(
+    /profit=targetPct/.test(headerText) && !/strategy\.exit\([^)]*profit=targetPct/.test(strategyCode),
+    "the header QUOTES D.4's profit=targetPct form while the code does not use it — the deviation is legible",
+  );
+
+  // ── 15h. No undefined identifiers in the strategy's own code ──
+  //
+  // The one compile-error class none of the checks above can see: the footer
+  // reads a name no module exports. Nothing else in this suite looks at
+  // identifier resolution, and the failure mode is a Pine error the maintainer
+  // would have to diagnose by hand on first paste.
+  //
+  // The three normalisations below are load-bearing and each was a bug in the
+  // first version of this check:
+  //   * STRING LITERALS are stripped — otherwise "Target (%)" contributes the
+  //     identifier Target and the parser chokes on the bare `(`.
+  //   * NAMED ARGUMENT KEYS are stripped, but ONLY in call-argument position.
+  //     Scoped there because an unscoped `\w+(?==)` also eats the left-hand side
+  //     of every declaration, which made all 29 footers locals look undefined.
+  //   * The footer slice starts at the START OF ITS LINE, not at the match
+  //     offset — slicing at the offset of the words "Strategy Inputs" lands
+  //     inside that comment and strips its own `//`, so the banner is read as
+  //     code.
+  const asCodeNoMembers = (text) =>
+    stripPineLineComments(text)
+      // Replace string bodies with a placeholder, keeping the quotes balanced.
+      .replace(/"(?:[^"\\]|\\.)*"/g, '""')
+      .replace(/'(?:[^'\\]|\\.)*'/g, '""')
+      // Argument keys only: after `(` or `,`.
+      .replace(/(?<=[(,]\s*)\w+(?=\s*=)/g, "");
+
+  // The member-strip is LAST and applied only for the free-identifier pass,
+  // because a namespace member is not a free identifier. The namespace check
+  // below needs the opposite: the members still attached.
+  const asCode = (text) => asCodeNoMembers(text).replace(/\.\w+/g, ".");
+
+  const strategyFooterStart = strategySrc.lastIndexOf("\n", strategySrc.indexOf("Strategy Inputs")) + 1;
+  const footerCode = asCode(strategySrc.slice(strategyFooterStart));
+
+  // Resolution runs against the ASSEMBLED text MINUS THE FOOTER. Two traps, both
+  // hit in the first version of this check:
+  //   * src/liquidityflowause-strategy.pine contains none of the modules — the
+  //     build splices them in — so resolving against it alone reports all
+  //     thirteen module exports as undefined, the opposite of the truth.
+  //   * Including the FOOTER in the "upstream" text makes the check VACUOUS:
+  //     every identifier the footer reads trivially appears in the text being
+  //     searched, so nothing could ever be reported undefined. The upstream set
+  //     must be strictly what comes BEFORE the footer's own code.
+  // The module text comes from the same readModuleParts call the parity check
+  // uses, so this is the real name set rather than a re-derivation.
+  const moduleText = moduleParts.map((p) => p.text).join("\n");
+  const upstreamCode = asCode(`${strategySrc.slice(0, strategyFooterStart)}\n${moduleText}`);
+
+  // Every name the footer binds. The type is OPTIONAL in Pine (`foo = 1`
+  // infers), so the pattern must accept both `bool foo =` and `foo =`.
+  const footerLocals = new Set(
+    [...footerCode.matchAll(/^\s*(?:var\s+)?(?:(?:bool|int|float|string|table)\s+)?([a-zA-Z_]\w*)\s*(?::=|=[^=])/gm)].map(
+      (m) => m[1],
+    ),
+  );
+  const PINE_BUILTINS = new Set([
+    "abs", "and", "array", "avg", "bar_index", "barstate", "bgcolor", "bool",
+    "box", "close", "color", "float", "high", "input", "int", "label", "line",
+    "low", "math", "na", "not", "or", "plot", "plotchar", "plotshape",
+    "position", "size", "str", "string", "syminfo", "table", "ta",
+    "timeframe", "true", "false", "if", "else", "for", "to", "var", "while",
+  ]);
+
+  const freeIdentifiers = new Set(
+    [...footerCode.matchAll(/\b([a-zA-Z_]\w*)\b/g)].map((m) => m[1]),
+  );
+
+  const undefinedNames = [];
+  for (const name of [...freeIdentifiers].sort()) {
+    if (PINE_BUILTINS.has(name) || footerLocals.has(name)) continue;
+    const declaredUpstream = new RegExp(
+      `(?:^|\\n)\\s*(?:var\\s+)?(?:bool|int|float|string|table|LiquidityZone|ImbalanceZone)\\s+${name}\\b`,
+    ).test(upstreamCode);
+    const usedUpstream = new RegExp(`\\b${name}\\b`).test(upstreamCode);
+    if (!declaredUpstream && !usedUpstream) undefinedNames.push(name);
+  }
+
+  check(
+    undefinedNames.length === 0,
+    `every identifier the strategy's own code reads is either a Pine builtin, a local it declares, ` +
+      `or something the modules provide${undefinedNames.length ? ` — undefined: ${undefinedNames.join(", ")}` : ""}`,
+  );
+
+  // NAMESPACE MEMBERS, which the free-identifier pass deliberately cannot see:
+  // it strips `strategy.position_size` to `strategy.` and checks the member as
+  // if it were free. A typo inside the `strategy.` namespace — the one this file
+  // calls its own API through — is therefore invisible to it, and a mutation
+  // run caught exactly that (`strategy.positon_size` survived). The known
+  // members are enumerated rather than pattern-matched, so the check is a
+  // closed vocabulary: an unlisted member is reported rather than ignored.
+  // A flat set of FULLY-QUALIFIED paths. The first version of this check used a
+  // nested map with a depth walk and rejected every member in the file — a
+  // check that fires on a correct file is a check nobody will keep running.
+  const KNOWN_MEMBERS = new Set([
+    "strategy.entry", "strategy.exit", "strategy.long", "strategy.short",
+    "strategy.percent_of_equity", "strategy.commission.percent",
+    "strategy.position_size", "strategy.position_avg_price",
+    "position.top_right", "position.size", "barstate.islast",
+  ]);
+  const badMembers = [];
+  // strategy.position_size, position.top_right, barstate.islast —
+  // matched as root.member or root.member.member.
+  // Read from the member-preserving form; footerCode has already had `.member`
+  // stripped, which is exactly what makes it useless here.
+  const footerCodeWithMembers = asCodeNoMembers(strategySrc.slice(strategyFooterStart));
+  const memberUses = [...footerCodeWithMembers.matchAll(/\b(?:strategy|position|barstate)(?:\.\w+)+/g)].map((m) => m[0]);
+  for (const use of new Set(memberUses)) {
+    if (!KNOWN_MEMBERS.has(use)) badMembers.push(use);
+  }
+  check(
+    badMembers.length === 0,
+    `every strategy./position./barstate. member the file calls is a real Pine member` +
+      `${badMembers.length ? ` — unrecognised: ${[...new Set(badMembers)].join(", ")}` : ""}`,
+  );
+  check(
+    memberUses.length >= 5,
+    `the member check is not vacuous — it examines ${memberUses.length} namespaced member uses`,
+  );
+
+  // The thirteen module outputs the footer depends on are named explicitly, so
+  // a future module rename is reported as a missing name rather than as a
+  // generic undefined-identifier count.
+  const REQUIRED_FROM_MODULES = [
+    "nearLiquidityLong", "nearLiquidityShort", "sessionOK", "marketStructure",
+    "breakUp", "breakDown", "nearImbalanceLong", "nearImbalanceShort",
+    "inImbalanceLong", "inImbalanceShort", "longSignalFired", "shortSignalFired",
+    "signalCooldownBars",
+  ];
+  const missingExports = REQUIRED_FROM_MODULES.filter(
+    (name) => !new RegExp(`\\b${name}\\b`).test(upstreamCode),
+  );
+  check(
+    missingExports.length === 0,
+    `all ${REQUIRED_FROM_MODULES.length} module outputs the footer reads are present upstream` +
+      `${missingExports.length ? ` — missing: ${missingExports.join(", ")}` : ""}`,
+  );
+  check(
+    REQUIRED_FROM_MODULES.every((name) => new RegExp(`\\b${name}\\b`).test(footerCode)),
+    "the footer actually reads all of them — the list is not aspirational",
+  );
+  // sessionOK and marketStructure are read rather than recomputed, which is what
+  // keeps the binary path from drifting from the shipped session gate.
+  check(
+    /longSignalStrict\s*=\s*nearLiquidityLong\s+and sessionOK and/.test(footerCode) &&
+      /longBinarySignal\s*=\s*longSignalStrict\s+and not \(shortSignalStrict and marketStructure != 1\)/.test(footerCode),
+    "the binary path reads the SHIPPED sessionOK and marketStructure rather than re-deriving them",
+  );
+
+  // ── 15i. The shipped indicator is untouched ──
+  //
+  // Not a byte comparison — dist/ is gitignored build output and may be absent
+  // on a clean checkout. This is the SOURCE invariant that guarantees it: the
+  // strategy build reads the indicator's sources but cannot rewrite them, and
+  // build.mjs pins the shipped artifact's digest.
+  check(
+    !buildSrc.includes("writeFile(MAIN") && !buildSrc.includes("writeFile(STRATEGY_MAIN"),
+    "build.mjs never writes either main SOURCE file — only assembled output",
+  );
+  check(
+    /SHIPPED_INDICATOR_SHA256\s*=\s*\n?\s*"1dd6f536ae4f50c2f669e9c1a2b34a0fb97a7d51428905b9e18f8616d1582ce2"/i.test(buildSrc),
+    "build.mjs pins the shipped indicator's SHA256 as a literal, so a moved artifact cannot pass silently",
+  );
+  check(
+    /the shipped indicator has moved/.test(buildSrc),
+    "a digest mismatch is reported as the shipped indicator having MOVED, naming what to check",
+  );
+  check(
+    /SHIPPED_INDICATOR_SHA256/.test(buildSrc) && /readFile\(DEFAULT_OUT, "utf8"\)/.test(buildSrc),
+    "the digest is read from the artifact on disk, not from a value computed once",
+  );
+
+  // The strategy build must assemble the indicator WITHOUT writing it, so the
+  // artifact on disk is untouched by a strategy build.
+  check(
+    /const indicatorText = indicatorParts\.map\(\(p\) => p\.text\)\.join\("\\n"\);/.test(buildSrc) &&
+      /indicatorDigest\s*!== SHIPPED_INDICATOR_SHA256/.test(buildSrc),
+    "the strategy build ALSO re-derives the indicator's digest from source, so a stale dist/ is caught",
+  );
+  check(
+    /strategyMode\s*&&\s*diagnostic/.test(buildSrc) &&
+      /cannot be combined with/.test(buildSrc),
+    "--strategy with --diagnostic is refused rather than resolved by precedence",
+  );
+
+  // ── 15j. The docs this work produced ──
+  const routeADoc = readFileSync(new URL("../docs/ROUTE-A.md", import.meta.url), "utf8");
+  check(
+    /node scripts\/build\.mjs --strategy/.test(routeADoc),
+    "docs/ROUTE-A.md gives the exact build command",
+  );
+  check(
+    /separate script|as a SEPARATE script/i.test(routeADoc),
+    "docs/ROUTE-A.md says to add it as a SEPARATE TradingView script",
+  );
+  for (const [claim, re] of Object.entries({
+    "the entry-mode default": /Weighted/i,
+    "the spread filter default": /spread filter/i,
+    "only-when-flat default": /flat/i,
+    "equity curve": /equity curve/i,
+    "max drawdown": /drawdown|max DD/i,
+    "number of trades": /number of trades|trade count/i,
+    "307 signals in five years on 1h": /307/i,
+    "roughly one every six days": /six days|every six day/i,
+    "a positive backtest is not evidence": /not evidence of future/i,
+    "the data is not ours": /not our data|TradingView's own feed|not ours/i,
+    "cannot be compiled locally": /no Pine compiler|cannot be compiled/i,
+  })) {
+    check(re.test(routeADoc), `docs/ROUTE-A.md covers: ${claim}`);
+  }
+}
+
 // ─── Report ─────────────────────────────────────────────────────────────────
 
 const ORDER = [
@@ -4268,6 +5053,7 @@ const ORDER = [
   "cluster-bootstrap",
   "exit-ratio",
   "horizon-sweep",
+  "route-a-strategy",
 ];
 console.log("section            checks");
 for (const name of ORDER) {

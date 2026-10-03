@@ -1,0 +1,314 @@
+//@version=5
+strategy("LiquidityFlowAuse Strategy", overlay=true,
+         pyramiding=10,
+         max_labels_count=500, max_lines_count=500, max_boxes_count=500,
+         default_qty_type=strategy.percent_of_equity,
+         default_qty_value=10,
+         commission_type=strategy.commission.percent,
+         commission_value=0.05,
+         slippage=2)
+
+// ============================================================================
+// LiquidityFlowAuse — STRATEGY VARIANT (Route A)
+// ----------------------------------------------------------------------------
+// Spec: docs/technical-spec.md D.4 "Strategy Version for Backtesting"
+//       (lines 1937-1968). Build: node scripts/build.mjs --strategy
+//
+// ----------------------------------------------------------------------------
+// WHAT THIS FILE IS FOR — READ THIS FIRST
+// ----------------------------------------------------------------------------
+// The local harness (backtest/) measures DESCRIPTIVE RATIOS over overlapping
+// forward windows. It has no cash, no positions, no equity curve and no
+// compounding, so it CANNOT answer one question: does this make money?
+// A TradingView Strategy Tester produces a P&L curve, which is the only thing
+// in reach that can. That is why this file exists.
+//
+// THIS FILE DOES NOT CHANGE THE SHIPPED INDICATOR. dist/liquidityflowause.pine
+// is a separate artifact and is never regenerated from this source. DO NOT paste
+// this file over the indicator: the indicator is the product, and this is a
+// measuring instrument built beside it.
+//
+// ----------------------------------------------------------------------------
+// THINGS THAT ARE NOT TRUE OF THIS FILE
+// ----------------------------------------------------------------------------
+// 1. IT CANNOT BE COMPILED OR VERIFIED HERE. There is no Pine compiler in this
+//    repository. Every check the build runs on it is STRUCTURAL — text shape,
+//    declaration counts, module parity — not execution. Nothing above has been
+//    run in a Pine Editor. Expect to fix compile errors by hand on first paste.
+//
+// 2. ITS DATA IS NOT OURS. The Strategy Tester runs on TradingView's own feed,
+//    on whatever symbol and timeframe the chart is set to. Our findings came
+//    from Bitstamp BTCUSD 5m / 1h / 4h candles fetched by backtest/run.mjs.
+//    A curve produced here is a DIFFERENT MEASUREMENT. It is not a
+//    reproduction of the harness numbers and must not be quoted beside them as
+//    if it were.
+//
+// 3. THE 0.10% ROUND-TRIP COMMISSION IS ALREADY THE DOMINANT KNOWN COST.
+//    commission_value=0.05 is charged on entry AND on exit, so 0.10% per round
+//    trip, before slippage. Our measurement found the shipped weighted model
+//    NEGATIVE after that commission and BEFORE any slippage is charged at all.
+//    A strategy curve on this file has that cost in it; the harness labels never
+//    did.
+//
+// 4. slippage=2 IS IN TICKS, NOT PERCENT. A tick is the instrument's minimum
+//    price increment on the exchange the chart belongs to. Two ticks is a
+//    rounding error on one symbol and a large move on another. Nothing in this
+//    file converts ticks into a percentage, because the conversion depends on
+//    the exchange and this file does not know which exchange you are on.
+//
+// 5. THE 288-BAR HOLD IS A FUNCTION OF THE GRID, NOT A PROPERTY OF THE STRATEGY.
+//    288 bars is 24 hours on 5m and 12 days on 1h. This file runs on whatever
+//    timeframe the chart is set to, so its hold is 288 bars of THAT grid and is
+//    neither 24 hours nor 12 days. A D.4-shaped rule measured on 1h is a
+//    twelve-day hold, not a one-day one, and it will look nothing like the
+//    harness figure it is being compared against.
+//
+// 6. THE HARNESS LABELS WERE NOT A PORTFOLIO SIMULATION. In backtest/, every
+//    label is an independent WINDOW over one shared candle series: signals six
+//    bars apart share 97.9% of their forward data and are not independent
+//    observations. A Strategy Tester IS a sequential simulation — one position,
+//    one cash balance, one equity curve — which is precisely the measurement
+//    that line of work could not perform.
+//
+// 7. A POSITIVE CURVE IS NOT EVIDENCE OF FUTURE PROFITABILITY. It is evidence
+//    that this configuration did not lose money on this feed, over this period,
+//    with this cost model. That is a much smaller claim, and it is the only one
+//    a Strategy Tester can support. Read the trade count before the equity
+//    line: 307 signals in five years on 1h is roughly one trade every six days,
+//    and a curve of six-day trades needs a correspondingly long window to mean
+//    anything at all.
+//
+// ----------------------------------------------------------------------------
+// DEVIATIONS FROM D.4, STATED UP FRONT
+// ----------------------------------------------------------------------------
+// D.4 is the starting point, not the last word. Each deviation below is a
+// deliberate decision; the numbers D.4 fixes are kept unchanged.
+//
+//   a. ENTRY MODEL IS SELECTABLE, DEFAULT WEIGHTED. D.4 enters on
+//      longSignalStrict — spec D.1's BINARY model. But the shipped indicator, and
+//      therefore what you actually trade, is the WEIGHTED model: longSignal /
+//      shortSignal gated by longScore/shortScore >= minConfidence. Trading the
+//      binary model by default would mean this file measures something other
+//      than the shipped product. Default is "Weighted". "Binary" is available
+//      for anyone who wants D.4 exactly.
+//
+//   b. THE SPREAD FILTER IS OPT-IN AND OFF BY DEFAULT. D.4's entry rules read
+//      `and spreadOK`, but D.3 (spreadOK) IS NOT IMPLEMENTED ANYWHERE UNDER
+//      src/ — the shipped indicator has no spread filter at all. Enabling it by
+//      default would make this file trade something the indicator never trades.
+//      It is implemented below per D.3 and defaults to disabled. Turn it on
+//      deliberately, and read the header before you do.
+//
+//   c. ONE POSITION AT A TIME BY DEFAULT. D.4 is silent and Pine pyramids by
+//      default. "Only Enter When Flat" defaults to ON. NOTE THE CONSEQUENCE: with
+//      it ON, a signal in the OPPOSITE direction cannot reverse an open
+//      position — the new entry is suppressed until the target or the stop
+//      closes the trade. Turn it off to allow pyramiding and reversal.
+//
+//   d. THE 10-BAR COOLDOWN LIMITS SIGNAL FREQUENCY, NOT POSITION COUNT. The
+//      shipped Signal Cooldown (10 bars) stops a signal from re-firing for ten
+//      bars. It says nothing about how many positions may be open at once; that
+//      is item (c) and nothing else.
+//
+//   e. THE EXIT IS PLACED AS A PRICE LEVEL, NOT WITH profit=/loss=. D.4 writes
+//      `strategy.exit(..., profit=targetPct, loss=stopPct)`. TradingView's own v5
+//      documentation states that `profit` and `loss` "accept relative values in
+//      ticks from the entry price", while `limit` and `stop` "accept absolute
+//      price levels". So `profit=1.5` is a one-and-a-half-tick target, not 1.5%.
+//      The inputs below are named "Target (%)" and carry percent bounds, and
+//      backtest/modules/label.mjs implements the rule as 1.5% / 0.8% OF THE
+//      ENTRY PRICE, long and short symmetric. This file therefore computes the
+//      same two levels from strategy.position_avg_price and passes them as
+//      limit=/stop=, which reproduces label.mjs exactly. The 1.5 / 0.8 numbers
+//      are unchanged from D.4; only the units they are expressed in are.
+//
+//   f. max_labels_count / max_lines_count / max_boxes_count ARE DECLARED. D.4's
+//      declaration omits them, which would silently drop the modules to Pine's
+//      small defaults and make zones, gaps and boundary lines disappear. They
+//      match the shipped indicator's declaration.
+//
+//   g. pyramiding=10 IS A CEILING, NOT A BEHAVIOUR. The number of positions
+//      actually held is governed entirely by "Only Enter When Flat" (item c);
+//      the declaration constant only has to be non-zero for stacking to be
+//      permitted when that input is off.
+//
+//   h. THE D.1 BINARY EXPRESSIONS BELOW ARE NOT IN src/modules/. They are
+//      transcribed from docs/technical-spec.md D.1 (lines 1849-1854) because
+//      the shipped Pine never implements them — the only binary port in this
+//      repository is backtest/modules/binary.mjs. They are the one piece of
+//      model-adjacent logic in this file and they are quarantined in their own
+//      block so they can be deleted when D.1 ever lands in a module.
+//
+//   i. D.3's SOURCE TEXT WOULD NOT COMPILE AS WRITTEN. D.3 declares
+//      `bool longSignalStrict = ...` and then reassigns it with `:=`. A `bool`
+//      declared with `=` cannot be reassigned in Pine. Here the filter is a
+//      separate `spreadOK` conjunct on the entry rule, which is what D.3
+//      intended, expressed legally.
+//
+// ----------------------------------------------------------------------------
+// WHERE THE ACTIVE CONFIGURATION IS SHOWN
+// ----------------------------------------------------------------------------
+// Pine Script v5 titles are const strings, so the runtime mode cannot be written
+// into the strategy's name. The active configuration is printed in two places
+// instead: the MODE table on the chart (top right), and the Strategy Tester's
+// Overview tab, which lists the live input values including "Entry Model".
+// Check one of the two before reading any number off the tester.
+// ============================================================================
+
+// ─── Module: Session Markers ────────────────────────────────────────────────
+// [CONCATENATION POINT] Paste the full contents of
+// src/modules/session-markers.pine below this comment block to include
+// session detection, session scoring, and session visual rendering
+// (background tints and boundary lines).
+//
+// Module outputs consumed by downstream modules:
+//   inAsia, inLondon, inNY, inOverlap (bool) — session membership flags
+//   sessionStrength   (int, 0-8)     — session conviction score
+//   sessionMultiplier (float, 0.3-1.5) — signal confidence weighting
+// ────────────────────────────────────────────────────────────────────────────
+
+// ─── Strategy Inputs ────────────────────────────────────────────────────────
+//
+// Declared HERE, after the modules, because every one of them reads a value the
+// modules declare. Pine has no forward declarations.
+
+entryModel    = input.string("Weighted", "Entry Model", options=["Weighted", "Binary"], group="Strategy")
+onlyWhenFlat  = input.bool(true,  "Only Enter When Flat",  group="Strategy")
+targetPct     = input.float(1.5,  "Target (%)",      minval=0.5, maxval=5.0, group="Exit")
+stopPct       = input.float(0.8,  "Stop Loss (%)",   minval=0.3, maxval=2.0, group="Exit")
+
+// ─── Spread Filter (spec D.3) — OPT-IN, DEFAULT OFF ─────────────────────────
+//
+// See deviation (b) in the header. D.3 declares this enabled; the shipped
+// indicator has no spread filter, so this file does not enable one either. It
+// is D.3's own proxy — (high - low) / close, normalised by its own 20-bar SMA —
+// so it measures CANDLE RANGE, not a real bid/ask spread, and it cannot see a
+// spread at all on instruments that quote no spread. maxSpreadPct is expressed
+// in PERCENT as in D.3 and is compared against the same normalised ratio, so
+// the threshold's own meaning depends on that normalisation.
+
+spreadFilterEnabled = input.bool(false,  "Enable Spread Filter", group="Spread Filter")
+maxSpreadPct        = input.float(0.02, "Max Spread (%)", minval=0.005, maxval=0.5, step=0.005, group="Spread Filter")
+
+float candleRange    = (high - low) / close
+float avgRange       = ta.sma(candleRange, 20)
+float spreadEstimate = candleRange / avgRange
+
+// D.3's expression is the comparison on the right. The `not na(avgRange)` guard
+// is added and is LOAD-BEARING: ta.sma is na for the first 19 bars, so D.3's
+// bare `spreadEstimate < ...` is na there, and `false or na` is na — which in an
+// `if` is falsy, so a DISABLED spread filter would still suppress entries for
+// the first 19 bars of the chart. Relying on Pine's `or` to short-circuit would
+// be relying on a behaviour the v5 documentation does not state (only the
+// ternary operator is documented as lazily evaluated), so the warm-up case is
+// excluded explicitly instead. The disabled case is now an unambiguous true.
+bool spreadOK = not spreadFilterEnabled or
+               (not na(avgRange) and spreadEstimate < (maxSpreadPct / 0.01))
+
+// ─── Entry Model: D.1 Binary Confluence (spec D.1) ──────────────────────────
+//
+// QUARANTINED. See deviation (h): this logic exists nowhere under src/modules/
+// and is transcribed from docs/technical-spec.md:1849-1854. It is reachable
+// only when "Entry Model" is "Binary", which is NOT the default.
+//
+// The strict expressions are D.1 verbatim. `sessionOK` and `marketStructure` are
+// read from the assembled modules rather than recomputed, so the binary path
+// cannot drift from the shipped session gate or the shipped structure state.
+//
+// The cooldown below is this model's OWN stamp, not the module's. The shipped
+// Signal Engine stamps `lastSignalBar` from the WEIGHTED fired flags, which in
+// binary mode is a different decision; sharing the stamp would let one model's
+// cooldown suppress the other's bars, which is exactly the distortion the
+// baseline harness exists to avoid. See backtest/modules/binary.mjs, "PER-MODEL
+// STATE".
+
+bool longSignalStrict  = nearLiquidityLong  and sessionOK and
+                         (breakUp or nearImbalanceLong or inImbalanceLong)
+
+bool shortSignalStrict = nearLiquidityShort and sessionOK and
+                         (breakDown or nearImbalanceShort or inImbalanceShort)
+
+// Directional exclusivity, same shape as signal-engine.pine: a sandwiched setup
+// is one ambiguous opportunity, structure breaks the tie, and a tie with no
+// established structure is dropped rather than resolved arbitrarily.
+bool longBinarySignal  = longSignalStrict  and not (shortSignalStrict and marketStructure != 1)
+bool shortBinarySignal = shortSignalStrict and not (longSignalStrict  and marketStructure != -1)
+
+var int lfBinaryLastBar = na
+
+// The na guard is required, not defensive: bar_index - na is na, and na < n is
+// na, so without it this would be na on every bar before the first signal.
+bool lfBinaryInCooldown = not na(lfBinaryLastBar) and (bar_index - lfBinaryLastBar) < signalCooldownBars
+
+bool longBinaryFired  = longBinarySignal  and not lfBinaryInCooldown
+bool shortBinaryFired = shortBinarySignal and not lfBinaryInCooldown
+
+// One stamp for both directions, as the shipped engine does.
+if longBinaryFired or shortBinaryFired
+    lfBinaryLastBar := bar_index
+
+// ─── Entry Rules ────────────────────────────────────────────────────────────
+//
+// D.4's shape, with the two gates D.4 omits made explicit.
+//
+// Weighted mode reads longSignalFired / shortSignalFired — the SHIPPED exports,
+// cooldown already applied, directional exclusivity already resolved. That is
+// exactly what the indicator prints on the chart, which is the point: this file
+// trades the signals the shipped indicator shows.
+
+bool longEntryRaw  = entryModel == "Weighted" ? longSignalFired  : longBinaryFired
+bool shortEntryRaw = entryModel == "Weighted" ? shortSignalFired : shortBinaryFired
+
+bool flatOK = not onlyWhenFlat or strategy.position_size == 0
+
+if longEntryRaw and spreadOK and flatOK
+    strategy.entry("LONG", strategy.long, comment="LF Long")
+
+if shortEntryRaw and spreadOK and flatOK
+    strategy.entry("SHORT", strategy.short, comment="LF Short")
+
+// ─── Exit Rules ─────────────────────────────────────────────────────────────
+//
+// Target 1.5% / stop 0.8% of the entry price, mirrored around it for the short:
+// a short wins when price FALLS 1.5% and stops when price RISES 0.8%.
+//
+// See deviation (e): these are passed as limit=/stop= rather than profit=/loss=
+// because D.4's profit=/loss= are ticks, not percent. The arithmetic below is
+// label.mjs's, on the same 1.5 / 0.8 constants.
+//
+// strategy.position_avg_price is na while flat, which makes every level na and
+// places no order; the explicit position_size test states that intent rather
+// than relying on na propagation.
+
+bool inPosition     = strategy.position_size != 0
+float avgEntryPx    = strategy.position_avg_price
+float longTargetPx  = inPosition ? avgEntryPx * (1 + targetPct / 100) : na
+float longStopPx    = inPosition ? avgEntryPx * (1 - stopPct / 100)   : na
+float shortTargetPx = inPosition ? avgEntryPx * (1 - targetPct / 100) : na
+float shortStopPx   = inPosition ? avgEntryPx * (1 + stopPct / 100)   : na
+
+if inPosition
+    strategy.exit("Exit Long",  "LONG",  limit = longTargetPx,  stop = longStopPx)
+    strategy.exit("Exit Short", "SHORT", limit = shortTargetPx, stop = shortStopPx)
+
+// ─── Active Configuration (chart) ───────────────────────────────────────────
+//
+// Pine v5 strategy titles are const, so the runtime mode cannot appear in the
+// script's name. It is printed here instead. See the header section "WHERE THE
+// ACTIVE CONFIGURATION IS SHOWN".
+
+var table modeTable = table.new(position.top_right, 2, 6, bgcolor = color.new(color.black, 20), frame_color = color.gray)
+
+if barstate.islast
+    table.cell(modeTable, 0, 0, "LiquidityFlowAuse", text_color = color.white, text_size = size.small)
+    table.cell(modeTable, 1, 0, "STRATEGY",          text_color = color.lime,  text_size = size.small)
+    table.cell(modeTable, 0, 1, "Entry model",       text_color = color.silver, text_size = size.small)
+    table.cell(modeTable, 1, 1, entryModel,           text_color = color.aqua,  text_size = size.small)
+    table.cell(modeTable, 0, 2, "Only when flat",    text_color = color.silver, text_size = size.small)
+    table.cell(modeTable, 1, 2, onlyWhenFlat ? "ON" : "OFF (pyramid)", text_color = onlyWhenFlat ? color.aqua : color.orange, text_size = size.small)
+    table.cell(modeTable, 0, 3, "Spread filter",     text_color = color.silver, text_size = size.small)
+    table.cell(modeTable, 1, 3, spreadFilterEnabled ? "ON" : "OFF", text_color = spreadFilterEnabled ? color.orange : color.aqua, text_size = size.small)
+    table.cell(modeTable, 0, 4, "Target / stop",     text_color = color.silver, text_size = size.small)
+    table.cell(modeTable, 1, 4, str.tostring(targetPct, "#.##") + "% / " + str.tostring(stopPct, "#.##") + "%", text_color = color.aqua, text_size = size.small)
+    table.cell(modeTable, 0, 5, "Costs",             text_color = color.silver, text_size = size.small)
+    table.cell(modeTable, 1, 5, "0.10% RT + 2 ticks", text_color = color.orange, text_size = size.small)
