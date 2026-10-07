@@ -276,3 +276,126 @@ Five times during this work a task brief asserted something the shipped source c
 | 4h | 11,000 | 1,833.17 days | 0 | 0 | 0 |
 
 All from Bitstamp's public endpoint, no credentials. The 5m dataset was fetched for the gate; 1h and 4h were added after the tier diagnosis showed 5m could not answer the question.
+
+---
+
+## 11. The equity curve — position accounting, and the answer to the original question
+
+**Appended 2026-10-07.** Everything above is a descriptive ratio over overlapping forward windows. Section 6 said so in terms: *"It does not simulate a portfolio. Labels are overlapping forward windows — no cash curve, no sizing, no compounding, no interaction between signals."*
+
+This section closes that gap. `node backtest/run.mjs equity --timeframe 1h` keeps a book — cash, one open position at a time, sizing, compounding, a curve — over the same 5-year 1h dataset, using `baseline.mjs`'s signal sink and `modules/label.mjs`'s exit labels unchanged. It is the first output in `backtest/` where **"N trades" is a legitimate count**: only-enter-when-flat means the trades on this curve do not overlap.
+
+It answers the question section 5.1 could only approach. **The answer is that neither model makes money.**
+
+### 11.1 The run
+
+Dataset `backtest/data/btcusd-1h.json` — 44,000 bars, `2021-09-24T14:00:00.000Z` .. `2026-10-01T21:00:00.000Z`, 1833.2917 days, **0 gaps, 0 missing bars, 0 off-grid**. Exchange Bitstamp, BTC/USD (appendix "Datasets", row 1h).
+
+Account: 10,000 opening equity, sizing **10% of current equity (compounding)** per D.4's `default_qty_value=10`, commission **0.10% round trip charged exactly once per completed trade** from `D4_ROUND_TRIP_COMMISSION_PCT`, **slippage 0 — declared zero and NOT modelled** (11.6). Signals: weighted 307 / binary 1,701. The command prints **14 caveats, `[C0]`..`[C13]`**, which are the authority on what the numbers do and do not support.
+
+### 11.2 The result, and the sign convention it requires
+
+```
+  model horizon            final eq    return      gross     comm        net   skipped   unobs
+  weighted  8,760 bars         9,593.16    -4.07%    -181.86   224.97    -406.84         3      74
+  binary    8,760 bars         8,816.13   -11.84%     -95.65 1,088.22  -1,183.87       221     316
+  weighted    288 bars         9,469.83    -5.30%    -240.32   289.85    -530.17         6       3
+  binary      288 bars         8,515.88   -14.84%    -174.75 1,309.37  -1,484.12       272      12
+```
+
+**`gross` is negative. `comm` is a cost magnitude shown positive. `net = gross − comm`.** The gross is not a gain in any row, and commission is a burden being subtracted from an already-negative gross — not the cause of the loss.
+
+```
+  model horizon       trades      hit       PF  exp/trade    maxDD       CAGR   long  short
+  weighted  8,760 bars    230   31.30%     0.71     -0.18%   -5.25%     -1.03%    123    107
+  binary    8,760 bars  1,164   34.45%     0.82     -0.11%  -13.36%     -3.09%    621    543
+
+  shipped D.4 pair: target 1.5% / stop 0.8%, ratio 1.875, break-even hit rate 34.78%
+  weighted  8,760 bars    hit 31.30% vs break-even 34.78% (-3.48 pp) ... ratio REQUIRED 2.1944
+  binary    8,760 bars    hit 34.45% vs break-even 34.78% (-0.33 pp) ... ratio REQUIRED 1.9027
+```
+
+### 11.3 The arithmetic was verified by hand, independently of the simulator
+
+A simulator that computes itself correctly proves nothing about whether it computed the *right* thing. So one member of the accounting triple was recomputed from the hit rate and the exit pair alone, with no reference to the simulator's internals:
+
+- **Commission.** `224.97 / 230 = 0.978` USD per trade. A position is ≈ 10% of 10,000 ≈ 1,000 USD, and 0.10% round trip on 1,000 USD is 1.00 USD. Consistent.
+- **Gross.** `0.3130 × 1.5 = 0.4695`; `0.6870 × 0.8 = 0.5496`; difference **−0.0801% per trade**; × ~1,000 USD × 230 trades = **−184 USD**. Reported: **−181.86**.
+
+**Agreement.** The residual is compounding and the three skipped signals, both of which a flat-rate estimate ignores by construction. The simulator's own per-resolved-trade gross expectancy for that row is **−0.08%**, which is the same hand calculation stated in the output.
+
+This is the reason the curve can be trusted, and it is also how the error in the process appendix below was caught.
+
+### 11.4 What the curve establishes
+
+1. **Neither entry model makes money.** Weighted −4.07% over 1,458 traded days; binary −11.84%.
+
+2. **Neither model has an edge even before costs.** Gross is negative for both, on both horizons. Commission is an additional burden on top of a loss, **not the cause of it.** This is a sharper statement than §5.2's "negative after D.4's own declared commission", and it points the same way.
+
+3. **Binary is the better trade and the worse system.** Its hit rate is higher (34.45% vs 31.30%) and its expectancy per trade is better (−0.11% vs −0.18%), and it still loses roughly three times more in total — because it trades roughly five times as often. Binary's 34.45% is **0.33 pp below** the 34.78% break-even; at 1,164 trades, 0.33 pp is inside its own sampling noise. **Binary is therefore not called broken, and not called viable.** It is called *not distinguished from break-even*, which is the only thing this sample supports.
+
+4. **The long/short asymmetry observed on TradingView does not reproduce. This is a null result, and the earlier claim is withdrawn.** Locally: **123 long / 107 short** (weighted) and **621 / 543** (binary) — near 50/50 — against a reported 2× long penalty across the 247 trades of the two capped TradingView runs. Two feeds, 1,394 local trades. The observation may well be real on that window and that feed; **it is not a property of the signals, and nothing should be tuned toward it.**
+
+5. **Retuning target/stop is closed.** Weighted's 31.30% hit rate requires a ratio of **2.1944** and the shipped pair gives 1.875. Binary's 34.45% requires **1.9027** against the same 1.875 — a gap of **0.0277**, which is inside its own sampling noise and therefore **not distinguishable from adequate**. The binding constraint is the **hit rate**, and no exit rule repairs a hit rate.
+
+6. **The question this document was opened to answer is answered: the weighted model does not beat the binary model.** They are statistically indistinguishable — weighted on hit rate, and indistinguishable on the ratio.
+
+### 11.5 Why these gross-expectancy figures differ from §5.2's, and why that is not a contradiction
+
+§5.2 reports gross expectancy of −0.09% (weighted) and **+0.09%** (binary) per resolved trade. This run reports **−0.08%** (weighted) and **−0.01%** (binary). These are **different estimators over different samples** and are not two answers to one question:
+
+- §5.2 is the **independent** sample — at most one signal per model per side per non-overlapping 288-bar window, 130 and 152 resolved.
+- This run is the **full** fired-signal set with the only-enter-when-flat rule applied, 230 and 1,164 completed trades.
+
+They agree in sign for weighted and disagree in sign for binary by 0.10 pp. Given that §4 established that binary's 1h signals are effectively **one cluster**, the independent sample (§5.2) is the one better supported, and this run's binary figure should be read as a description of a particular trading path rather than an estimate of the underlying rate. Both are reported; neither is folded into the other.
+
+### 11.6 What the curve does not show
+
+Carried forward rather than restated — the command's own `[C0]`..`[C13]` remain authoritative. The ones that bear on any use of these numbers:
+
+- **Slippage is 0 and is not modelled.** D.4 declares `slippage=2` in **ticks**, and Bitstamp's BTC/USD tick size is recorded in **no meta file** in this repository. No tick size was invented to close the gap. **Every figure here is an upper bound on realised performance.** That D.4's value is tick-dependent rather than price-dependent is exactly why it cannot be assumed small. The unexplained observation noted in §5.2 — that the TradingView run's per-trade figures were exactly target − 0.10%, implying slippage contributed nothing measurable there — is still unresolved by anything in this repository.
+- **The wiring is untested by construction.** The suite never reads `backtest/data/`, so it cannot catch a bar-shape mismatch between the on-disk dataset and what the simulator consumes. A live-run bug of exactly that kind occurred in this project and was found only on the first real run.
+- **`--timeframe` defaults to 5m harness-wide, so a bare `equity` run executes on 5m.** `--timeframe 1h` is required. Changing that default is out of scope. **Nothing here says anything about 5m**, where §3 established the indicator effectively does not function at the shipped threshold.
+- **One dataset, one exchange, one timeframe preference (1h).** Fills are taken **at the signal close**, which is optimistic against a real book.
+- **`insufficient_data` is counted, never silently dropped** (`unobs`; 74 and 316 at the primary horizon). `label.mjs` checks availability *before* scanning, so a touch inside a truncated window is `insufficient_data` and never a win.
+- **`skipped` is counted, never silently dropped** (3 and 221 at the primary horizon). A silently discarded signal is indistinguishable from one that never fired.
+- **Max drawdown is a lower bound** (`[C9]`): the curve moves only at an exit, so it never shows the real path between two closes.
+- **No interval is attached to any hit rate here**, including these — position accounting makes the trades non-overlapping, but it does not make them independent draws.
+
+### 11.7 Reproducing this
+
+```bash
+node backtest/run.mjs equity --timeframe 1h    # the curve; prints 14 caveats
+node backtest/run.mjs validate                  # fidelity gate, 5m only
+node backtest/smoke.mjs                         # TOTAL 1985, failed 0
+node scripts/build.mjs                          # production SHA unchanged
+```
+
+`node backtest/gate.mjs` **is not the gate entry point and does nothing** — it exports `runGate()` with no top-level execution, so it prints nothing and exits 0. This is pre-existing, not introduced here. The gate runs on `node backtest/run.mjs validate`.
+
+## Appendix — brief-versus-source disagreements, equity simulator
+
+This project's standing rule is that where a brief disagrees with the shipped source, **the source wins and the disagreement is recorded rather than executed.** It has now fired **eight times**; the three below are from the equity simulator, on top of the five in the appendix above.
+
+| # | Claim in the brief | What the source says |
+|---|---|---|
+| 6 | `D4_ROUND_TRIP_COMMISSION_PCT` is exported and can be imported | `ratio.mjs:192` is `const D4_ROUND_TRIP_COMMISSION_PCT = 0.10;` — no `export` on that line. The name was added to `ratio.mjs`'s **existing** export block (`:2418`) rather than retyping `0.10` |
+| 7 | Add `equity` to `EXTRA_SUBCOMMANDS` | `smoke.mjs:3439` asserts `EXTRA_SUBCOMMANDS = ["ratio"]` **verbatim**; appending breaks it. `equity` reaches `DISPATCHABLE` through a **third** list, `LATER_SUBCOMMANDS = ["equity"]` (`run.mjs:779`), both original literals untouched, and a typo still refuses to dispatch |
+| 8 | `node backtest/gate.mjs` is the fidelity gate | `gate.mjs` exports `runGate()` with **no top-level execution** — prints nothing, exits 0. Pre-existing, proved by stashing all work and re-running. The real entry point is `node backtest/run.mjs validate` |
+
+## Appendix — process record: a misread sign, caught by recomputation
+
+**Recorded because this project keeps its own mistakes, not because the mistake was interesting.**
+
+The orchestrator told the maintainer **"the signal IS profitable before commissions"** and built a recommendation on it — reduce trade frequency to protect a gross edge.
+
+**That was a misread of the sign.** `224.97` is the **commission magnitude** and `−181.86` is the **gross**, in the **same table row**. Commission was being added to a positive-looking number instead of subtracted from a negative one.
+
+It was caught by §11.3's hand recalculation — recomputing the gross from the hit rate and the exit pair, **−184 against a reported −181.86** — which contradicted the recommendation's premise. The recommendation was **withdrawn**.
+
+**The rule this produced, recorded so it survives the author:** any reported gross/net/commission triple must have **one member recomputed from the hit rate and the exit pair before it is interpreted.** Two adjacent numbers in a table are not evidence that they were read in the right direction.
+
+Two further process items, declared rather than hidden:
+
+- **TDD deviation.** Cycles 3 and 4 produced no failing test. The loss branch, the short-side sign, the flat-position rule, compounding and `insufficient_data` handling were written in cycle 1, as part of the loop the win fixture needed. They were **not** inverted retroactively to manufacture a red-then-green record. Cycles 5–8 were clean.
+- **Wrong test expectations, not wrong code.** A profit-factor fixture sized trade 2 off the opening balance rather than the current one, and a compounding fixture's signals overlapped the flat window. Both were corrected **in the expectation**, with the correct arithmetic documented beside them — not by bending the code to match a wrong expectation.
