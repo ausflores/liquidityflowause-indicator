@@ -5039,6 +5039,679 @@ sec("route-a-strategy");
 
 // ─── Report ─────────────────────────────────────────────────────────────────
 
+// -- 16. equity-curve: position accounting (equity simulator T3-T5) -------------
+
+sec("equity-curve");
+{
+  // --- Why the import is DYNAMIC ------------------------------------------------
+  //
+  // Every other section here uses a static top-level import. This one does not,
+  // deliberately: equity.mjs is a NEW module, and a static import of a missing
+  // file aborts the whole ES module before a single one of the ~1,900 existing
+  // assertions runs. Loading it at the point of use turns "the new module is
+  // broken or absent" into a FAILED CHECK in this section, so a defect in the
+  // slice under construction cannot hide a regression in the slice before it.
+  // The cost is that a syntax error surfaces as one check instead of a stack
+  // trace; the err.message is included so it stays diagnosable.
+  let equityApi = null;
+  try {
+    equityApi = await import("./equity.mjs");
+  } catch (err) {
+    check(false, `equity.mjs must load as an ES module: ${err.message}`);
+  }
+
+  if (equityApi !== null) {
+    const { EQUITY_DEFAULTS, simulateEquity } = equityApi;
+
+    // --- Fixtures -------------------------------------------------------------
+    //
+    // A synthetic DATASET bar: only `t` and `c` are read by the pure core (the
+    // core needs `t` to timestamp the curve and `c` only to mark a timeout to
+    // market). Prices are round numbers so every expected figure below is
+    // hand-computable and stated in the label.
+    const T0 = 1767225600000; // 2026-01-01T00:00:00.000Z
+    const eqBars = (n, close = 100, stepMs = 3600000) =>
+      Array.from({ length: n }, (_, i) => ({ t: T0 + i * stepMs, c: close }));
+
+    // Every expected money figure below is computed here BY HAND from these
+    // constants rather than by calling the module under test:
+    //   notional    = equityBefore * 10%
+    //   grossPnl    = notional * signed % move from entry to exit
+    //   commission  = notional * 0.10%   (once per completed trade)
+    //   netPnl      = grossPnl - commission
+    //   equityAfter = equityBefore + netPnl
+    const P0 = 10000; // initial equity
+    const NOTIONAL0 = P0 * 0.1; // 1000
+    const COMM0 = NOTIONAL0 * 0.001; // 1
+    const WIN_GROSS = NOTIONAL0 * 0.015; // +15  (1.5% target, D.4)
+    const LOSS_GROSS = -NOTIONAL0 * 0.008; // -8   (0.8% stop, D.4)
+
+    /** Tolerance-comparing check: these are decimal ratios, not integers. */
+    const near = (actual, expected, label) =>
+      check(
+        typeof actual === "number" && Math.abs(actual - expected) < 1e-9,
+        `${label} (expected ${expected}, got ${actual})`,
+      );
+
+    // --- The declared defaults are the D.4 declaration, not house taste -------
+    check(EQUITY_DEFAULTS.initialEquity === 10000, "initial equity is declared, not implied");
+    check(EQUITY_DEFAULTS.riskFractionPct === 10, "sizing is 10% of equity (D.4 default_qty_value=10)");
+    check(EQUITY_DEFAULTS.commissionPct === 0.1, "commission is 0.10% round trip (D.4 0.05 per side)");
+    check(EQUITY_DEFAULTS.slippageTicks === 0, "slippage is declared 0, not silently omitted");
+
+    // --- Zero signals: no trade, no curve, no crash, equity UNCHANGED --------
+    {
+      const r = simulateEquity(eqBars(8), []);
+      check(r.counts.signals === 0, "zero signals -> counts.signals is 0");
+      check(r.counts.trades === 0, "zero signals -> counts.trades is 0");
+      check(r.curve.length === 0, "zero signals -> an empty curve, not a one-point curve");
+      check(r.trades.length === 0, "zero signals -> no trade rows");
+      check(r.finalEquity === P0, `zero signals -> equity unchanged (got ${r.finalEquity})`);
+      check(r.grossPnl === 0 && r.commissionPaid === 0 && r.netPnl === 0, "zero signals -> no P&L at all");
+      check(r.maxDrawdownPct === 0, "zero signals -> no drawdown");
+      check(r.annualizedReturnPct === null, "zero signals -> annualised return is null, never 0 (nothing compounded)");
+      check(r.hitRate === null, "zero signals -> hit rate is null, not 0");
+      check(r.profitFactor === null, "zero signals -> profit factor is null, not Infinity or 0");
+    }
+
+    // --- One forced target hit: exact equity, commission charged ONCE --------
+    {
+      const r = simulateEquity(eqBars(8), [
+        {
+          label: "win",
+          side: "long",
+          entryIndex: 1,
+          exitIndex: 3,
+          entryPrice: 100,
+          exitPrice: 101.5, // +1.5% = D.4 EXIT_TARGET_PCT
+          altExitPrice: null,
+          doubleTouch: false,
+        },
+      ]);
+
+      check(r.counts.signals === 1, "one signal -> counts.signals is 1");
+      check(r.counts.trades === 1, "one signal -> counts.trades is 1");
+      check(r.counts.wins === 1 && r.counts.losses === 0, "one signal -> 1 win, 0 losses");
+      check(r.counts.resolved === 1, "one signal -> 1 resolved trade (win+loss)");
+      check(r.counts.long === 1 && r.counts.short === 0, "long/short split counts the long");
+      check(r.curve.length === 1, "one trade -> one curve point");
+      check(r.curve[0].barIndex === 3, "the curve point sits on the EXIT bar, not the entry bar");
+      check(r.curve[0].t === T0 + 3 * 3600000, "the curve point is timestamped from candles[exitIndex].t");
+
+      const t = r.trades[0];
+      near(t.notional, NOTIONAL0, "trade notional is 10% of the equity in force at entry");
+      near(t.grossPnl, WIN_GROSS, "gross P&L is +1.5% of a 1,000 notional");
+      near(t.commission, COMM0, "commission is 0.10% of the notional");
+      near(t.netPnl, WIN_GROSS - COMM0, "net P&L is gross minus commission");
+      near(t.equityBefore, P0, "the trade records the equity it opened against");
+      near(t.equityAfter, P0 + WIN_GROSS - COMM0, "the trade records the equity it closed at");
+      check(t.holdBars === 2, `hold is exitIndex - entryIndex = 2 bars (got ${t.holdBars})`);
+
+      near(r.commissionPaid, COMM0, "total commission is charged EXACTLY ONCE for one trade");
+      near(r.grossPnl, WIN_GROSS, "aggregate gross P&L equals the single trade");
+      near(r.netPnl, WIN_GROSS - COMM0, "aggregate net P&L equals the single trade");
+      near(r.finalEquity, P0 + WIN_GROSS - COMM0, `final equity is 10,014 (got ${r.finalEquity})`);
+      near(r.returnPct, ((WIN_GROSS - COMM0) / P0) * 100, "return is net P&L over initial equity");
+
+      // Hit rate comes from the SHARED break-even algebra, so the equity report
+      // and the ratio report cannot disagree about what a win is worth.
+      near(r.hitRate, 1, "hit rate is win / (win + loss)");
+      check(r.profitFactor === null, "profit factor is null with no losing trade to divide by");
+      check(r.longestWinStreak === 1 && r.longestLossStreak === 0, "the run of wins is reported");
+    }
+
+    // --- One forced stop hit: the loss branch, commission still paid ONCE ----
+    {
+      const r = simulateEquity(eqBars(8), [
+        {
+          label: "loss",
+          side: "long",
+          entryIndex: 1,
+          exitIndex: 4,
+          entryPrice: 100,
+          exitPrice: 99.2, // -0.8% = D.4 EXIT_STOP_PCT
+          altExitPrice: null,
+          doubleTouch: false,
+        },
+      ]);
+
+      const t = r.trades[0];
+      near(t.grossPnl, LOSS_GROSS, "gross P&L is -0.8% of a 1,000 notional");
+      near(t.commission, COMM0, "commission is charged on a LOSING trade too");
+      near(t.netPnl, LOSS_GROSS - COMM0, "net P&L is the loss PLUS the commission");
+      near(r.finalEquity, P0 + LOSS_GROSS - COMM0, `final equity is 9,991 (got ${r.finalEquity})`);
+
+      // The sign, stated directly: a losing trade must DECREASE equity. An
+      // implementation that added the loss, or that skipped commission on
+      // losers, would still balance to some number - this is the check that
+      // catches it.
+      check(r.finalEquity < P0, `a losing trade DECREASES equity (${P0} -> ${r.finalEquity})`);
+      check(t.netPnl < 0, "the losing trade's own net P&L is negative");
+      check(r.counts.losses === 1 && r.counts.wins === 0, "one signal -> 1 loss, 0 wins");
+      check(r.returnPct < 0, "the run's return is negative");
+    }
+
+    // --- A SHORT stop is a LOSS and a SHORT target is a WIN -----------------
+    //
+    // The sign convention is the whole content of a short: it profits when
+    // price FALLS. Asserted on both sides because an implementation that got
+    // only one of them right would still produce a plausible-looking curve.
+    {
+      const shortStop = simulateEquity(eqBars(8), [
+        {
+          label: "loss", side: "short", entryIndex: 1, exitIndex: 3,
+          entryPrice: 100, exitPrice: 100.8, altExitPrice: null, doubleTouch: false,
+        },
+      ]);
+      near(shortStop.finalEquity, P0 + LOSS_GROSS - COMM0, "short stopped out at +0.8% is a LOSS");
+
+      const shortTarget = simulateEquity(eqBars(8), [
+        {
+          label: "win", side: "short", entryIndex: 1, exitIndex: 3,
+          entryPrice: 100, exitPrice: 98.5, altExitPrice: null, doubleTouch: false,
+        },
+      ]);
+      near(shortTarget.finalEquity, P0 + WIN_GROSS - COMM0, "short targeting -1.5% is a WIN");
+      check(shortTarget.counts.short === 1 && shortTarget.counts.long === 0, "the short/ long split is symmetric");
+    }
+
+    // --- Expectancy comes from the SHARED break-even algebra ----------------
+    //
+    // One win then one loss, flat in between (win closes on bar 2, the loss
+    // enters on bar 3), so both are taken:
+    //   hit rate      = 1 / 2 = 0.5
+    //   gross expect  = 0.5*1.5 - 0.5*0.8 = 0.35 pp per resolved trade
+    //   net expect    = mean((14/1000)*100, (-9/1000)*100) = (1.4 - 0.9)/2 = 0.25 pp
+    {
+      const r = simulateEquity(eqBars(8), [
+        {
+          label: "win", side: "long", entryIndex: 0, exitIndex: 2,
+          entryPrice: 100, exitPrice: 101.5, altExitPrice: null, doubleTouch: false,
+        },
+        {
+          label: "loss", side: "long", entryIndex: 3, exitIndex: 5,
+          entryPrice: 100, exitPrice: 99.2, altExitPrice: null, doubleTouch: false,
+        },
+      ]);
+      check(r.counts.trades === 2, "the second signal is taken because the book is flat by then");
+      near(r.hitRate, 0.5, "hit rate is 1 win / 2 resolved");
+      near(r.expectancyGrossPct, 0.5 * 1.5 - 0.5 * 0.8, "gross expectancy is h*T - (1-h)*S = 0.35 pp");
+      near(r.expectancyNetPctAllTrades, (1.4 + -0.9) / 2, "net expectancy per COMPLETED trade is 0.25 pp");
+      // The loss is NOT -9. The book sizes the second trade off the equity the
+      // first one produced, so its notional is 10,014 * 10% = 1,001.4 and its
+      // commission is 1.0014 - the compounding declared in decision 4 shows up
+      // in the profit factor and nowhere else. net = -8.0112 - 1.0014 = -9.0126.
+      near(r.profitFactor, 14 / 9.0126, "profit factor is net profit 14 / net loss 9.0126 (losses size on grown equity)");
+      check(r.maxDrawdownPct > 0, "a peak-to-trough drop is reported once the equity falls");
+    }
+
+    // --- ONLY-ENTER-WHEN-FLAT: skipped AND counted --------------------------
+    //
+    // Signal A opens on bar 0 and closes on bar 5. Signal B fires on bar 2,
+    // inside that window. B must be skipped, and it must be COUNTED - a
+    // silently dropped signal is indistinguishable from a signal that never
+    // fired, which is precisely the confusion this whole feature exists to
+    // remove.
+    const A_WIN = {
+      label: "win", side: "long", entryIndex: 0, exitIndex: 5,
+      entryPrice: 100, exitPrice: 101.5, altExitPrice: null, doubleTouch: false,
+    };
+    const B_LATE = {
+      label: "win", side: "long", entryIndex: 2, exitIndex: 7,
+      entryPrice: 100, exitPrice: 101.5, altExitPrice: null, doubleTouch: false,
+    };
+    {
+      const r = simulateEquity(eqBars(10), [A_WIN, B_LATE]);
+      check(r.counts.signals === 2, "both signals are counted on the way in");
+      check(r.counts.trades === 1, "the signal inside the open position is NOT taken");
+      check(r.counts.skippedFlat === 1, "the skipped signal is COUNTED, not dropped");
+      check(r.trades[0].entryIndex === 0, "the first signal is the one that was taken");
+      near(r.finalEquity, P0 + WIN_GROSS - COMM0, "only the taken trade moves equity");
+      near(r.commissionPaid, COMM0, "a skipped signal pays NO commission - it was never opened");
+    }
+
+    // --- The boundary: the book is flat again AT THE CLOSE of the exit bar ---
+    //
+    // The exit fills intrabar at the target or the stop, so by that bar's close
+    // there is nothing open. A signal on bar 5 - the exit bar itself - may
+    // therefore re-enter. `<=` instead of `<` here would silently delete every
+    // back-to-back signal in the sample, so the rule is asserted in both
+    // directions: bar 2 is skipped, bar 5 is taken.
+    {
+      const r = simulateEquity(eqBars(10), [
+        A_WIN,
+        {
+          label: "loss", side: "long", entryIndex: 5, exitIndex: 9,
+          entryPrice: 100, exitPrice: 99.2, altExitPrice: null, doubleTouch: false,
+        },
+      ]);
+      check(r.counts.skippedFlat === 0, "a signal on the exit bar itself is not skipped");
+      check(r.counts.trades === 2, "a signal on the exit bar itself re-enters");
+      // 10,014 after the win, then a loss sized on THAT: notional 1,001.4,
+      // gross -8.0112, commission 1.0014, net -9.0126 -> 10,004.9874.
+      near(r.finalEquity, P0 + WIN_GROSS - COMM0 - 9.0126, "both trades move equity, the second sized on grown equity");
+    }
+
+    // --- Fill order is the ENTRY order, whatever order they arrive in -------
+    //
+    // The core sorts a copy by entryIndex. Without that, a caller handing the
+    // list in labelling order or reversed would fill in the wrong sequence and
+    // produce a different curve for the same book.
+    {
+      const forward = simulateEquity(eqBars(10), [A_WIN, B_LATE]);
+      const reversed = simulateEquity(eqBars(10), [B_LATE, A_WIN]);
+      check(
+        reversed.counts.trades === forward.counts.trades &&
+          reversed.counts.skippedFlat === forward.counts.skippedFlat &&
+          reversed.finalEquity === forward.finalEquity,
+        "the fill order is the entry order, not the input order",
+      );
+      check(reversed.trades[0].entryIndex === 0, "the earliest entry is filled first even when handed last");
+    }
+
+    // --- Sizing is 10% of CURRENT equity, so the curve COMPOUNDS ------------
+    //
+    // Two back-to-back wins:
+    //   trade 1  notional 10,000 * 10% = 1,000     gross +15.000  comm 1.0000  -> 10,014
+    //   trade 2  notional 10,014 * 10% = 1,001.4   gross +15.021  comm 1.0014  -> 10,028.0196
+    // A 10%-of-INITIAL implementation would report 10,030.00 and would call
+    // the difference "noise". It is the difference between compounding and
+    // not compounding, so the second notional is asserted exactly.
+    {
+      const r = simulateEquity(eqBars(10), [
+        A_WIN,
+        {
+          label: "win", side: "long", entryIndex: 5, exitIndex: 9,
+          entryPrice: 100, exitPrice: 101.5, altExitPrice: null, doubleTouch: false,
+        },
+      ]);
+      near(r.trades[0].notional, 1000, "trade 1 sizes 10% of the 10,000 opening equity");
+      near(r.trades[1].notional, 1001.4, "trade 2 sizes 10% of the GROWN 10,014, not the opening balance");
+      check(r.trades[1].notional !== 1000, "the second notional is demonstrably not 10% of initial");
+      near(r.trades[1].equityBefore, P0 + WIN_GROSS - COMM0, "trade 2 opens against the closed equity");
+      near(r.trades[1].netPnl, 15.021 - 1.0014, "trade 2's net is its own scaled gross and commission");
+      near(r.finalEquity, 10028.0196, "two compounding wins land on 10,028.0196, not 10,030");
+    }
+
+    // --- insufficient_data is REPORTED, never silently discarded ------------
+    //
+    // modules/label.mjs checks availability BEFORE the scan, so the last
+    // maxHorizonBars bars cannot be labelled at all. Those outcomes carry no
+    // exit price and no exit index, and they were never taken - so they are
+    // counted, they do not move equity, and they do NOT occupy the book: a
+    // position that was never opened cannot block the next entry.
+    const UNLABELLED = {
+      label: "insufficient_data", side: "long", entryIndex: 0,
+      exitIndex: null, // never observed
+      entryPrice: 100, exitPrice: null, altExitPrice: null, doubleTouch: false,
+    };
+    {
+      const r = simulateEquity(eqBars(10), [
+        UNLABELLED,
+        {
+          label: "win", side: "long", entryIndex: 1, exitIndex: 4,
+          entryPrice: 100, exitPrice: 101.5, altExitPrice: null, doubleTouch: false,
+        },
+      ]);
+      check(r.counts.signals === 2, "both the unlabellable and the labelled signal are counted on the way in");
+      check(r.counts.insufficientData === 1, "the insufficient_data outcome is counted, not dropped");
+      check(r.counts.trades === 1, "an unobservable outcome is not a trade");
+      check(r.counts.skippedFlat === 0, "an unobservable outcome does not occupy the book");
+      check(r.trades[0].entryIndex === 1, "the following signal is still taken");
+      near(r.finalEquity, P0 + WIN_GROSS - COMM0, "the unobservable outcome moves no money");
+      near(r.commissionPaid, COMM0, "the unobservable outcome is charged no commission");
+    }
+
+    // --- A run of nothing but insufficient_data is a clean empty run --------
+    {
+      const r = simulateEquity(eqBars(4), [UNLABELLED]);
+      check(r.counts.trades === 0, "no observable signal -> no trade");
+      check(r.counts.insufficientData === 1, "and the omission is still reported");
+      check(r.finalEquity === P0, "and equity is untouched");
+      check(r.hitRate === null && r.annualizedReturnPct === null, "and every rate is null, never a fabricated 0");
+    }
+
+    // --- A timeout is a REAL trade, marked at the horizon CLOSE -------------
+    //
+    // Bars 0..3, closes 100 except bar 3 which closes at 110. A timeout carries
+    // no target and no stop price, so it is marked to market: notional 1,000,
+    // move +10%, gross +100, commission 1 -> 10,099. Calling a timeout a
+    // discard would throw away a month of capital at risk; calling it a win or
+    // a loss would put it in the hit rate.
+    {
+      const bars = eqBars(10, 100).map((b, i) => (i === 3 ? { ...b, c: 110 } : b));
+      const r = simulateEquity(bars, [
+        {
+          label: "timeout", side: "long", entryIndex: 0, exitIndex: 3,
+          entryPrice: 100, exitPrice: null, altExitPrice: null, doubleTouch: false,
+        },
+      ]);
+      check(r.counts.timeouts === 1, "the timeout is counted as a timeout");
+      check(r.counts.resolved === 0, "a timeout is NOT a resolved win/loss");
+      check(r.hitRate === null, "so it never enters the hit rate");
+      check(r.trades.length === 1, "but it IS a completed trade with money at risk");
+      near(r.trades[0].exitPrice, 110, "it exits at candles[exitIndex].c, not at a level");
+      near(r.trades[0].netPnl, 100 - COMM0, "its P&L is the marked-to-market move");
+      near(r.finalEquity, P0 + 100 - COMM0, "and it moves the curve");
+    }
+
+    // --- doubleTouch: PESSIMISTIC by default, OPTIMISTIC reported beside it --
+    //
+    // One bar touched both levels, so intra-bar order is unknowable from OHLC.
+    // The default resolves to the STOP (the loss), which is the reading that
+    // cannot flatter the result; the optimistic reading resolves to the target
+    // and is reported as a SENSITIVITY, never chosen. altExitPrice is the other
+    // level, so the core never has to know what a target is.
+    const DOUBLE_TOUCH = {
+      label: "loss", side: "long", entryIndex: 1, exitIndex: 3,
+      entryPrice: 100,
+      exitPrice: 99.2,   // the stop: the pessimistic resolution
+      altExitPrice: 101.5, // the target: what the optimistic reading would pay
+      doubleTouch: true,
+    };
+    {
+      const pessimistic = simulateEquity(eqBars(8), [DOUBLE_TOUCH]);
+      near(pessimistic.finalEquity, P0 + LOSS_GROSS - COMM0, "doubleTouch resolves to the STOP by default");
+      check(pessimistic.counts.doubleTouch === 1, "the doubleTouch is counted whatever the resolution");
+      check(pessimistic.counts.losses === 1, "and the pessimistic reading puts it in the loss column");
+
+      const optimistic = simulateEquity(eqBars(8), [DOUBLE_TOUCH], {
+        doubleTouchResolution: "optimistic",
+      });
+      near(optimistic.finalEquity, P0 + WIN_GROSS - COMM0, "the optimistic reading pays the target instead");
+      check(optimistic.counts.doubleTouch === 1, "the count is a SENSITIVITY, not a choice: same count either way");
+      near(
+        optimistic.finalEquity - pessimistic.finalEquity,
+        WIN_GROSS - LOSS_GROSS,
+        "the whole double-touch sensitivity is one target minus one stop",
+      );
+      throws(
+        () => simulateEquity(eqBars(8), [DOUBLE_TOUCH], { doubleTouchResolution: "coin-flip" }),
+        RangeError,
+        "an unrecognised doubleTouchResolution is refused rather than defaulted",
+      );
+    }
+
+    // --- The doubleTouch invariant is asserted, not assumed ------------------
+    //
+    // modules/label.mjs sets doubleTouch only when BOTH levels were touched on
+    // the resolving bar, and in that case hitStop is true, so the label is
+    // always "loss". An outcome claiming otherwise is a wiring bug, and
+    // silently simulating it would produce a curve from an impossible trade.
+    {
+      const impossible = { ...DOUBLE_TOUCH, label: "win" };
+      throws(
+        () => simulateEquity(eqBars(8), [impossible]),
+        TypeError,
+        "a doubleTouch outcome labelled anything but loss is refused",
+      );
+      throws(
+        () => simulateEquity(eqBars(8), [A_WIN], { notAnOption: 1 }),
+        TypeError,
+        "an unknown option is refused rather than silently ignored",
+      );
+    }
+
+    // --- Max drawdown is peak-to-trough ON THE CLOSED-TRADE CURVE -----------
+    //
+    // Three trades, one win then two losses, so the peak is set at the first
+    // close and never recovered:
+    //   e1 = 10,000 + 1,000*0.015 - 1,000*0.001        = 10,014      <- the peak
+    //   n2 = e1*0.1 = 1,001.4 ; e2 = e1 + n2*(-0.008) - n2*0.001
+    //   n3 = e2*0.1           ; e3 = e2 + n3*(-0.008) - n3*0.001
+    //   drawdown = (e1 - e3) / e1
+    {
+      const r = simulateEquity(eqBars(10), [
+        {
+          label: "win", side: "long", entryIndex: 0, exitIndex: 2,
+          entryPrice: 100, exitPrice: 101.5, altExitPrice: null, doubleTouch: false,
+        },
+        {
+          label: "loss", side: "long", entryIndex: 3, exitIndex: 5,
+          entryPrice: 100, exitPrice: 99.2, altExitPrice: null, doubleTouch: false,
+        },
+        {
+          label: "loss", side: "long", entryIndex: 6, exitIndex: 8,
+          entryPrice: 100, exitPrice: 99.2, altExitPrice: null, doubleTouch: false,
+        },
+      ]);
+      const e1 = P0 + NOTIONAL0 * 0.015 - COMM0;
+      const n2 = e1 * 0.1;
+      const e2 = e1 + n2 * -0.008 - n2 * 0.001;
+      const n3 = e2 * 0.1;
+      const e3 = e2 + n3 * -0.008 - n3 * 0.001;
+      near(r.finalEquity, e3, "three trades land on the chained equity");
+      near(r.maxDrawdownAbsolute, e1 - e3, "drawdown is measured from the peak, not from the start");
+      near(r.maxDrawdownPct, ((e1 - e3) / e1) * 100, "drawdown % is the drop over the peak");
+      check(r.maxDrawdownPct > 0 && e3 < e1, "the fixture really does draw down");
+      check(r.longestLossStreak === 2 && r.longestWinStreak === 1, "the losing streak is reported");
+    }
+
+    // --- A curve that only ever RISES has no drawdown ------------------------
+    {
+      const r = simulateEquity(eqBars(10), [A_WIN]);
+      near(r.maxDrawdownPct, 0, "a run that only gains reports zero drawdown");
+      near(r.maxDrawdownAbsolute, 0, "and zero absolute drawdown");
+    }
+
+    // --- Annualised return is over the TRADED span, and states its formula ---
+    //
+    // One win entering on bar 0 and closing on bar 2 of a DAILY series, so the
+    // traded span is exactly 2 days and the formula is locked:
+    //   CAGR% = ((final / initial) ^ (365.25 / spanDays) - 1) * 100
+    // Annualising over the dataset's span instead of the traded span would
+    // flatter every idling curve in this harness, so spanDays is asserted too.
+    {
+      const DAY = 24 * 3600000;
+      const r = simulateEquity(eqBars(4, 100, DAY), [
+        {
+          label: "win", side: "long", entryIndex: 0, exitIndex: 2,
+          entryPrice: 100, exitPrice: 101.5, altExitPrice: null, doubleTouch: false,
+        },
+      ]);
+      near(r.spanDays, 2, "the traded span is first entry to last exit, 2 bars = 2 days");
+      near(
+        r.annualizedReturnPct,
+        (Math.pow(r.finalEquity / P0, 365.25 / 2) - 1) * 100,
+        "annualised return is ((final/initial)^(365.25/spanDays) - 1) * 100",
+      );
+      check(r.annualizedReturnPct > r.returnPct, "two days of gains annualise UP, not down");
+    }
+
+    // --- The metrics the report MUST print, on one fixture, all present ------
+    {
+      const r = simulateEquity(eqBars(10), [
+        A_WIN,
+        {
+          label: "loss", side: "short", entryIndex: 5, exitIndex: 9,
+          entryPrice: 100, exitPrice: 100.8, altExitPrice: null, doubleTouch: false,
+        },
+      ]);
+      for (const field of [
+        "trades", "hitRate", "profitFactor", "expectancyNetPctAllTrades",
+        "maxDrawdownPct", "annualizedReturnPct",
+      ]) {
+        check(Object.prototype.hasOwnProperty.call(r, field), `metric "${field}" is present on the result`);
+      }
+      check(r.counts.long === 1 && r.counts.short === 1, "the long/short split is reported for both models symmetrically");
+    }
+
+    // --- An exit bar past the end of the data is refused, not crashed on -----
+    //
+    // The core indexes candles[exitIndex] to timestamp the curve and to mark a
+    // timeout. An off-by-one in the wiring would otherwise surface as
+    // "Cannot read properties of undefined", which says nothing about which
+    // bar was wrong - the same reasoning label.mjs applies to its own
+    // anti-miswire invariant.
+    {
+      const err = throws(
+        () =>
+          simulateEquity(eqBars(4), [
+            {
+              label: "win", side: "long", entryIndex: 0, exitIndex: 9,
+              entryPrice: 100, exitPrice: 101.5, altExitPrice: null, doubleTouch: false,
+            },
+          ]),
+        RangeError,
+        "an exitIndex past the last candle is refused",
+      );
+      check(
+        err !== null && /exitIndex 9/.test(err.message),
+        `the refusal NAMES the offending bar (got: ${err === null ? "no throw" : err.message})`,
+      );
+    }
+
+    // --- Two holes that would produce a PLAUSIBLE WRONG NUMBER -------------
+    //
+    // Both of these are silent rather than loud, which is exactly why they are
+    // worth a test: a bad side falls through the short branch of signedMovePct
+    // and turns every stop into a win, and a null exit price propagates NaN
+    // through the whole curve. Neither throws on its own.
+    {
+      throws(
+        () =>
+          simulateEquity(eqBars(8), [
+            {
+              label: "win", side: "sideways", entryIndex: 1, exitIndex: 3,
+              entryPrice: 100, exitPrice: 101.5, altExitPrice: null, doubleTouch: false,
+            },
+          ]),
+        TypeError,
+        'a side that is neither "long" nor "short" is refused, not silently treated as short',
+      );
+      throws(
+        () =>
+          simulateEquity(eqBars(8), [
+            {
+              label: "win", side: "long", entryIndex: 1, exitIndex: 3,
+              entryPrice: 100, exitPrice: null, altExitPrice: null, doubleTouch: false,
+            },
+          ]),
+        TypeError,
+        "a resolved label with no exit price is refused rather than propagating NaN through the curve",
+      );
+      throws(
+        () =>
+          simulateEquity(eqBars(8), [
+            {
+              label: "loss", side: "long", entryIndex: 1, exitIndex: 3,
+              entryPrice: 0, exitPrice: 99.2, altExitPrice: null, doubleTouch: false,
+            },
+          ]),
+        RangeError,
+        "a non-positive entry price is refused - it would size the position by dividing by nothing",
+      );
+    }
+
+    // ─── 16b. The WIRING: reuse, the sink guard, and the CLI ───────────────
+    //
+    // Source-text assertions, the same shape the exit-ratio section uses for
+    // its own wiring. The pure core above is proved by BEHAVIOUR on synthetic
+    // bars; the wiring cannot be proved that way without reading
+    // backtest/data/, which this suite has never done and must not start.
+    {
+      const equitySrc = readFileSync(new URL("./equity.mjs", import.meta.url), "utf8");
+      const runSrcEquity = readFileSync(new URL("./run.mjs", import.meta.url), "utf8");
+
+      check(
+        /import\s*\{[^}]*runComparison[^}]*\}\s*from\s*"\.\/baseline\.mjs"/.test(equitySrc),
+        "equity.mjs takes its signals from baseline.mjs's OWN runComparison - nothing is re-derived",
+      );
+      check(
+        equitySrc.includes("labelSignalsExitRule"),
+        "equity.mjs reuses modules/label.mjs to label - the target/stop levels are never re-implemented",
+      );
+      check(
+        /if \(sink === null\)[\s\S]{0,300}throw new Error/.test(equitySrc),
+        "a sink that never fired THROWS rather than reporting a curve computed over no signals",
+      );
+      for (const helper of ["breakevenHitRate", "expectancyPercent", "requiredRatio"]) {
+        check(
+          new RegExp(`import\\s*\\{[^}]*${helper}[^}]*\\}\\s*from\\s*"\\.\\/ratio\\.mjs"`).test(equitySrc),
+          `equity.mjs imports the SHARED ${helper} rather than re-deriving it`,
+        );
+      }
+      check(
+        !equitySrc.includes('from "./modules/signal-engine.mjs"') &&
+          !equitySrc.includes('from "./modules/binary.mjs"'),
+        "equity.mjs instantiates NEITHER model - it cannot perturb the baselines it reads",
+      );
+      check(
+        equitySrc.includes("EXIT_TARGET_PCT") && equitySrc.includes("EXIT_STOP_PCT"),
+        "the D.4 levels are imported from label.mjs, never typed in again",
+      );
+
+      // Declared horizons, on the record in the source.
+      check(
+        equitySrc.includes("primaryHorizonBars: 8760") && equitySrc.includes("companionHorizonBars: 288"),
+        "both horizons are DECLARED in the source: 8,760 primary (~1y on 1h), 288 companion",
+      );
+
+      // Output idiom and the caveats array, which is a real house convention
+      // (baseline.mjs:896, ratio.mjs:1821) rather than decoration.
+      check(
+        equitySrc.includes("const out = (s = \"\") => console.log(`equity: ${s}`);"),
+        "the output prefix is the house `equity: ` idiom",
+      );
+      check(
+        equitySrc.includes("[C${i}]"),
+        "caveats are printed as [C0], [C1], ... like every other report in the harness",
+      );
+      for (const topic of [
+        "insufficient_data", // decision 7
+        "skippedFlat", // decision 3
+        "doubleTouch", // decision 2
+        "slippage", // decision 6
+        "riskFractionPct", // decision 4
+        "commissionPct", // decision 5
+      ]) {
+        check(equitySrc.includes(topic), `the report carries the declared decision surface "${topic}"`);
+      }
+
+      // --json, following the runBaseline entry-point shape.
+      check(
+        /export async function runEquity\(options = \{\}\)/.test(equitySrc),
+        "runEquity is exported in the runBaseline / runRatio shape",
+      );
+      check(
+        equitySrc.includes("schemaVersion") && equitySrc.includes("ok: true"),
+        "the --json payload carries schemaVersion and ok",
+      );
+
+      // CLI registration. NOT in the six-name SUBCOMMANDS literal - that is
+      // asserted verbatim twice above and widening it would edit an assertion
+      // to make a new test pass.
+      check(
+        runSrcEquity.includes('SUBCOMMANDS = ["fetch", "validate", "baseline", "diagnose", "compare", "search"]'),
+        "the six-name SUBCOMMANDS literal is still untouched by the equity subcommand",
+      );
+      check(
+        runSrcEquity.includes('EXTRA_SUBCOMMANDS = ["ratio"]'),
+        "and EXTRA_SUBCOMMANDS is untouched too - smoke.mjs asserts that literal verbatim as well",
+      );
+      check(
+        /const LATER_SUBCOMMANDS = \["equity"\]/.test(runSrcEquity) &&
+          /const DISPATCHABLE = \[\.\.\.SUBCOMMANDS, \.\.\.EXTRA_SUBCOMMANDS, \.\.\.LATER_SUBCOMMANDS\]/.test(
+            runSrcEquity,
+          ),
+        "equity is registered through DISPATCHABLE, so a typo in it still refuses to dispatch",
+      );
+      check(
+        runSrcEquity.includes('subcommand === "equity"'),
+        "equity is a dispatched subcommand",
+      );
+      check(
+        /import\s*\{[^}]*runEquity[^}]*\}\s*from\s*"\.\/equity\.mjs"/.test(runSrcEquity),
+        "run.mjs imports the equity runner",
+      );
+      check(
+        /native grid for fetch\/baseline\/diagnose\/compare\/ratio\/equity/.test(runSrcEquity),
+        "the --timeframe help text names equity, which is a data-reading subcommand",
+      );
+    }
+  }
+}
+
 const ORDER = [
   "session-markers",
   "liquidity-zones",
@@ -5054,6 +5727,7 @@ const ORDER = [
   "exit-ratio",
   "horizon-sweep",
   "route-a-strategy",
+  "equity-curve",
 ];
 console.log("section            checks");
 for (const name of ORDER) {
