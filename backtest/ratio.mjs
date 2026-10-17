@@ -2415,7 +2415,7 @@ function printReport(r) {
   r.caveats.forEach((cv, i) => out(`  [C${i}] ${cv}`));
 }
 
-export { shortfallText, horizonHoldHours };
+export { shortfallText, horizonHoldHours, D4_ROUND_TRIP_COMMISSION_PCT };
 
 function yesNo(v) {
   if (v === null || v === undefined) return "n/a";

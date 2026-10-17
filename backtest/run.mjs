@@ -27,6 +27,8 @@
 //                                    --seed <n>, --bootstrap <n>, --json
 //                                    --horizon <bars> re-runs the analysis at a
 //                                    different hold (default 288 = shipped)
+//   node backtest/run.mjs equity     local equity curve with real position
+//                                    accounting (backtest/equity.mjs), --json
 //   node backtest/run.mjs search     T12 weight search (not implemented yet)
 //
 // Every data-reading subcommand takes `--timeframe <5m|1h|4h>` and defaults to
@@ -45,6 +47,7 @@ import { runGate } from "./gate.mjs";
 import { runBaseline } from "./baseline.mjs";
 import { parseCompareFlags, runCompare } from "./compare.mjs";
 import { parseRatioFlags, parseRatioHorizonFlag, runRatio } from "./ratio.mjs";
+import { runEquity } from "./equity.mjs";
 import { runTierDiagnostic } from "./tier-diagnostic.mjs";
 import {
   DEFAULT_TIMEFRAME,
@@ -674,9 +677,24 @@ function usage() {
   );
   console.log("             exactly and adds no power or horizon section.");
   console.log("  search     weight search with holdout evaluation (T12)");
+  console.log(
+    "  equity     local equity curve (backtest/equity.mjs): real position",
+  );
+  console.log(
+    "             accounting, 10%-of-equity compounding, 0.10% commission,",
+  );
+  console.log(
+    "             only-enter-when-flat, --json for JSON output. Both entry",
+  );
+  console.log(
+    "             models at BOTH declared horizons (8,760 bars primary, 288",
+  );
+  console.log(
+    "             companion) - the horizon is a declared choice, not a flag.",
+  );
   console.log("");
   console.log(
-    `  --timeframe   native grid for fetch/baseline/diagnose/compare/ratio ` +
+    `  --timeframe   native grid for fetch/baseline/diagnose/compare/ratio/equity ` +
       `(${TIMEFRAME_IDS.join(", ")}); default "${DEFAULT_TIMEFRAME}".`,
   );
   console.log(
@@ -751,7 +769,15 @@ const SUBCOMMANDS = ["fetch", "validate", "baseline", "diagnose", "compare", "se
 // harness must never make. `ratio` is registered through DISPATCHABLE below, so
 // a typo in it still refuses to dispatch.
 const EXTRA_SUBCOMMANDS = ["ratio"];
-const DISPATCHABLE = [...SUBCOMMANDS, ...EXTRA_SUBCOMMANDS];
+
+// Subcommands added after `ratio`, in their own list for the SAME reason:
+// smoke.mjs asserts `EXTRA_SUBCOMMANDS = ["ratio"]` verbatim (smoke.mjs:3439),
+// exactly as it asserts the six-name SUBCOMMANDS literal twice. Appending to
+// that list would edit an existing assertion to make a new test pass, which is
+// the one move this harness must never make. `equity` therefore reaches
+// DISPATCHABLE by a third route, so a typo in it still refuses to dispatch.
+const LATER_SUBCOMMANDS = ["equity"];
+const DISPATCHABLE = [...SUBCOMMANDS, ...EXTRA_SUBCOMMANDS, ...LATER_SUBCOMMANDS];
 const subcommand = process.argv[2];
 
 // The flag is parsed BEFORE dispatch so an invalid --timeframe fails loudly on
@@ -823,6 +849,15 @@ if (subcommand === undefined || !DISPATCHABLE.includes(subcommand)) {
         seed: ratioFlags.seed,
         bootstrap: ratioFlags.bootstrap,
         horizon: parseRatioHorizonFlag(process.argv),
+      });
+    } else if (subcommand === "equity") {
+      // No flags of its own beyond --json and --timeframe: the horizons are
+      // DECLARED inside equity.mjs and both are run every time, because a
+      // horizon is a modelling choice and letting a flag silently change it
+      // would make two runs with the same name incomparable.
+      process.exitCode = await runEquity({
+        json: process.argv.includes("--json"),
+        tf,
       });
     } else if (subcommand === "diagnose") {
       process.exitCode = await runTierDiagnostic({
