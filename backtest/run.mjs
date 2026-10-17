@@ -29,6 +29,11 @@
 //                                    different hold (default 288 = shipped)
 //   node backtest/run.mjs equity     local equity curve with real position
 //                                    accounting (backtest/equity.mjs), --json
+//   node backtest/run.mjs band       proximity-band counterfactual sweep
+//                                    (backtest/band.mjs), --json too
+//   node backtest/run.mjs concept    the maintainer's OWN STATED concept
+//                                    counted as a per-variant matrix
+//                                    (backtest/concept.mjs), --json too
 //   node backtest/run.mjs search     T12 weight search (not implemented yet)
 //
 // Every data-reading subcommand takes `--timeframe <5m|1h|4h>` and defaults to
@@ -49,6 +54,8 @@ import { parseCompareFlags, runCompare } from "./compare.mjs";
 import { parseRatioFlags, parseRatioHorizonFlag, runRatio } from "./ratio.mjs";
 import { runEquity } from "./equity.mjs";
 import { runTierDiagnostic } from "./tier-diagnostic.mjs";
+import { runBand } from "./band.mjs";
+import { runConcept } from "./concept.mjs";
 import {
   DEFAULT_TIMEFRAME,
   TIMEFRAME_IDS,
@@ -676,6 +683,25 @@ function usage() {
     "             have resolved later. Omitting the flag reproduces the 288-bar report",
   );
   console.log("             exactly and adds no power or horizon section.");
+  console.log(
+    "  band       COUNTERFACTUAL proximity-band sweep — every row but A is a",
+  );
+  console.log(
+    "             what-if, nothing under src/ changes and nothing is recommended",
+  );
+  console.log(
+    "  concept    the maintainer's OWN stated concept — liquidity + hours +",
+  );
+  console.log(
+    "             (imbalance AND structure change) — counted as a matrix over",
+  );
+  console.log(
+    "             session strength, structure arm, imbalance arm, AND-vs-OR and",
+  );
+  console.log(
+    "             the score gate. Every row but the shipped one is a",
+  );
+  console.log("             counterfactual; nothing is recommended.",  );
   console.log("  search     weight search with holdout evaluation (T12)");
   console.log(
     "  equity     local equity curve (backtest/equity.mjs): real position",
@@ -694,7 +720,7 @@ function usage() {
   );
   console.log("");
   console.log(
-    `  --timeframe   native grid for fetch/baseline/diagnose/compare/ratio/equity ` +
+    `  --timeframe   native grid for fetch/baseline/diagnose/compare/ratio/equity/band/concept ` +
       `(${TIMEFRAME_IDS.join(", ")}); default "${DEFAULT_TIMEFRAME}".`,
   );
   console.log(
@@ -768,16 +794,29 @@ const SUBCOMMANDS = ["fetch", "validate", "baseline", "diagnose", "compare", "se
 // would edit an assertion to make a new test pass, which is the one move this
 // harness must never make. `ratio` is registered through DISPATCHABLE below, so
 // a typo in it still refuses to dispatch.
+// `band` was added after `ratio` and is registered through its OWN list for the
+// same reason: appending to EXTRA_SUBCOMMANDS in place would break smoke.mjs's
+// verbatim assertion of that literal, and editing the assertion to admit a new
+// subcommand is precisely what that assertion exists to prevent. The cost is one
+// more named list; the benefit is that both existing literals keep meaning what
+// smoke.mjs says they mean.
 const EXTRA_SUBCOMMANDS = ["ratio"];
 
-// Subcommands added after `ratio`, in their own list for the SAME reason:
-// smoke.mjs asserts `EXTRA_SUBCOMMANDS = ["ratio"]` verbatim (smoke.mjs:3439),
-// exactly as it asserts the six-name SUBCOMMANDS literal twice. Appending to
-// that list would edit an existing assertion to make a new test pass, which is
-// the one move this harness must never make. `equity` therefore reaches
-// DISPATCHABLE by a third route, so a typo in it still refuses to dispatch.
-const LATER_SUBCOMMANDS = ["equity"];
-const DISPATCHABLE = [...SUBCOMMANDS, ...EXTRA_SUBCOMMANDS, ...LATER_SUBCOMMANDS];
+// Subcommands added after `ratio`, each in its OWN named list, for the SAME
+// reason: smoke.mjs asserts `EXTRA_SUBCOMMANDS = ["ratio"]` verbatim and the
+// six-name SUBCOMMANDS literal twice. Appending to either would edit an existing
+// assertion to make a new test pass - the one move this harness must never make.
+//
+// Every late subcommand therefore reaches DISPATCHABLE by unioning its own list,
+// so a typo in any of them still refuses to dispatch. A further subcommand gets a
+// FURTHER list and a FURTHER spread below - do NOT widen an existing one.
+//
+//   equity  -> LATER_SUBCOMMANDS     (the equity curve, PR #25)
+//   band    -> LATER_SUBCOMMANDS     (the proximity-band counterfactual sweep)
+//   concept -> CONCEPT_SUBCOMMANDS  (the maintainer's stated concept)
+const LATER_SUBCOMMANDS = ["equity", "band"];
+const CONCEPT_SUBCOMMANDS = ["concept"];
+const DISPATCHABLE = [...SUBCOMMANDS, ...EXTRA_SUBCOMMANDS, ...LATER_SUBCOMMANDS, ...CONCEPT_SUBCOMMANDS];
 const subcommand = process.argv[2];
 
 // The flag is parsed BEFORE dispatch so an invalid --timeframe fails loudly on
@@ -798,7 +837,10 @@ try {
   }
 }
 
-if (subcommand === undefined || !DISPATCHABLE.includes(subcommand)) {
+if (
+  subcommand === undefined ||
+  !(DISPATCHABLE.includes(subcommand))
+) {
   if (subcommand !== undefined) console.log(`run: unknown subcommand: ${subcommand}`);
   usage();
 } else if (tf === null) {
@@ -859,8 +901,30 @@ if (subcommand === undefined || !DISPATCHABLE.includes(subcommand)) {
         json: process.argv.includes("--json"),
         tf,
       });
+    } else if (subcommand === "band") {
+      // Counterfactual only. `band` re-runs the baseline wiring against a set of
+      // alternative proximity-band definitions and reports what WOULD change; it
+      // writes nothing, changes nothing under src/, and recommends nothing.
+      // Candidate A is REQUIRED to reproduce `baseline` on the same grid or the
+      // whole sweep throws rather than reporting.
+      process.exitCode = await runBand({
+        json: process.argv.includes("--json"),
+        tf,
+      });
     } else if (subcommand === "diagnose") {
       process.exitCode = await runTierDiagnostic({
+        json: process.argv.includes("--json"),
+        tf,
+      });
+    } else if (subcommand === "concept") {
+      // Counterfactual only, exactly like `band`. `concept` counts the
+      // maintainer's own stated setup as an explicit, parameterisable predicate
+      // over the SAME per-bar state every other subcommand reads, and reports
+      // what each gating choice costs. It writes nothing, changes nothing under
+      // src/, recommends nothing, and THROWS if its one shipped row fails to
+      // reproduce the real Signal Engine's output on every bar — which is what
+      // makes any of its other rows mean anything.
+      process.exitCode = await runConcept({
         json: process.argv.includes("--json"),
         tf,
       });
