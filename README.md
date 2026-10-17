@@ -39,7 +39,7 @@ it. The question this project set out to answer is answered, with the answer rec
 |---|---|
 | `src/liquidityflowause.pine` | the indicator source |
 | `src/liquidityflowause-strategy.pine` | the `strategy()` variant used for fills/commission/slippage (Route A, see `docs/ROUTE-A.md`) |
-| `dist/` | the built Pine you install — **this is the file TradingView consumes** |
+| `dist/` | **generated, never committed** (`.gitignore`) — the built Pine you install, and **the file TradingView consumes**. A fresh clone has no `dist/` until you build it. |
 | `backtest/` | the measurement harness: Node, **no dependencies, no package.json** |
 | `backtest/modules/` | ports of the Pine modules (structure break, imbalance detector, signal engine…) |
 | `docs/` | technical spec, validation record, weight-calibration findings, Route A procedure |
@@ -47,11 +47,15 @@ it. The question this project set out to answer is answered, with the answer rec
 | `odd/tasks/` | the authoritative task records for each feature |
 
 `dist/` is the source of truth for what ships: the harness never writes it, and every
-finding in `docs/` was produced against it.
+finding in `docs/` was produced against it. It is **build output** — `scripts/build.mjs`
+regenerates it and `.gitignore` excludes it — so it is produced, not fetched. Anyone who
+clones this repository starts with no `dist/` and runs the build first.
 
 ## Running the harness
 
 ```bash
+node scripts/build.mjs                     # REQUIRED FIRST: dist/ is not committed
+node scripts/build.mjs --strategy          # and the Route A strategy sibling (docs/ROUTE-A.md)
 node backtest/smoke.mjs                    # the suite: 2,092 assertions, no data, no network
 node backtest/run.mjs validate             # fidelity gate against docs/VALIDATION.md — 5m only
 node backtest/run.mjs equity --timeframe 1h   # the equity curve (the finding quoted above)
