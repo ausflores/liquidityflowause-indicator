@@ -39,6 +39,7 @@ import {
   labelSignalsForwardReturn,
 } from "./modules/label.mjs";
 import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import {
   createBinarySignalModel,
   BINARY_INPUT_CONTRACT,
@@ -6489,6 +6490,83 @@ sec("subcommand-registration");
       "widened to admit a subcommand that already had a list of its own",
   );
 }
+// ============================================================================
+// cli-wiring — run.mjs EXECUTED, not read
+// ----------------------------------------------------------------------------
+// Every other section observes this harness by importing modules, or by reading
+// run.mjs as TEXT. Both miss the same defect class: a run.mjs that no longer
+// parses still satisfies every substring assertion in this file, because a
+// broken file is still a string containing the phrases those assertions look for.
+// That is not hypothetical - an orphaned `});` left by a conflict resolution made
+// this suite report "TOTAL 2086 failed 0" while the CLI could not start at all.
+//
+// So this section SPAWNS the CLI. Both invocations exit before any dataset is
+// touched, which keeps this suite data-free; the only cost is a process spawn.
+// If this section passes, the file parses, the guard runs, and a near-miss of a
+// REAL subcommand name is refused rather than dispatched.
+// ============================================================================
+
+sec("cli-wiring");
+{
+  const repoRoot = fileURLToPath(new URL("../", import.meta.url));
+  const runCli = (args) =>
+    spawnSync(process.execPath, ["backtest/run.mjs", ...args], {
+      cwd: repoRoot,
+      encoding: "utf8",
+    });
+
+  const runSrcCli = readFileSync(new URL("./run.mjs", import.meta.url), "utf8");
+
+  // Every registration list run.mjs declares. CONCEPT_SUBCOMMANDS may not exist
+  // yet - a list that is absent registers nothing, which is exactly its meaning.
+  const lists = {};
+  for (const name of ["SUBCOMMANDS", "EXTRA_SUBCOMMANDS", "LATER_SUBCOMMANDS", "CONCEPT_SUBCOMMANDS"]) {
+    const m = runSrcCli.match(new RegExp(`const ${name} = \\[([^\\]]*)\\]`));
+    lists[name] = m ? m[1].split(",").map((s) => s.trim().replace(/^"|"$/g, "")).filter(Boolean) : [];
+  }
+  const registered = [
+    ...lists.SUBCOMMANDS,
+    ...lists.EXTRA_SUBCOMMANDS,
+    ...lists.LATER_SUBCOMMANDS,
+    ...lists.CONCEPT_SUBCOMMANDS,
+  ];
+  check(registered.length > 0, `run.mjs declares its registration lists (${registered.length} names)`);
+
+  // 1. The usage path: the file parses, prints usage, and names every
+  //    registered subcommand - the lists and the CLI cannot drift apart silently.
+  const usage = runCli([]);
+  check(
+    usage.status === 1 && usage.stdout.startsWith("usage: node backtest/run.mjs"),
+    `run.mjs with no arguments prints usage and exits 1 (status ${usage.status})`,
+  );
+  check(
+    !/SyntaxError/.test(usage.stderr ?? ""),
+    "run.mjs PARSES - no SyntaxError on stderr; a CLI that cannot start still passes every substring assertion in this file",
+  );
+  const missing = registered.filter((n) => !new RegExp(`^\\s+${n}\\s`, "m").test(usage.stdout));
+  check(
+    missing.length === 0,
+    `usage names every registered subcommand (${registered.join(", ")})` +
+      (missing.length ? ` - MISSING from usage: ${missing.join(", ")}` : ""),
+  );
+
+  // 2. A near-miss of a REAL name is refused by the guard, not dispatched.
+  //    The victim is whichever name arrived LAST, so this keeps testing the
+  //    newest registration rather than the oldest.
+  const late = [...lists.LATER_SUBCOMMANDS, ...lists.CONCEPT_SUBCOMMANDS];
+  const victim = late[late.length - 1] ?? registered[registered.length - 1];
+  const typo = `${victim}y`;
+  const refused = runCli([typo]);
+  check(
+    refused.status === 1 && refused.stdout.includes(`unknown subcommand: ${typo}`),
+    `the near-miss "${typo}" (of the registered "${victim}") is refused with an explicit message (status ${refused.status})`,
+  );
+  check(
+    !/SyntaxError/.test(refused.stderr ?? ""),
+    "the refusing path parses too - a typo must not be able to hide a syntax error",
+  );
+}
+
 const ORDER = [
   "subcommand-registration",
   "session-markers",
@@ -6508,6 +6586,7 @@ const ORDER = [
   "equity-curve",
     "band-sweep",
     "concept-matrix",
+  "cli-wiring",
 ];
 console.log("section            checks");
 for (const name of ORDER) {
