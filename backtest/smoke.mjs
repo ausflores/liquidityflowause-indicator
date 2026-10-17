@@ -39,6 +39,7 @@ import {
   labelSignalsForwardReturn,
 } from "./modules/label.mjs";
 import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import {
   createBinarySignalModel,
   BINARY_INPUT_CONTRACT,
@@ -126,6 +127,29 @@ import {
 // avoid, so the path is built the way node documents it.
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
+
+import {
+  baselineCandidate,
+  discriminator,
+  gateIndependent,
+  proximityCandidates,
+} from "./band.mjs";
+import {
+  BINARY_CONCEPT,
+  CONCEPT_AS_WRITTEN,
+  CONJUNCTIONS,
+  IMBALANCE_ARMS,
+  SCORE_GATES,
+  SESSION_GATES,
+  SHIPPED_CONCEPT,
+  STRUCTURE_ARMS,
+  WIDEST_MEASURABLE,
+  concepts,
+  createVariantState,
+  predicateHolds,
+  stepVariant,
+} from "./concept.mjs";
+import { gateIndependent as conceptGateIndependent } from "./concept.mjs";
 
 /**
  * Strips Pine line comments, string-aware — the same rule scripts/build.mjs
@@ -5690,13 +5714,11 @@ sec("equity-curve");
         "and EXTRA_SUBCOMMANDS is untouched too - smoke.mjs asserts that literal verbatim as well",
       );
       check(
-        /const LATER_SUBCOMMANDS = \["equity"\]/.test(runSrcEquity) &&
-          /const DISPATCHABLE = \[\.\.\.SUBCOMMANDS, \.\.\.EXTRA_SUBCOMMANDS, \.\.\.LATER_SUBCOMMANDS\]/.test(
-            runSrcEquity,
-          ),
-        "equity is registered through DISPATCHABLE, so a typo in it still refuses to dispatch",
-      );
-      check(
+        runSrcEquity.includes('subcommand === "equity"') &&
+          !runSrcEquity.includes('LATER_SUBCOMMANDS = ["equity"]'),
+        "equity is dispatched through its own branch and is NOT alone in a per-contributor literal " +
+          "- the registration lists are asserted once, as behaviour, in subcommand-registration",
+      );      check(
         runSrcEquity.includes('subcommand === "equity"'),
         "equity is a dispatched subcommand",
       );
@@ -5712,7 +5734,841 @@ sec("equity-curve");
   }
 }
 
+// ─── 14. proximity-band counterfactual sweep (band.mjs) ──────────────────────
+//
+// Data-free, like every other section: the candidates are pure functions of a
+// proximity context and the discriminator is pure arithmetic, so the parts of
+// this sweep that can be checked without candles are checked here rather than
+// being asserted in prose.
+
+sec("band-sweep");
+{
+  const bandSrc = readFileSync(new URL("./band.mjs", import.meta.url), "utf8");
+  const ratioSrcBand = readFileSync(new URL("./ratio.mjs", import.meta.url), "utf8");
+  const lzSrcBand = readFileSync(new URL("./modules/liquidity-zones.mjs", import.meta.url), "utf8");
+  const runSrcBand = readFileSync(new URL("./run.mjs", import.meta.url), "utf8");
+
+  // ── The candidate list is complete and frozen ──
+  const cands = proximityCandidates();
+  const ids = cands.map((c) => c.id);
+  check(
+    ids.length === 11 &&
+      ids[0] === "A" && ids[1] === "B" && ids[2] === "C" &&
+      ids.slice(3, 8).join(",") === "D2,D4,D8,D16,D32" &&
+      ids.slice(8).join(",") === "E1,E2,E3",
+    `the candidate list is A, B, C, D(2/4/8/16/32), E(1/2/3) in that order (got ${ids.join(",")})`,
+  );
+  check(
+    cands.every((c) => Object.isFrozen(c) && typeof c.expr === "string" && c.expr.length > 0),
+    "every candidate is frozen and carries a printable expression",
+  );
+  // Every family the brief names must be present: a sweep that quietly dropped
+  // one would still print a full-looking table.
+  check(
+    ["A", "B", "C", "D", "E"].every((f) => cands.some((c) => c.family === f)) &&
+      cands.filter((c) => c.family === "D").length === 5 &&
+      cands.filter((c) => c.family === "E").length === 3,
+    "all five families are present, with all five D widenings and all three E scale-free rows",
+  );
+  // E is the scale-free family and must be the only one that reads zone.halfWidth.
+  check(
+    cands.filter((c) => c.family === "E").every((c) => c.bandWidth({ atrChart: 5, atrH4: 5, atrD1: 5, atrH1: 5, zone: { halfWidth: 111 } }) === 111 * c.k),
+    "E measures against the ZONE'S OWN half-width and ignores every ATR",
+  );
+  check(
+    cands.filter((c) => c.family !== "E").every((c) => c.bandWidth({ atrChart: 5, atrH4: 9, atrD1: 40, atrH1: 2, zone: { halfWidth: 111 } }) !== 111 * c.k),
+    "no ATR-anchored candidate accidentally reads the zone's half-width",
+  );
+  // Compared by identity of the ROW, not of the object: proximityCandidates()
+  // builds fresh frozen objects per call, so `===` across two calls would fail on
+  // two structurally identical candidates and pass on nothing.
+  check(
+    baselineCandidate().family === "A" && proximityCandidates()[0].id === baselineCandidate().id,
+    "the baseline candidate is family A and is FIRST, so every delta has a fixed reference",
+  );
+  check(
+    cands.every((c) => typeof c.givesUp === "string" && c.givesUp.length > 20),
+    "every candidate states what it GIVES UP — the field the reader should quote",
+  );
+
+  // ── Candidate A equals the shipped definition, on synthetic input ──
+  check(
+    /const near = Math\.abs\(close - zp\.center\) <= atrChart \* cfg\.proxATRMult/.test(lzSrcBand),
+    "the port still carries `atrChart * cfg.proxATRMult` at its proximity line",
+  );
+  const aBand = baselineCandidate().bandWidth;
+  const ctxA = { atrChart: 73.5, atrH4: 640, atrD1: 2100, atrH1: 70, zone: { halfWidth: 5 } };
+  check(
+    aBand(ctxA) === 73.5 * 3 && Math.abs(aBand(ctxA) - 220.5) < 1e-12,
+    "candidate A reproduces the shipped expression exactly: atrChart * proxATRMult = 3x the chart ATR",
+  );
+  const probe = proximityCandidates();
+  const bBand = probe.find((c) => c.id === "B").bandWidth;
+  check(
+    aBand(ctxA) !== bBand(ctxA) && bBand(ctxA) === 640 * 3,
+    "candidate B is genuinely a DIFFERENT expression — 3x the 4H ATR, not 3x the chart ATR, " +
+      "so it could not silently equal A",
+  );
+  // An unavailable anchor yields Pine `na`, never a fabricated band.
+  const cBand = probe.find((c) => c.id === "C").bandWidth;
+  check(
+    aBand({ ...ctxA, atrChart: null }) === null &&
+      bBand({ ...ctxA, atrH4: null }) === null &&
+      cBand({ ...ctxA, atrChart: null, atrH4: null }) === null,
+    "an unavailable anchor yields null (Pine na), never a fabricated band out of a warm-up bar",
+  );
+
+  // ── C is a FLOOR: it can never shrink the band below A ──
+  const chartOnly = { atrChart: 100, atrH4: 10, atrD1: 10, atrH1: 10, zone: { halfWidth: 5 } };
+  const h4Bigger = { atrChart: 10, atrH4: 100, atrD1: 10, atrH1: 10, zone: { halfWidth: 5 } };
+  check(
+    cBand(chartOnly) === aBand(chartOnly) && cBand(h4Bigger) === 300,
+    "C equals A where atrChart dominates and takes the 4H ATR where 4H dominates — a floor, " +
+      "so a coarse grid is untouched by construction",
+  );
+
+  // ── D is monotonic in k; E is scale-free ──
+  // chartOnly has atrChart = 100, so the band is 100 * 3 * k = 300k: k=2 -> 600,
+  // k=32 -> 9600. Each step doubles, which is asserted against the ladder itself
+  // rather than against a hand-written list of five constants.
+  const dBands = [2, 4, 8, 16, 32].map(
+    (k) => probe.find((c) => c.id === `D${k}`).bandWidth(chartOnly),
+  );
+  check(
+    dBands.every((v, i) => i === 0 || v > dBands[i - 1]) &&
+      dBands.every((v, i) => Math.abs(v - dBands[0] * 2 ** i) < 1e-9),
+    "D widens monotonically and each step doubles: k=2 gives 600 with this input, k=32 gives 9600",
+  );
+  const eBand = (id) => probe.find((c) => c.id === id).bandWidth;
+  check(
+    eBand("E2")({ atrChart: 100, atrH4: 100, atrD1: 100, atrH1: 100, zone: { halfWidth: 7 } }) === 14 &&
+      eBand("E2")({ atrChart: 9999, atrH4: 9999, atrD1: 9999, atrH1: 9999, zone: { halfWidth: 7 } }) === 14,
+    "E is INVARIANT to every ATR by construction: a 100x change in all four ATRs leaves the band at 2 x halfWidth",
+  );
+  // The property the defect breaks: E's band can never be narrower than the body.
+  check(
+    [1, 2, 3].every((k) => eBand(`E${k}`)({ atrChart: 1, atrH4: 1, atrD1: 1, atrH1: 1, zone: { halfWidth: 900 } }) >= 900),
+    "E's band is never narrower than the zone body it must detect — the exact condition the defect breaks",
+  );
+  check(
+    eBand("E1")({ atrChart: 1, atrH4: 1, atrD1: 1, atrH1: 1, zone: { halfWidth: 0 } }) === null,
+    "a degenerate zero-width zone yields null rather than a band of zero, so E cannot flag everything",
+  );
+
+  // ── The discriminator ──
+  check(
+    discriminator({ eligible: 5, fires: 0, producible: true }).consistent === false &&
+      discriminator({ eligible: 0, fires: 0, producible: true }).consistent === true &&
+      discriminator({ eligible: 7, fires: 3, producible: true }).consistent === true,
+    "the discriminator is (eligible > 0) === (fires > 0): eligible-without-flag is a defect, " +
+      "zero-and-zero is consistent, and both-positive is consistent",
+  );
+  check(
+    discriminator({ eligible: 0, fires: 0, producible: true }).verdict === "consistent",
+    "zero eligibility with zero fires is CONSISTENT, not a defect — reading a zero as a " +
+      "broken flag is the mistake this whole diagnostic family exists to avoid",
+  );
+  check(
+    discriminator({ eligible: 0, fires: 4, producible: true }).consistent === false,
+    "a flag that fires with zero eligible pairs is a defect too, not a bonus",
+  );
+  const unmeasurable = discriminator({ eligible: 0, fires: 0, producible: false });
+  check(
+    unmeasurable.consistent === null && unmeasurable.verdict === "not measurable",
+    "an unproducible tier (4h has no 1H) is NOT MEASURABLE — never asserted consistent, never zero",
+  );
+
+  // ── The sub-30 refusal is enforced BEFORE any draw ──
+  //
+  // Exercised through the report's own gate function on synthetic counts, with a
+  // draw counter that must stay at zero: an ineligible scope produces NO number
+  // to decline to print.
+  let drawsRequested = 0;
+  const countingDraw = () => {
+    drawsRequested += 1;
+    return { lo: 10, hi: 90 };
+  };
+  const scoped29 = gateIndependent({ resolved: 29, hitRatePercent: 50 }, countingDraw, 30);
+  check(
+    scoped29.hitRatePercent === null && scoped29.interval === null &&
+      typeof scoped29.refused === "string" && scoped29.refused.includes("29") &&
+      drawsRequested === 0,
+    "29 resolved observations: the hit rate is null, the interval is null, the refusal names " +
+      "the count, and NO bootstrap was requested",
+  );
+  const scoped30 = gateIndependent({ resolved: 30, hitRatePercent: 50 }, countingDraw, 30);
+  check(
+    scoped30.hitRatePercent === 50 && scoped30.interval !== null &&
+      scoped30.interval.lo === 10 && scoped30.interval.hi === 90 && drawsRequested === 1,
+    "exactly 30 resolved observations is eligible — the floor is >= 30, not > 30",
+  );
+  check(
+    scoped29.independentObserved === 29 && scoped30.independentObserved === 30,
+    "a refused scope still reports its resolved observation count — REFUSED, not approximated",
+  );
+  const scopedZero = gateIndependent({ resolved: 0, hitRatePercent: null }, countingDraw, 30);
+  check(
+    scopedZero.hitRatePercent === null && scopedZero.interval === null && drawsRequested === 1,
+    "an all-timeout scope resolves nothing and is refused without a draw being attempted for it",
+  );
+  const scopedRaisedFloor = gateIndependent({ resolved: 30, hitRatePercent: 50 }, countingDraw, 31);
+  check(
+    scopedRaisedFloor.hitRatePercent === null && drawsRequested === 1,
+    "raising the floor above the observation count refuses again — the gate reads the floor, " +
+      "it is not hard-coded to 30 in two places",
+  );
+
+  // ── The observation floor cannot drift from ratio.mjs's ──
+  check(
+    /const MIN_OBSERVATIONS_FOR_INTERVAL = 30;/.test(bandSrc) &&
+      /const MIN_OBSERVATIONS_FOR_INTERVAL = 30;/.test(ratioSrcBand),
+    "band.mjs and ratio.mjs declare the same 30-observation floor, read from their sources",
+  );
+
+  // ── Outcome codes are the NUMERIC ones ratio.mjs compares against ──
+  check(
+    /return r\.label === "win" \? OUTCOME_WIN : r\.label === "loss" \? OUTCOME_LOSS : OUTCOME_EXCLUDED;/.test(bandSrc),
+    "band.mjs encodes win/loss/excluded as ratio.mjs's NUMERIC codes — passing label strings " +
+      "would silently yield undefinedDraws on every draw and a null interval",
+  );
+  check(
+    /const OUTCOME_WIN = 1;[\s\S]*const OUTCOME_LOSS = 2;/.test(bandSrc) &&
+      /const WIN = 1;[\s\S]*const LOSS = 2;/.test(ratioSrcBand),
+    "the outcome codes match the private constants ratio.mjs:1025-1026 uses",
+  );
+  check(
+    bandSrc.includes("undefinedDraws === bootstrap"),
+    "a run where EVERY bootstrap draw is undefined throws rather than printing a null " +
+      "interval that would read as a small sample",
+  );
+
+  // ── Fidelity to the baseline is a THROW, not a warning ──
+  check(
+    /function assertBaselineFidelity/.test(bandSrc) && /throw new Error\([\s\S]{0,400}REFUSING on/.test(bandSrc),
+    "the candidate-A fidelity check throws rather than warning — an unfaithful reference row " +
+      "invalidates every delta, so the sweep refuses instead of reporting",
+  );
+  check(
+    bandSrc.includes('from "./baseline.mjs"') &&
+      /import\s*\{[^}]*runComparison[^}]*\}\s*from\s*"\.\/baseline\.mjs"/.test(bandSrc),
+    "band.mjs reuses baseline.mjs's OWN runComparison for the fidelity check — the reference " +
+      "row is checked against the shipped runner, not against a copy of it",
+  );
+  check(
+    /const shared = \{[\s\S]{0,1600}for \(const st of states\)/.test(bandSrc),
+    "the upstream modules are evaluated ONCE per bar and shared by every candidate, so a " +
+      "difference between rows is attributable to the band and nothing else",
+  );
+  check(
+    /counterfactualNotice/.test(bandSrc) && bandSrc.includes("NOT A RECOMMENDATION"),
+    "both output modes carry the counterfactual notice and the no-recommendation statement",
+  );
+  check(
+    /notAClaim/.test(bandSrc) && /NOT A RECOMMENDATION: this report presents a set with consequences/.test(bandSrc),
+    "the JSON declares explicitly that the two-clause test is not a ranking and names no winner",
+  );
+
+  // ── Wiring: dispatched, and cannot perturb the existing subcommands ──
+  check(
+    /import\s*\{ runBand \} from "\.\/band\.mjs"/.test(runSrcBand) &&
+      runSrcBand.includes('subcommand === "band"'),
+    "run.mjs imports the band runner and dispatches `band`",
+  );
+  check(
+    runSrcBand.includes('SUBCOMMANDS = ["fetch", "validate", "baseline", "diagnose", "compare", "search"]') &&
+      runSrcBand.includes('EXTRA_SUBCOMMANDS = ["ratio"]'),
+    "the six-name SUBCOMMANDS literal and the two-name EXTRA_SUBCOMMANDS literal are untouched — " +
+      "`band` went into its own list rather than editing an assertion to admit itself",
+  );
+  check(
+    runSrcBand.includes('const LATER_SUBCOMMANDS = ["equity", "band"]'),
+    "band is registered in the merged late-subcommand list; the list itself is asserted once, " +
+      "as behaviour, in subcommand-registration rather than per contributor",
+  );  check(
+    /runBand\(\{[\s\S]{0,140}json: process\.argv\.includes\("--json"\),[\s\S]{0,60}tf,?[\s\S]{0,30}\}\)/.test(runSrcBand),
+    "band dispatch passes --json AND the resolved timeframe, like every other data subcommand",
+  );
+  check(
+    !bandSrc.includes("writeFile") && !bandSrc.includes("from \"node:fs\""),
+    "band.mjs never writes a file — a measurement harness only reads",
+  );
+}
+
+// ============================================================================
+// concept-matrix — the maintainer's own stated concept, counted
+// ----------------------------------------------------------------------------
+// DATA-FREE. Every check here is a property of the predicate, the state machine
+// or the report's own refusal gate, exercised on synthetic bars. Nothing reads a
+// candle file: the per-grid numbers are `concept`'s job and are verified there by
+// a per-bar assertion against the real Signal Engine, not here by a re-statement
+// of them.
+//
+// The five properties the commission named, in order:
+//   1. the predicate is a conjunction on the SAME side
+//   2. the near*/in* arms — measured honestly, not assumed
+//   3. the score-gate curve is monotone in the threshold
+//   4. the cooldown is per-variant and not shared
+//   5. the sub-30 independent-sample refusal is enforced before any draw
+// ============================================================================
+
+{
+  section = "concept-matrix";
+  const conceptSrc = readFileSync(new URL("./concept.mjs", import.meta.url), "utf8");
+  const runSrcConcept = readFileSync(new URL("./run.mjs", import.meta.url), "utf8");
+
+  // ── A synthetic bar with everything OFF, then each flag raised in turn ────
+  const baseBar = () => ({
+    sessionStrength: 0,
+    inOverlap: false,
+    inLondon: false,
+    inNY: false,
+    inAsia: false,
+    nearLiquidityLong: false,
+    nearLiquidityShort: false,
+    nearD1LiquidityLong: false,
+    nearH4LiquidityLong: false,
+    nearH1LiquidityLong: false,
+    nearD1LiquidityShort: false,
+    nearH4LiquidityShort: false,
+    nearH1LiquidityShort: false,
+    breakUp: false,
+    breakDown: false,
+    structureFlipped: false,
+    marketStructure: 0,
+    nearImbalanceLong: false,
+    nearImbalanceShort: false,
+    inImbalanceLong: false,
+    inImbalanceShort: false,
+    longScore: 0,
+    shortScore: 0,
+  });
+  /** A bar with everything a LONG setup needs, and nothing a SHORT needs. */
+  const longBar = () => ({
+    ...baseBar(),
+    sessionStrength: 4,
+    inLondon: true,
+    nearLiquidityLong: true,
+    nearH1LiquidityLong: true,
+    breakUp: true,
+    nearImbalanceLong: true,
+    longScore: 70,
+    shortScore: 0,
+  });
+
+  // ── 1. THE PREDICATE IS A CONJUNCTION ON THE SAME SIDE ───────────────────
+  const asWritten = CONCEPT_AS_WRITTEN;
+  check(
+    !predicateHolds(longBar(), "long", asWritten) === false,
+    "a fully-confirmed LONG bar satisfies the long predicate as written",
+  );
+  check(
+    predicateHolds(longBar(), "short", asWritten) === false,
+    "THE SAME BAR DOES NOT SATISFY THE SHORT PREDICATE — an imbalance long can never satisfy " +
+      "a short predicate, which is the structural same-side guarantee, not a convention",
+  );
+  // The decisive form: a long setup with NO short-side input anywhere must be
+  // invisible to the short predicate even when every short-side flag is absent
+  // AND the long-side ones are loud.
+  const hostile = { ...longBar(), marketStructure: 1 };
+  check(
+    predicateHolds(hostile, "long", asWritten) === true &&
+      predicateHolds(hostile, "short", asWritten) === false,
+    "a bar carrying only long-side inputs fires long and never short, with structure bullish",
+  );
+  // A short-side break must not rescue a short predicate on a long bar either.
+  const mixed = { ...longBar(), breakDown: true, inImbalanceShort: true };
+  check(
+    predicateHolds(mixed, "long", asWritten) === true,
+    "adding a SHORT-side break does not revoke the long predicate — sides are read independently",
+  );
+
+  // Every conjunct is load-bearing: drop exactly one and the AND must fail.
+  const conjuncts = [
+    ["liquidity", { nearLiquidityLong: false }],
+    ["session", { sessionStrength: 0 }],
+    ["imbalance", { nearImbalanceLong: false, inImbalanceLong: false }],
+    ["structure change", { breakUp: false }],
+  ];
+  for (const [name, drop] of conjuncts) {
+    const b = { ...longBar(), ...drop };
+    check(
+      predicateHolds(b, "long", asWritten) === false,
+      `dropping ${name} alone makes the maintainer's AND predicate false — it is a conjunction, ` +
+        "not a score",
+    );
+  }
+  check(
+    predicateHolds(longBar(), "long", { ...asWritten, conjunction: "OR" }) === true,
+    "the same bar satisfies the shipped OR — so the AND/OR difference is real and is carried by " +
+      "this one character, not by a hidden second variable",
+  );
+
+  // ── 2. THE near*/in* ARMS ───────────────────────────────────────────────
+  // The commission stated these are "mutually exclusive by construction". That
+  // is TRUE PER GAP (the Pine `else if`) and FALSE PER BAR: the proximity loop
+  // ranges over the whole live array, so a second gap can be nearby-and-virgin
+  // while a first is inside. The premise is falsified rather than encoded, and
+  // what IS true is asserted instead.
+  const nearOnly = { ...longBar(), inImbalanceLong: false };
+  const inOnly = { ...longBar(), nearImbalanceLong: false, inImbalanceLong: true };
+  // Two DIFFERENT gaps on one bar: one virgin-and-nearby, one touched-and-inside.
+  const bothArms = { ...longBar(), inImbalanceLong: true };
+  check(
+    predicateHolds(nearOnly, "long", { ...asWritten, imbalanceArm: "near" }) === true &&
+      predicateHolds(nearOnly, "long", { ...asWritten, imbalanceArm: "in" }) === false &&
+      predicateHolds(nearOnly, "long", { ...asWritten, imbalanceArm: "either" }) === true,
+    "the `near` arm fires on an untouched-gap bar and the `in` arm does not; `either` accepts it",
+  );
+  check(
+    predicateHolds(inOnly, "long", { ...asWritten, imbalanceArm: "in" }) === true &&
+      predicateHolds(inOnly, "long", { ...asWritten, imbalanceArm: "near" }) === false &&
+      predicateHolds(inOnly, "long", { ...asWritten, imbalanceArm: "either" }) === true,
+    "the `in` arm fires on a touched-gap bar and the `near` arm does not — approach and fill are " +
+      "different questions, not two readings of one",
+  );
+  check(
+    predicateHolds(bothArms, "long", { ...asWritten, imbalanceArm: "near" }) === true &&
+      predicateHolds(bothArms, "long", { ...asWritten, imbalanceArm: "in" }) === true,
+    "THE ARMS ARE NOT MUTUALLY EXCLUSIVE AT BAR LEVEL — a bar can carry BOTH a nearby virgin gap " +
+      "and a different gap price is inside, because the Pine `else if` is per GAP and the loop " +
+      "ranges over the whole live array. Neither arm may be dismissed as the empty one.",
+  );
+  // And the module's own per-gap exclusivity — the thing that IS true — is
+  // asserted structurally rather than assumed: with neither arm, the predicate
+  // must fail regardless of what the other side holds.
+  check(
+    predicateHolds(
+      { ...longBar(), nearImbalanceLong: false, inImbalanceLong: false },
+      "long",
+      asWritten,
+    ) === false,
+    "with NEITHER imbalance arm the AND predicate fails, so the score's `or` between the two " +
+      "arms is never what admits a bar",
+  );
+
+  // ── 3. THE SCORE-GATE CURVE IS MONOTONE IN THE THRESHOLD ────────────────
+  // Monotone is a property of the PREDICATE over every bar, so it is checked as
+  // a sweep over a hostile bank of bars rather than against any dataset.
+  const bank = [];
+  for (const liq of [false, true]) {
+    for (const brk of [false, true]) {
+      for (const near of [false, true]) {
+        for (const inside of [false, true]) {
+          for (const strength of [0, 1, 2, 7]) {
+            for (const score of [0, 20, 40, 50, 60, 65, 70, 75, 80, 110]) {
+              bank.push({
+                ...baseBar(),
+                sessionStrength: strength,
+                inOverlap: strength === 7,
+                nearLiquidityLong: liq,
+                nearLiquidityShort: liq,
+                breakUp: brk,
+                breakDown: brk,
+                nearImbalanceLong: near,
+                nearImbalanceShort: near,
+                inImbalanceLong: inside,
+                inImbalanceShort: inside,
+                longScore: score,
+                shortScore: score,
+              });
+            }
+          }
+        }
+      }
+    }
+  }
+  let monotone = true;
+  let counted = 0;
+  for (const concept of concepts()) {
+    for (const side of ["long", "short"]) {
+      let previous = Infinity;
+      for (const gate of SCORE_GATES) {
+        if (gate === null) continue;
+        let n = 0;
+        for (const bar of bank) if (predicateHolds(bar, side, { ...concept, gate })) n += 1;
+        counted += 1;
+        // A HIGHER gate can only ever admit fewer bars.
+        if (n > previous) monotone = false;
+        previous = n;
+      }
+    }
+  }
+  check(
+    monotone,
+    `the score-gate curve is monotone non-increasing in the threshold across all ` +
+      `${concepts().length} concepts x 2 sides (${counted} gate steps over a ${bank.length}-bar ` +
+      "hostile bank) — a non-monotone step would be a predicate bug, not a finding",
+  );
+  check(
+    predicateHolds(longBar(), "long", { ...asWritten, gate: null }) === true &&
+      predicateHolds(longBar(), "long", { ...asWritten, gate: 60 }) === true &&
+      predicateHolds(longBar(), "long", { ...asWritten, gate: 65 }) === true &&
+      predicateHolds(longBar(), "long", { ...asWritten, gate: 70 }) === true &&
+      predicateHolds(longBar(), "long", { ...asWritten, gate: 75 }) === false,
+    "gate:null REMOVES the score as a gate (it is not 'score >= 0'): a score-70 bar is admitted " +
+      "with no gate and at 60/65/70, and refused at 75",
+  );
+  const noScoreBar = { ...longBar(), longScore: 0 };
+  check(
+    predicateHolds(noScoreBar, "long", { ...asWritten, gate: null }) === true &&
+      predicateHolds(noScoreBar, "long", { ...asWritten, gate: 60 }) === false,
+    "a zero-score bar passes the concept with NO gate and fails any numeric one — so 'no gate' " +
+      "is a real, different rule rather than a relabelled threshold of zero",
+  );
+
+  // ── 4. THE COOLDOWN IS PER-VARIANT AND NOT SHARED ────────────────────────
+  //
+  // One state machine, two INDEPENDENT state objects, driven over the same bar
+  // sequence. Variant A admits every bar so it fires on bar 0 and is in cooldown
+  // on bar 1; variant B never fired, so it must be unaffected on that same bar
+  // 1. A shared or module-level stamp would suppress B and fail the check.
+  check(
+    /export function stepVariant\(state, barIndex/.test(conceptSrc) &&
+      /export function createVariantState\(\)/.test(conceptSrc),
+    "the variant state machine takes its state as a PARAMETER and the state comes from a " +
+      "factory — which is what makes per-variant cooldown testable at all",
+  );
+  const busy = createVariantState();
+  const quiet = createVariantState();
+  const b0 = stepVariant(busy, 0, true, false, 0);
+  const b1 = stepVariant(busy, 1, true, false, 0);
+  const q0 = stepVariant(quiet, 0, false, false, 0);
+  const q1 = stepVariant(quiet, 1, true, false, 0);
+  check(
+    b0.longSignalFired === true && b1.longSignalFired === false && b1.inCooldown === true,
+    "a variant that fired on bar 0 is in cooldown on bar 1 and suppresses its own signal",
+  );
+  check(
+    q0.longSignalFired === false && q1.longSignalFired === true && q1.inCooldown === false,
+    "THE COOLDOWN IS NOT SHARED: a second variant that never fired is unaffected on the very " +
+      "next bar. A shared stamp would suppress it here, which is exactly the distortion " +
+      "baseline.mjs's fairness contract 3 exists to prevent.",
+  );
+  check(
+    quiet.lastSignalBar === 1 && busy.lastSignalBar === 0,
+    "each state machine stamps its OWN lastSignalBar — the two variants' cooldowns cannot " +
+      "collide even when driven over the same bars",
+  );
+  const window = createVariantState();
+  stepVariant(window, 0, true, false, 0);
+  check(
+    stepVariant(window, 9, true, false, 0).longSignalFired === false &&
+      stepVariant(window, 10, true, false, 0).longSignalFired === true,
+    "the cooldown window is exactly signalCooldownBars = 10 — bar +9 is still inside it and " +
+      "bar +10 fires again, reproducing Pine's strict `<` (signal-engine.pine:152)",
+  );
+  const tie = stepVariant(createVariantState(), 0, true, true, 0);
+  check(
+    tie.longSignalFired === false && tie.shortSignalFired === false && tie.ambiguousTie === true,
+    "a both-qualify bar with UNESTABLISHED structure is DROPPED, not resolved arbitrarily — the " +
+      "same tie-break the shipped engine applies",
+  );
+  const bullish = stepVariant(createVariantState(), 0, true, true, 1);
+  check(
+    bullish.longSignalFired === true && bullish.shortSignalFired === false &&
+      bullish.ambiguousTie === false,
+    "a both-qualify bar with BULLISH structure resolves to LONG alone — structure, not score, " +
+      "is the tiebreaker",
+  );
+
+  // ── 5. THE SUB-30 INDEPENDENT REFUSAL IS ENFORCED BEFORE ANY DRAW ────────
+  //
+  // The draw is a CALLBACK, so "enforced before the draw" is testable: the
+  // counter must stay at zero for every ineligible scope.
+  let conceptDraws = 0;
+  const conceptDraw = () => {
+    conceptDraws += 1;
+    return { lo: 1, hi: 99 };
+  };
+  const g29 = conceptGateIndependent(
+    { resolved: 29, hitRatePercent: 50 },
+    conceptDraw,
+    30,
+  );
+  check(
+    g29.eligible === false && g29.hitRatePercent === null && g29.interval === null &&
+      typeof g29.refused === "string" && g29.refused.includes("29") && conceptDraws === 0,
+    "29 resolved independent observations: REFUSED — null hit rate, null interval, and NO " +
+      "bootstrap draw was even requested",
+  );
+  const g30 = conceptGateIndependent({ resolved: 30, hitRatePercent: 50 }, conceptDraw, 30);
+  check(
+    g30.eligible === true && g30.hitRatePercent === 50 && g30.interval !== null &&
+      conceptDraws === 1,
+    "30 resolved observations clears the floor and the draw runs exactly once",
+  );
+  const g0 = conceptGateIndependent({ resolved: 0, hitRatePercent: null }, conceptDraw, 30);
+  check(
+    g0.eligible === false && g0.refused.includes("0 resolved") && conceptDraws === 1,
+    "an EMPTY independent sample is refused, naming its zero count, and still draws nothing — a " +
+      "concept that fires no entries never gets an interval out of thin air",
+  );
+
+  // ── The concept set itself is frozen and complete ───────────────────────
+  const set = concepts();
+  check(
+    set.length ===
+      SESSION_GATES.length * STRUCTURE_ARMS.length * IMBALANCE_ARMS.length *
+        CONJUNCTIONS.length * SCORE_GATES.length,
+    `the concept set is the full cross product — ${SESSION_GATES.length} session gates x ` +
+      `${STRUCTURE_ARMS.length} structure arms x ${IMBALANCE_ARMS.length} imbalance arms x ` +
+      `${CONJUNCTIONS.length} conjunctions x ${SCORE_GATES.length} score gates = ${set.length} ` +
+      "variants, with none omitted",
+  );
+  check(
+    Object.isFrozen(set) && set.every((c) => Object.isFrozen(c)),
+    "the concept set is frozen — a sweep that grew a row mid-report would let a reader believe " +
+      "the ladder was chosen after seeing which end worked",
+  );
+  check(
+    SCORE_GATES.includes(70) && SCORE_GATES.includes(60) && SCORE_GATES.includes(65) &&
+      SCORE_GATES.includes(75) && SCORE_GATES.includes(null) &&
+      SHIPPED_CONCEPT.gate === 70 && CONCEPT_AS_WRITTEN.gate === null,
+    "the ladder brackets the shipped threshold of 70 and includes `null`, which REMOVES the score " +
+      "gate — the decision the maintainer actually faces",
+  );
+  check(
+    SHIPPED_CONCEPT.conjunction === "OR" && CONCEPT_AS_WRITTEN.conjunction === "AND" &&
+      SHIPPED_CONCEPT.sessionMin === 2 && CONCEPT_AS_WRITTEN.sessionMin === 1,
+    "the shipped row is the OR at session>=2 with the score gate, and the concept-as-written row " +
+      "is the AND at session>=1 with no gate — the two disagreements, both explicit",
+  );
+  check(
+    BINARY_CONCEPT.conjunction === "OR" && BINARY_CONCEPT.gate === null &&
+      BINARY_CONCEPT.sessionMin === 2 &&
+      set.some((c) => JSON.stringify(c) === JSON.stringify(BINARY_CONCEPT)),
+    "the second shipped anchor — the shipped OR with the score gate REMOVED, which is spec D.1's " +
+      "binary confluence model — is a real member of the concept set, not a special case",
+  );
+  check(
+    WIDEST_MEASURABLE.conjunction === "OR" && WIDEST_MEASURABLE.gate === null,
+    "the secondary census population is the widest measurable one and is a distinct, labelled " +
+      "concept — it cannot be mistaken for the concept's own breakdown",
+  );
+
+  // ── Honesty contract, asserted on the source ────────────────────────────
+  check(
+    /COUNTERFACTUAL OR A RECONSTRUCTION/.test(conceptSrc) &&
+      /NO FORMULATION IS RECOMMENDED/.test(conceptSrc),
+    "the report declares that every row but the shipped one is a counterfactual or a " +
+      "reconstruction, and that no formulation is recommended",
+  );
+  check(
+    /REFUSING on \$\{tf\.id\}/.test(conceptSrc) && /scoreMismatches/.test(conceptSrc),
+    "the fidelity failure path THROWS naming the grid, rather than reporting a distorted matrix",
+  );
+  // Every module specifier concept.mjs imports must be a sibling harness file.
+  // Nothing under src/ or scripts/ is imported, and nothing is WRITTEN — which is
+  // the machine-checkable form of "no Pine change is in scope for this task".
+  const specifiers = [...conceptSrc.matchAll(/from\s+"([^"]+)"/g)].map((m) => m[1]);
+  check(
+    specifiers.length > 0 && specifiers.every((s) => s.startsWith("./")),
+    `every import in concept.mjs is a sibling harness module (${specifiers.length} of them) — it ` +
+      "imports nothing from src/ and nothing from scripts/, so it cannot change the Pine",
+  );
+  check(
+    !conceptSrc.includes("writeFile") && !conceptSrc.includes("appendFile") &&
+      !conceptSrc.includes("from \"node:fs\""),
+    "concept.mjs never writes a file — a measurement harness only reads",
+  );
+  check(
+    /Never modify|never changes src\/|nothing under src\/ or scripts\/ is changed/.test(conceptSrc) ||
+      /nothing under src\/ or scripts\/ is changed/i.test(conceptSrc),
+    "concept.mjs states in its own header that nothing under src/ or scripts/ is changed and that " +
+      "no Pine change is in scope",
+  );
+  // The 30-observation floor must not drift from the one ratio.mjs declares.
+  check(
+    /const MIN_OBSERVATIONS_FOR_INTERVAL = 30;/.test(conceptSrc),
+    "concept.mjs declares the 30-observation independent-sample floor itself, and smoke.mjs pins " +
+      "the literal — the same value ratio.mjs and band.mjs declare",
+  );
+
+  // ── Wiring: dispatched, without editing a literal other sections assert ──
+  check(
+    /import\s*\{ runConcept \} from "\.\/concept\.mjs"/.test(runSrcConcept) &&
+      runSrcConcept.includes('subcommand === "concept"'),
+    "run.mjs imports the concept runner and dispatches `concept`",
+  );
+  check(
+    runSrcConcept.includes('const CONCEPT_SUBCOMMANDS = ["concept"]'),
+    "concept is registered through its OWN list, and that list is unioned into the dispatch " +
+      "spread rather than replacing one - asserted once, as behaviour, in subcommand-registration",
+  );  check(
+    runSrcConcept.includes("const DISPATCHABLE = [...SUBCOMMANDS, ...EXTRA_SUBCOMMANDS, " +
+      "...LATER_SUBCOMMANDS, ...CONCEPT_SUBCOMMANDS]"),
+    "the dispatch spread carries the concept list too, so the guard reads ONE source of truth " +
+      "and the ratio section's DISPATCHABLE.includes(subcommand) literal is still there",
+  );  check(
+    /runConcept\(\{[\s\S]{0,140}json: process\.argv\.includes\("--json"\),[\s\S]{0,60}tf,?[\s\S]{0,30}\}\)/.test(
+      runSrcConcept,
+    ),
+    "concept dispatch passes --json AND the resolved timeframe, like every other data subcommand",
+  );
+}
+
+// ============================================================================
+// subcommand-registration — the ONE place the registration invariant is asserted
+// ----------------------------------------------------------------------------
+// Three contributors arrived after `ratio`, and each correctly refused to widen a list
+// that another section asserts verbatim. Three later contributors therefore left three
+// mutually incompatible literals behind (two `const LATER_SUBCOMMANDS` in one file is a
+// syntax error), so the assertions are merged HERE, once, and stated as behaviour:
+//
+//   the four registration lists are parsed out of run.mjs, then membership is checked
+//   for every real subcommand and non-membership for its typos.
+//
+// Substring matching never proved that. It proved that a phrase was present. This proves
+// that `equityy`, `bnd` and `conept` are in no list, so the guard refuses them, while
+// `equity`, `band` and `concept` are in one - which is what the assertions were for.
+// ============================================================================
+
+sec("subcommand-registration");
+{
+  const runSrcReg = readFileSync(new URL("./run.mjs", import.meta.url), "utf8");
+
+  // The two literals every earlier section asserts verbatim must stay untouched.
+  check(
+    runSrcReg.includes('SUBCOMMANDS = ["fetch", "validate", "baseline", "diagnose", "compare", "search"]'),
+    "the six-name SUBCOMMANDS literal is untouched by every subcommand added after it",
+  );
+  check(
+    runSrcReg.includes('EXTRA_SUBCOMMANDS = ["ratio"]'),
+    "EXTRA_SUBCOMMANDS is untouched too - ratio got its own route and nobody widened it",
+  );
+
+  // The merged invariant: every late subcommand has its own list, and every list is
+  // unioned into the one spread the guard reads.
+  check(
+    runSrcReg.includes("const DISPATCHABLE = [...SUBCOMMANDS, ...EXTRA_SUBCOMMANDS, " +
+      "...LATER_SUBCOMMANDS, ...CONCEPT_SUBCOMMANDS]"),
+    "DISPATCHABLE spreads all four registration lists, so the guard reads one source of truth",
+  );
+  check(
+    runSrcReg.includes("!(DISPATCHABLE.includes(subcommand))"),
+    "the guard is DISPATCHABLE alone - no per-subcommand escape hatch beside it that could " +
+      "widen what dispatches without appearing in a list",
+  );
+
+  // Behaviour: parse the lists, then check membership for real names and typos.
+  const lists = {};
+  for (const name of ["SUBCOMMANDS", "EXTRA_SUBCOMMANDS", "LATER_SUBCOMMANDS", "CONCEPT_SUBCOMMANDS"]) {
+    const m = runSrcReg.match(new RegExp(`const ${name} = \\[([^\\]]*)\\]`));
+    check(m !== null, `${name} is declared as a name list`);
+    lists[name] = m ? m[1].split(",").map((s) => s.trim().replace(/^\"|\"$/g, "")).filter(Boolean) : [];
+  }
+  const dispatchable = [...lists.SUBCOMMANDS, ...lists.EXTRA_SUBCOMMANDS, ...lists.LATER_SUBCOMMANDS, ...lists.CONCEPT_SUBCOMMANDS];
+  check(
+    lists.LATER_SUBCOMMANDS.includes("equity") && lists.LATER_SUBCOMMANDS.includes("band") &&
+      lists.CONCEPT_SUBCOMMANDS.includes("concept"),
+    "equity and band share the late list and concept has its own - each contributor got a " +
+      "list, and the earlier ones were not widened",
+  );
+  for (const real of ["equity", "band", "concept"]) {
+    check(
+      dispatchable.includes(real),
+      `"${real}" is dispatchable - so the typo checks below are not vacuous`,
+    );
+  }
+  for (const typo of ["equityy", "equi", "bnd", "bandd", "conept", "conceptz"]) {
+    check(
+      !dispatchable.includes(typo),
+      `the typo "${typo}" is in no registration list, so the guard refuses to dispatch it`,
+    );
+  }
+
+  // The guard is the only door: every dispatched subcommand is reached through it.
+  const dispatched = [...runSrcReg.matchAll(/subcommand === "([a-z]+)"/g)].map((m) => m[1]);
+  check(
+    dispatched.length > 0 && dispatched.every((s) => dispatchable.includes(s)),
+    "every dispatched branch (" + dispatched.join(", ") + ") is dispatchable - no branch is " +
+      "reachable by a name the guard would refuse",
+  );
+  check(
+    new Set(dispatchable).size === dispatchable.length,
+    "no name is registered twice across the four lists - a duplicate would mean one list was " +
+      "widened to admit a subcommand that already had a list of its own",
+  );
+}
+// ============================================================================
+// cli-wiring — run.mjs EXECUTED, not read
+// ----------------------------------------------------------------------------
+// Every other section observes this harness by importing modules, or by reading
+// run.mjs as TEXT. Both miss the same defect class: a run.mjs that no longer
+// parses still satisfies every substring assertion in this file, because a
+// broken file is still a string containing the phrases those assertions look for.
+// That is not hypothetical - an orphaned `});` left by a conflict resolution made
+// this suite report "TOTAL 2086 failed 0" while the CLI could not start at all.
+//
+// So this section SPAWNS the CLI. Both invocations exit before any dataset is
+// touched, which keeps this suite data-free; the only cost is a process spawn.
+// If this section passes, the file parses, the guard runs, and a near-miss of a
+// REAL subcommand name is refused rather than dispatched.
+// ============================================================================
+
+sec("cli-wiring");
+{
+  const repoRoot = fileURLToPath(new URL("../", import.meta.url));
+  const runCli = (args) =>
+    spawnSync(process.execPath, ["backtest/run.mjs", ...args], {
+      cwd: repoRoot,
+      encoding: "utf8",
+    });
+
+  const runSrcCli = readFileSync(new URL("./run.mjs", import.meta.url), "utf8");
+
+  // Every registration list run.mjs declares. CONCEPT_SUBCOMMANDS may not exist
+  // yet - a list that is absent registers nothing, which is exactly its meaning.
+  const lists = {};
+  for (const name of ["SUBCOMMANDS", "EXTRA_SUBCOMMANDS", "LATER_SUBCOMMANDS", "CONCEPT_SUBCOMMANDS"]) {
+    const m = runSrcCli.match(new RegExp(`const ${name} = \\[([^\\]]*)\\]`));
+    lists[name] = m ? m[1].split(",").map((s) => s.trim().replace(/^"|"$/g, "")).filter(Boolean) : [];
+  }
+  const registered = [
+    ...lists.SUBCOMMANDS,
+    ...lists.EXTRA_SUBCOMMANDS,
+    ...lists.LATER_SUBCOMMANDS,
+    ...lists.CONCEPT_SUBCOMMANDS,
+  ];
+  check(registered.length > 0, `run.mjs declares its registration lists (${registered.length} names)`);
+
+  // 1. The usage path: the file parses, prints usage, and names every
+  //    registered subcommand - the lists and the CLI cannot drift apart silently.
+  const usage = runCli([]);
+  check(
+    usage.status === 1 && usage.stdout.startsWith("usage: node backtest/run.mjs"),
+    `run.mjs with no arguments prints usage and exits 1 (status ${usage.status})`,
+  );
+  check(
+    !/SyntaxError/.test(usage.stderr ?? ""),
+    "run.mjs PARSES - no SyntaxError on stderr; a CLI that cannot start still passes every substring assertion in this file",
+  );
+  const missing = registered.filter((n) => !new RegExp(`^\\s+${n}\\s`, "m").test(usage.stdout));
+  check(
+    missing.length === 0,
+    `usage names every registered subcommand (${registered.join(", ")})` +
+      (missing.length ? ` - MISSING from usage: ${missing.join(", ")}` : ""),
+  );
+
+  // 2. A near-miss of a REAL name is refused by the guard, not dispatched.
+  //    The victim is whichever name arrived LAST, so this keeps testing the
+  //    newest registration rather than the oldest.
+  const late = [...lists.LATER_SUBCOMMANDS, ...lists.CONCEPT_SUBCOMMANDS];
+  const victim = late[late.length - 1] ?? registered[registered.length - 1];
+  const typo = `${victim}y`;
+  const refused = runCli([typo]);
+  check(
+    refused.status === 1 && refused.stdout.includes(`unknown subcommand: ${typo}`),
+    `the near-miss "${typo}" (of the registered "${victim}") is refused with an explicit message (status ${refused.status})`,
+  );
+  check(
+    !/SyntaxError/.test(refused.stderr ?? ""),
+    "the refusing path parses too - a typo must not be able to hide a syntax error",
+  );
+}
+
 const ORDER = [
+  "subcommand-registration",
   "session-markers",
   "liquidity-zones",
   "structure-break",
@@ -5728,6 +6584,9 @@ const ORDER = [
   "horizon-sweep",
   "route-a-strategy",
   "equity-curve",
+    "band-sweep",
+    "concept-matrix",
+  "cli-wiring",
 ];
 console.log("section            checks");
 for (const name of ORDER) {
