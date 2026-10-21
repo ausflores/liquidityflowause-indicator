@@ -15,7 +15,7 @@ node backtest/run.mjs validate                # gate de fidelidad vs docs/VALIDA
 node backtest/run.mjs                         # uso + lista completa de subcomandos
 ```
 
-- **No hay CI**: no existe `.github/`. El build y la suite son las únicas puertas de calidad — correlos vos antes de pushear.
+- **CI en GitHub Actions**: `.github/workflows/ci.yml` corre el build del indicador, el build de la estrategia Route A (incluye el check del pin `SHIPPED_INDICATOR_SHA256`) y la suite de 2.116 verificaciones en cada PR y en cada push a `main`. El gate de fidelidad (`run.mjs validate`) queda local: lee el dataset 5m, que no está en el repo.
 - `backtest/data/` está gitignored: un clone nuevo no tiene datos. `node backtest/run.mjs fetch` (toca la red) es el primer paso de cualquier medición; solo `fetch` usa la red o escribe, el resto de los subcomandos solo imprimen.
 - La suite no se puede correr parcial: `smoke.mjs` no parsea `process.argv`; son 2.116 verificaciones de una sola pasada.
 - Las cifras de `docs/` se midieron con `--timeframe 1h`; con el default **5m** el indicador prácticamente nunca dispara.
