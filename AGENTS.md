@@ -67,3 +67,14 @@ node backtest/run.mjs                         # usage + full subcommand list
 - [docs/WEIGHT-CALIBRATION.md](docs/WEIGHT-CALIBRATION.md) — calibration findings + appendices.
 - [docs/VALIDATION.md](docs/VALIDATION.md) — chart readings replayed by the `validate` gate.
 - [docs/ROUTE-A.md](docs/ROUTE-A.md) — strategy build and install procedure.
+
+## Ownership & review
+
+- Authored by an AI for AI readers; the human owner reviews and signs off on any change to this
+  file. Read it whole at least once before trusting individual lines — it doubles as the
+  shortest map of the project.
+- An AI-authored line can be wrong: an invented command, or a "source of truth" that is not one.
+  If something here fails or contradicts the code, fix THIS file first — until it is fixed,
+  every session repeats the same wrong instruction.
+- Every entry must be verified (commands executed, gotchas observed in this repo); unverifiable
+  lines are deleted, not softened. Keep it short — past ~100 lines it stops being read.
