@@ -1675,16 +1675,12 @@ liquidityflowause-indicator/
 │   └── changelog.md                  # Version history
 ├── src/
 │   ├── liquidityflowause.pine        # Main indicator (single file)
-│   ├── modules/
-│   │   ├── liquidity-zones.pine      # Liquidity zone detection
-│   │   ├── session-markers.pine      # Session detection & rendering
-│   │   ├── imbalance-detector.pine   # Imbalance & volume delta
-│   │   ├── structure-break.pine      # BoS/ChoCh detection
-│   │   └── signal-engine.pine        # Confluence & signal output
-│   └── lib/
-│       ├── colors.pine              # Color constants & theme
-│       ├── utils.pine               # Shared utility functions
-│       └── inputs.pine              # All input declarations
+│   └── modules/
+│       ├── liquidity-zones.pine      # Liquidity zone detection
+│       ├── session-markers.pine      # Session detection & rendering
+│       ├── imbalance-detector.pine   # Imbalance & volume delta
+│       ├── structure-break.pine      # BoS/ChoCh detection
+│       └── signal-engine.pine        # Confluence & signal output
 ├── tests/
 │   ├── backtest-results.md          # Documented backtest performance
 │   ├── signal-accuracy.md           # Signal hit-rate analysis
@@ -1740,22 +1736,50 @@ node scripts/build.mjs --check
 Output: `dist/liquidityflowause.pine` — paste into the TradingView Pine Editor.
 `dist/` is gitignored; the file is regenerated, never edited by hand.
 
-**Source order** (encoded in the `SOURCES` list in `scripts/build.mjs`):
+**Source order** (encoded in the `SOURCES` list in `scripts/assemble.mjs`):
 
 | # | Source | Role |
 |---|--------|------|
 | 1 | `src/liquidityflowause.pine` | `//@version=5` + `indicator()` + header |
-| 2 | `src/lib/colors.pine` | Color constants |
-| 3 | `src/lib/utils.pine` | Shared utility functions |
-| 4 | `src/lib/inputs.pine` | All input declarations |
-| 5 | `src/modules/liquidity-zones.pine` | Liquidity zone detection |
-| 6 | `src/modules/session-markers.pine` | Session detection & rendering |
-| 7 | `src/modules/imbalance-detector.pine` | Imbalance & volume delta |
-| 8 | `src/modules/structure-break.pine` | BoS/ChoCh detection |
-| 9 | `src/modules/signal-engine.pine` | Confluence & signal output |
+| 2 | `src/modules/liquidity-zones.pine` | Liquidity zone detection |
+| 3 | `src/modules/session-markers.pine` | Session detection & rendering |
+| 4 | `src/modules/imbalance-detector.pine` | Imbalance & volume delta |
+| 5 | `src/modules/structure-break.pine` | BoS/ChoCh detection |
+| 6 | `src/modules/signal-engine.pine` | Confluence & signal output |
 
-A source that does not exist yet is reported as a **warning**, not a failure, so
-the project builds incrementally instead of waiting for the final module.
+A source that is declared but **does not exist on disk is a build failure**,
+not a warning: the assembled script would otherwise ship without a module the
+list promised, and nothing downstream would report the omission. The same check
+runs in the other direction — every `*.pine` file under `src/` that is not one
+of the two main files must be declared, or it is a file the build never reads.
+The declared list and the source tree must agree in both directions.
+
+#### The three planned `src/lib/` files
+
+`src/lib/colors.pine`, `src/lib/utils.pine` and `src/lib/inputs.pine` were
+planned here and **never written**. They are deliberately **not declared** in
+`SOURCES`: a list that promises files that do not exist is a list the build
+cannot honour, and the build now refuses to honour one.
+
+The three roles they were meant to hold are filled elsewhere in the assembled
+script:
+
+| Planned file | Its role | Where that role lives today |
+|--------------|----------|-----------------------------|
+| `src/lib/colors.pine` | Colour constants | `color.*` calls inside the five modules |
+| `src/lib/utils.pine` | Shared utility functions | the `f_*` helpers inside the modules |
+| `src/lib/inputs.pine` | All input declarations | `input.*` declarations inside the modules |
+
+Verified in the assembled single file that ships: **33 `input.*` declarations,
+51 `color.*` references and 6 `f_*` helper functions** — every one of them
+coming from a declared module under `src/modules/`, never from an undeclared
+file. The concatenation root `src/liquidityflowause.pine` itself carries none
+of them: it is the version directive, the `indicator()` declaration, the file
+banner and the splice marker — and nothing else.
+
+If those three files are ever written, they must be declared in `SOURCES` in
+the same change, or the build fails on the undeclared-file check. That is the
+point of the check, not a nuisance to work around.
 
 ### 12.3.1 Structural Checks
 
@@ -1769,6 +1793,8 @@ the project builds incrementally instead of waiting for the final module.
 | Script declaration | Zero, or more than one, `indicator()` / `study()` |
 | Input legality | An `input.*` call precedes the script declaration |
 | Module independence | A module file declares its own `indicator()` / `study()` |
+| Declared module present | A module listed in `SOURCES` is not on disk |
+| Declared list completeness | A `*.pine` file under `src/` is neither declared nor a main file |
 
 Type errors, unknown builtins, and runtime behavior are **not** covered. Only the
 TradingView Pine Editor verifies those.

@@ -17,28 +17,42 @@
 // backtest/modules/, so the measurement harness still cannot reach the Pine.
 // ============================================================================
 
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { join, relative, sep } from "node:path";
 
 /**
  * ORDER IS SEMANTIC. Pine v5 has no forward declarations: every input, const
- * and function must be declared before its first use. The documented order in
- * docs/technical-spec.md section 12.3 lists modules BEFORE the main file,
- * which cannot compile — //@version=5 and the script declaration must come
- * first.
+ * and function must be declared before its first use. The main file therefore
+ * comes FIRST — //@version=5 and the script declaration must precede all
+ * code — and the modules follow in dependency order. The documented order in
+ * docs/technical-spec.md section 12.3 matches this list exactly.
  *
  * Both targets read this one list. There is deliberately no second list.
+ *
+ * The list names files that EXIST. A declared module that is missing from
+ * disk fails the build (see assertDeclaredModulesPresent), so this list
+ * cannot promise a file that was never written.
  */
 export const SOURCES = [
-  "src/lib/colors.pine",
-  "src/lib/utils.pine",
-  "src/lib/inputs.pine",
   "src/modules/liquidity-zones.pine",
   "src/modules/session-markers.pine",
   "src/modules/imbalance-detector.pine",
   "src/modules/structure-break.pine",
   "src/modules/signal-engine.pine",
+];
+
+/**
+ * The two main source files. They are assembled, not spliced, so they are
+ * NOT modules and must not appear in SOURCES.
+ *
+ * They are listed here rather than in build.mjs because the tree-completeness
+ * check needs them to tell a stray module apart from a main file, and there
+ * is exactly one place where that distinction should live.
+ */
+export const MAIN_SOURCE_FILES = [
+  "src/liquidityflowause.pine",
+  "src/liquidityflowause-strategy.pine",
 ];
 
 /** The comment marker both main files use to declare their splice point. */
@@ -87,9 +101,13 @@ export function stripBanner(source) {
  * Reads the modules and returns the parts, in SOURCES order.
  *
  * Callbacks rather than direct error reporting, so this file does not own the
- * reporting policy: build.mjs routes a missing module to a warning and a
- * module carrying its own script declaration to a build error, and the smoke
- * suite wants both outcomes without a process exit.
+ * reporting policy: build.mjs routes a missing module to a build error and a
+ * module carrying its own script declaration to a build error as well, and the
+ * smoke suite wants both outcomes without a process exit.
+ *
+ * `onMissing(rel)` fires when a declared module is not on disk. It is a build
+ * FAILURE, not a warning: the assembled artifact would silently ship without
+ * the module it was declared to contain, and nothing downstream would say so.
  *
  * `onForbidden(rel)` fires when a module declares indicator()/study()/strategy().
  * Both indicators and strategies are refused, because the invariant is the same
@@ -187,4 +205,115 @@ export function assertModuleParity(indicatorParts, strategyParts) {
   }
 
   return { ok: report.length > 0 && report.every((m) => m.identical), report, errors };
+}
+
+// ─── The Declared Module List ───────────────────────────────────────────────
+
+/**
+ * The message a missing declared module produces, in ONE wording.
+ *
+ * build.mjs reports the same finding from two places — the up-front check and
+ * the read hook — and the two must read identically, so a reader sees one
+ * problem rather than two, and so the report can be de-duplicated.
+ */
+export function missingModuleMessage(rel) {
+  return (
+    `declared module not found on disk: ${rel} — SOURCES promises a file that does ` +
+    "not exist. The build will not ship a module list it cannot read: the missing " +
+    "module would be silently absent from the assembled script."
+  );
+}
+
+/**
+ * The message an undeclared Pine source produces.
+ */
+export function undeclaredModuleMessage(rel) {
+  return (
+    `undeclared Pine source: ${rel} — every *.pine file under src/ must be listed ` +
+    "in SOURCES, or it is a file the build never reads. Declare it, or move it out " +
+    "of src/."
+  );
+}
+
+/**
+ * Checks that every DECLARED module exists on disk.
+ *
+ * This is the rule the build used to break: a declared module that was missing
+ * produced a warning and the build carried on, so the assembled artifact
+ * quietly lacked a module the manifest promised. Nothing downstream could see
+ * that, because the artifact looked complete.
+ *
+ * It returns its findings instead of throwing, and the CALLER decides what a
+ * failure means — build.mjs turns it into a build error; the smoke suite
+ * asserts that it reports one. A rule that can only be exercised against the
+ * real build cannot prove it is capable of failing, and a rule that has never
+ * been seen to fail is not known to work, only known not to have been
+ * triggered.
+ *
+ * @returns {{ok: boolean, missing: string[], errors: string[]}}
+ */
+export function assertDeclaredModulesPresent(root, sources = SOURCES) {
+  const missing = (sources ?? []).filter((rel) => !existsSync(join(root, rel)));
+
+  return {
+    ok: missing.length === 0,
+    missing,
+    errors: missing.map(missingModuleMessage),
+  };
+}
+
+/**
+ * Lists every *.pine file under src/, relative to root, in POSIX form.
+ */
+async function listPineSources(root) {
+  const srcDir = join(root, "src");
+  const found = [];
+
+  async function walk(dir) {
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return; // No src/ tree: nothing to be undeclared.
+    }
+
+    for (const entry of entries) {
+      const abs = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(abs);
+      } else if (entry.isFile() && entry.name.endsWith(".pine")) {
+        found.push(relative(root, abs).split(sep).join("/"));
+      }
+    }
+  }
+
+  await walk(srcDir);
+  return found.sort();
+}
+
+/**
+ * Checks the OTHER direction: every *.pine file under src/ that is not a main
+ * source file must be DECLARED.
+ *
+ * A file that exists but is not declared is a defect too — it is dead code
+ * that the build never reads, and it is how a stray file (the src/lib/ ones
+ * this repository planned and never wrote) sneaks in. The missing-module rule
+ * alone cannot catch it: a file nobody declared produces no missing-module
+ * error at all.
+ *
+ * @returns {Promise<{ok: boolean, undeclared: string[], found: string[], errors: string[]}>}
+ */
+export async function assertDeclaredModulesComplete(root, sources = SOURCES, options = {}) {
+  const mainFiles = options.mainFiles ?? MAIN_SOURCE_FILES;
+  const declared = new Set(sources ?? []);
+  const onDisk = await listPineSources(root);
+
+  const undeclared = onDisk.filter((rel) => !declared.has(rel) && !mainFiles.includes(rel));
+
+  return {
+    ok: undeclared.length === 0,
+    undeclared,
+    found: onDisk,
+    errors: undeclared.map(undeclaredModuleMessage),
+  };
 }

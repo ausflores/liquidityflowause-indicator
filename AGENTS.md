@@ -10,14 +10,14 @@ No hay `package.json`, ni scripts de npm, ni linter — ejecuta `node` a secas d
 node scripts/build.mjs                        # REQUERIDO PRIMERO: ensambla dist/ (gitignored) + verificaciones textuales
 node scripts/build.mjs --check                # solo valida, no escribe nada
 node scripts/build.mjs --strategy             # variante estrategia Route A (docs/ROUTE-A.md)
-node backtest/smoke.mjs                       # suite de regresión: 2.092 verificaciones, sin datos, sin red
+node backtest/smoke.mjs                       # suite de regresión: 2.116 verificaciones, sin datos, sin red
 node backtest/run.mjs validate                # gate de fidelidad vs docs/VALIDATION.md — SOLO 5m
 node backtest/run.mjs                         # uso + lista completa de subcomandos
 ```
 
 - **No hay CI**: no existe `.github/`. El build y la suite son las únicas puertas de calidad — correlos vos antes de pushear.
 - `backtest/data/` está gitignored: un clone nuevo no tiene datos. `node backtest/run.mjs fetch` (toca la red) es el primer paso de cualquier medición; solo `fetch` usa la red o escribe, el resto de los subcomandos solo imprimen.
-- La suite no se puede correr parcial: `smoke.mjs` no parsea `process.argv`; son 2.092 verificaciones de una sola pasada.
+- La suite no se puede correr parcial: `smoke.mjs` no parsea `process.argv`; son 2.116 verificaciones de una sola pasada.
 - Las cifras de `docs/` se midieron con `--timeframe 1h`; con el default **5m** el indicador prácticamente nunca dispara.
 
 ## Subcomandos de medición
@@ -65,15 +65,15 @@ node backtest/run.mjs                         # uso + lista completa de subcoman
   limpio y falló en runtime en la barra 0. Compilar no es funcionar.
 - El gate real es `run.mjs validate`: el 5m se lee ahí adentro. `backtest/gate.mjs` solo exporta
   `runGate()` y no hace nada por sí solo.
-- `src/lib/{colors,utils,inputs}.pine` están en `SOURCES` pero no existen: el build avisa y sigue. Si creás
-  `inputs.pine`, NO redeclarar `enableLongSignals`, `enableShortSignals`, `signalBullColor`, `signalBearColor`,
-  `labelSize` (quedan declarados y consumidos en ningún lado → duplicados en el splice).
+- `src/lib/{colors,utils,inputs}.pine` nunca se escribieron y NO están declarados en `SOURCES`: sus roles (colores,
+  helpers `f_*`, inputs) viven hoy dentro de `src/modules/*.pine`. El build FALLA si un módulo declarado no existe,
+  y también FALLA si hay un `*.pine` bajo `src/` que no esté declarado (mismo criterio en las dos direcciones).
 - Pine v5: `time()` por defecto devuelve `1234567` (dom-sáb), no `23456`.
 - Route A: nunca pegarlo sobre el indicador (el build rehúsa una `strategy()` con `indicator()`); los cinco
   módulos deben quedar byte-idénticos y el SHA del indicador es `1dd6f536…582ce2`. En `strategy.exit`,
   `profit=1.5`/`loss=0.8` serían TICKS, no %: el archivo usa `limit`/`stop` con niveles absolutos.
 - Los documentos tienen cifras viejas: `WEIGHT-CALIBRATION.md` dice 1.450/1.718/1.985 verificaciones (la real
-  se imprime en runtime: 2.092) y su `LATER_SUBCOMMANDS` quedó desactualizada. NO ajustes el código para calzar con el doc.
+  se imprime en runtime: 2.116) y su `LATER_SUBCOMMANDS` quedó desactualizada. NO ajustes el código para calzar con el doc.
 - La línea de pesos y exits está cerrada (§11): ambos modelos de entrada pierden (weighted −4,07%, binary −11,84%
   en 5 años 1h) y el gross ya es negativo antes de la comisión. No re-tunear target/stop, no cambiar pesos, no
   adoptar binary: es decisión del maintainer, no tuya. Toda cifra es cota superior (fills al cierre, sin

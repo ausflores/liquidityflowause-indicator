@@ -10,9 +10,11 @@
 // The modules in src/modules/ are a development reference; this script
 // flattens them into the file that gets pasted into the Pine Editor.
 //
-// Why Node and not the bash script in docs/technical-spec.md section 12.3:
-// that spec predates the target platform, and the ordering it shows is wrong
-// for Pine v5. See ORDER below.
+// Why Node and not a shell script: the build does more than concatenate. It
+// asserts that the indicator and the strategy embed byte-identical module
+// text, checks the plot budget, and validates the assembled text. The source
+// order is documented in docs/technical-spec.md section 12.3 and matches the
+// SOURCES list this script imports from scripts/assemble.mjs.
 //
 // Usage:
 //   node scripts/build.mjs                 # build + validate
@@ -40,7 +42,16 @@ import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, resolve, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { MARKER, SOURCES, assertModuleParity, readModuleParts } from "./assemble.mjs";
+import {
+  MARKER,
+  SOURCES,
+  MAIN_SOURCE_FILES,
+  assertModuleParity,
+  assertDeclaredModulesPresent,
+  assertDeclaredModulesComplete,
+  missingModuleMessage,
+  readModuleParts,
+} from "./assemble.mjs";
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -53,9 +64,12 @@ const MAIN = join(ROOT, "src", "liquidityflowause.pine");
 // re-declared here — so the five modules are read from the same bytes in the
 // same order, and there is no second list to drift.
 //
-// Missing SOURCES entries are reported as warnings, not failures: the three
-// src/lib/ files are planned and not written yet, and a build that hard-failed
-// on planned files would block every increment until the last module lands.
+// SOURCES names files that EXIST. A declared module that is missing from disk
+// is a BUILD FAILURE, not a warning: the assembled artifact would quietly ship
+// without a module the manifest promised, and nothing downstream would say so.
+// The three src/lib/ files this repository once planned (colors, utils,
+// inputs) were never written and are therefore NOT declared — a list that
+// promises files that do not exist is a list the build cannot honour.
 const DEFAULT_OUT = join(ROOT, "dist", "liquidityflowause.pine");
 const DIAGNOSTIC_OUT = join(ROOT, "dist", "liquidityflowause-diag.pine");
 const STRATEGY_OUT = join(ROOT, "dist", "liquidityflowause-strategy.pine");
@@ -199,9 +213,13 @@ async function build(mainPath, label) {
 
   // 2. Modules, in declared order. Read by scripts/assemble.mjs so the two
   //    targets cannot differ here even by accident.
+  //
+  //    A declared module that is not on disk FAILS the build. It used to be a
+  //    warning, which meant the assembled script silently shipped without a
+  //    module its manifest promised and nothing downstream could see it.
   parts.push(
     ...(await readModuleParts(ROOT, SOURCES, {
-      onMissing: (rel) => warn(`module not built yet, skipped: ${rel}`),
+      onMissing: (rel) => fail(missingModuleMessage(rel)),
       // Structural invariant: a module that declares its own script declaration
       // would produce a script with two of them. Indicators AND strategies are
       // both refused: the main file owns the single declaration either way.
@@ -220,6 +238,58 @@ async function build(mainPath, label) {
   }
 
   return parts;
+}
+
+// ─── Declared Module List ───────────────────────────────────────────────────
+
+/**
+ * Checks that the declared module list and the real source tree agree, in BOTH
+ * directions.
+ *
+ *   1. Every DECLARED module exists on disk. A declared module that is missing
+ *      fails the build: the assembled artifact would quietly ship without it.
+ *   2. Every *.pine file under src/ that is not a main source file is DECLARED.
+ *      A file nobody declared is dead code the build never reads, and it is
+ *      how a stray file sneaks in without any error appearing.
+ *
+ * Both rules live in scripts/assemble.mjs and return their findings; this
+ * wrapper is the build's half of the contract — findings become build errors
+ * here, and the smoke suite proves the rules can fail.
+ */
+async function checkDeclaredModuleList() {
+  const present = assertDeclaredModulesPresent(ROOT, SOURCES);
+  for (const e of present.errors) fail(e);
+
+  const complete = await assertDeclaredModulesComplete(ROOT, SOURCES, {
+    mainFiles: MAIN_SOURCE_FILES,
+  });
+  for (const e of complete.errors) fail(e);
+
+  return {
+    declared: SOURCES.length,
+    found: complete.found.length,
+    missing: present.missing,
+    undeclared: complete.undeclared,
+  };
+}
+
+/**
+ * Prints the declared-module check so "verified" is visible, not merely
+ * not-false — the same rule the parity report follows.
+ *
+ * The counts are printed as they are, so the line can never claim a clean
+ * result that did not happen.
+ */
+function reportDeclaredModules() {
+  console.log("");
+  console.log("// Declared module list — checked against the source tree in both directions");
+  console.log(
+    `  ${declaredModules.declared} declared, ${declaredModules.missing.length} missing, ` +
+      `${declaredModules.undeclared.length} undeclared`,
+  );
+  if (!declaredModules.missing.length && !declaredModules.undeclared.length) {
+    console.log("  every *.pine under src/ is either declared or a main file");
+  }
 }
 
 // ─── Module Parity (Route A) ─────────────────────────────────────────────────
@@ -1262,6 +1332,33 @@ let parts;
 let assembled;
 let lineCount;
 
+// The declared module list and the real source tree must agree, in both
+// directions, BEFORE anything is assembled. A build that reads a module list
+// it cannot honour is a build whose output nobody can reason about.
+//
+// The finding is routed to fail(), not to a warning: a missing declared module
+// would otherwise produce an artifact that silently lacks it.
+//
+// The build STOPS here rather than assembling a broken script and reporting
+// the consequences afterwards: a second error about a moved digest or a
+// mismatched parity would only bury the one finding that matters.
+const declaredModules = await checkDeclaredModuleList();
+
+if (errors.length) {
+  console.log(BANNER);
+  console.log(
+    strategyMode
+      ? "// LiquidityFlowAuse build — STRATEGY (Route A, spec D.4)"
+      : "// LiquidityFlowAuse build",
+  );
+  console.log(BANNER);
+  console.log("");
+  for (const e of [...new Set(errors)]) console.log(`  ERROR: ${e}`);
+  console.log("");
+  console.log("build failed — nothing written");
+  process.exit(1);
+}
+
 // The indicator build, assembled FIRST and ALWAYS — including under
 // --strategy. It is not the thing being written in strategy mode; it is the
 // REFERENCE the strategy's module text is compared against, and its digest is
@@ -1270,10 +1367,10 @@ let lineCount;
 // between one build and a file on disk that may be stale.
 const indicatorParts = await build(MAIN, MAIN_LABEL);
 
-// The strategy build assembles BOTH targets, so the "module not built yet"
-// notices are raised twice. They are deduplicated for the report rather than
-// printed as pairs: a repeated line reads as two problems where there is one,
-// and it trains a reader to skim past warnings.
+// A strategy build assembles BOTH targets, so a finding raised while reading
+// the modules is raised twice. They are deduplicated for the report rather
+// than printed as pairs: a repeated line reads as two problems where there is
+// one, and it trains a reader to skim past the message.
 const warningsOnce = [...new Set(warnings)];
 
 if (strategyMode) {
@@ -1338,6 +1435,7 @@ if (strategyMode) {
   console.log("");
   console.log(`  ${"TOTAL".padEnd(44)} ${String(lineCount).padStart(5)} lines`);
   console.log(`plot budget: ${plotCount} / ${PLOT_LIMIT}`);
+  reportDeclaredModules();
 
   // ── The parity result, printed in full ──
   //
@@ -1384,7 +1482,7 @@ if (strategyMode) {
 
   if (errors.length) {
     console.log("");
-    for (const e of errors) console.log(`  ERROR: ${e}`);
+    for (const e of [...new Set(errors)]) console.log(`  ERROR: ${e}`);
     console.log("");
     console.log("build failed — nothing written");
     process.exit(1);
@@ -1467,6 +1565,7 @@ for (const part of parts) {
 console.log("");
 console.log(`  ${"TOTAL".padEnd(44)} ${String(lineCount).padStart(5)} lines`);
 console.log(`plot budget: ${plotCount} / ${PLOT_LIMIT}`);
+reportDeclaredModules();
 
 if (warnings.length) {
   console.log("");
@@ -1475,7 +1574,7 @@ if (warnings.length) {
 
 if (errors.length) {
   console.log("");
-  for (const e of errors) console.log(`  ERROR: ${e}`);
+  for (const e of [...new Set(errors)]) console.log(`  ERROR: ${e}`);
   console.log("");
   console.log("build failed — nothing written");
   process.exit(1);
