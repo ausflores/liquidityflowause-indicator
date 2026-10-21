@@ -1,80 +1,81 @@
 # AGENTS.md
 
-Pine Script v5 TradingView indicator (crypto, 24/7) plus a zero-dependency Node measurement harness.
+Indicador para TradingView en Pine Script v5 (cripto, 24/7) más una herramienta de medición en Node sin dependencias.
 
-## Commands
+## Comandos
 
-There is no `package.json`, no npm scripts, and no linter — run bare `node` from the repo root.
+No hay `package.json`, ni scripts de npm, ni linter — ejecuta `node` a secas desde la raíz del repositorio.
 
 ```bash
-node scripts/build.mjs                        # REQUIRED FIRST: assembles dist/ (gitignored) + structural checks
-node scripts/build.mjs --check                # validate only, write nothing
-node scripts/build.mjs --strategy             # Route A strategy variant (docs/ROUTE-A.md)
-node backtest/smoke.mjs                       # regression suite: 2,092 checks, data-free, no network
-node backtest/run.mjs validate                # fidelity gate vs docs/VALIDATION.md — accepts 5m ONLY
-node backtest/run.mjs equity --timeframe 1h   # measurement run; subcommand list comes from bare usage below
-node backtest/run.mjs                         # usage + full subcommand list
+node scripts/build.mjs                        # REQUERIDO PRIMERO: ensambla dist/ (gitignored) + verificaciones estructurales
+node scripts/build.mjs --check                # solo valida, no escribe nada
+node scripts/build.mjs --strategy             # variante estrategia Route A (docs/ROUTE-A.md)
+node backtest/smoke.mjs                       # suite de regresión: 2,092 verificaciones, sin datos, sin red
+node backtest/run.mjs validate                # verificación de fidelidad vs docs/VALIDATION.md — acepta SOLO 5m
+node backtest/run.mjs equity --timeframe 1h   # ejecución de medición; la lista de subcomandos sale del uso con el comando vacío (abajo)
+node backtest/run.mjs                         # uso + lista completa de subcomandos
 ```
 
-- Figures quoted in `docs/` used `--timeframe 1h`; the default **5m** is where the indicator effectively never fires.
-- Only `fetch` touches the network or writes (`backtest/data/`, gitignored); measurement subcommands only print.
+- Las cifras citadas en `docs/` usaron `--timeframe 1h`; con el valor por defecto **5m** el indicador prácticamente nunca dispara.
+- Solo `fetch` toca la red o escribe datos (`backtest/data/`, gitignored); los subcomandos de medición solo imprimen por pantalla.
 
-## Architecture map
+## Mapa de arquitectura
 
-- `src/liquidityflowause.pine` — indicator main: the single `indicator()` declaration and the
-  `[CONCATENATION POINT]` marker where modules are spliced in; `src/liquidityflowause-strategy.pine`
-  is the Route A strategy main — same modules, no duplicated logic.
-- `src/modules/*.pine` — five modules (liquidity-zones, session-markers, imbalance-detector,
-  structure-break, signal-engine). A module declaring `indicator()`/`strategy()` fails the build.
-- `scripts/assemble.mjs` — the single `SOURCES` list (order is semantic: Pine v5 has no forward
-  declarations), banner stripping, and the indicator-vs-strategy module-parity assertion.
-- `scripts/build.mjs` — concatenates main + modules into `dist/`, enforces the 64-plot budget,
-  validates the strategy text, cross-checks exit levels against `backtest/modules/label.mjs`.
-- `backtest/modules/*.mjs` — JS ports of the five Pine modules; `backtest/run.mjs` is the
-  measurement CLI; `backtest/smoke.mjs` is the regression suite over all of it.
-- `odd/tasks/` — authoritative task records per feature; `openspec/`, `.atl/` — tooling state.
+- `src/liquidityflowause.pine` — archivo principal del indicador: la única declaración `indicator()` y la
+  marca `[CONCATENATION POINT]` donde se insertan los módulos; `src/liquidityflowause-strategy.pine`
+  es el archivo principal de la estrategia Route A — mismos módulos, sin lógica duplicada.
+- `src/modules/*.pine` — cinco módulos (liquidity-zones, session-markers, imbalance-detector,
+  structure-break, signal-engine). Un módulo que declare `indicator()`/`strategy()` hace fallar la compilación.
+- `scripts/assemble.mjs` — la única lista `SOURCES` (el orden es semántico: Pine v5 no tiene
+  forward declarations), la eliminación de encabezados y la aserción de paridad de módulos entre indicador y estrategia.
+- `scripts/build.mjs` — concatena principal + módulos en `dist/`, respeta el presupuesto de 64 plots,
+  valida el texto de la estrategia y verifica los niveles de salida contra `backtest/modules/label.mjs`.
+- `backtest/modules/*.mjs` — traducciones a JS de los cinco módulos Pine; `backtest/run.mjs` es la
+  CLI de medición; `backtest/smoke.mjs` es la suite de regresión de todo eso.
+- `odd/tasks/` — registros de tareas autoritativos por funcionalidad; `openspec/`, `.atl/` — estado de las herramientas.
 
-## Source of truth
+## Fuente de verdad
 
-- The Pine source in `src/` is canonical: when a doc and the shipped source disagree, the
-  source decides and the disagreement gets written down rather than smoothed over.
-- Behavior changes must land in BOTH `src/modules/*.pine` and its `backtest/modules/*.mjs` port;
-  `run.mjs validate` and `smoke.mjs` gate the sync.
-- Spec: `docs/technical-spec.md` (~2,000 lines). Calibration truth: `docs/WEIGHT-CALIBRATION.md`
-  — no weight change is recommended there and the measurement line is closed.
-- `dist/` is build output, never hand-edited. `build.mjs` pins `SHIPPED_INDICATOR_SHA256`: a
-  `--strategy` build fails if the shipped indicator moved, so update the pin deliberately.
+- El código Pine en `src/` es canónico: cuando un documento y el código publicado discrepan,
+  decide el código y la discrepancia se documenta en lugar de suavizarse.
+- Los cambios de comportamiento deben quedar en AMBOS lados: `src/modules/*.pine` y su traducción
+  `backtest/modules/*.mjs`; `run.mjs validate` y `smoke.mjs` verifican la sincronización.
+- Spec: `docs/technical-spec.md` (~2,000 líneas). Verdad de calibración: `docs/WEIGHT-CALIBRATION.md`
+  — allí no se recomienda ningún cambio de pesos y la línea de medición está cerrada.
+- `dist/` es salida de compilación, nunca se edita a mano. `build.mjs` fija el hash `SHIPPED_INDICATOR_SHA256`: una
+  compilación `--strategy` falla si el indicador publicado cambió, así que actualiza el pin de forma deliberada.
 
-## Gotchas (verified in this repo)
+## Advertencias clave (verificadas en este repositorio)
 
-- The smoke suite never reads `backtest/data/`: fixtures are hand-built synthetic candles
-  defined inside `smoke.mjs`. It therefore cannot catch a bar-shape mismatch against the real
-  dataset — that bug class already happened once and surfaced only on a live run (see README).
-- New `run.mjs` subcommands get their OWN registration list, unioned into `DISPATCHABLE`
-  (`SUBCOMMANDS`, `EXTRA_SUBCOMMANDS`, `LATER_SUBCOMMANDS`, `CONCEPT_SUBCOMMANDS`). Widening an
-  existing list is a defect; the suite asserts membership for real names and non-membership for typos.
-- `docs/technical-spec.md` section 12.3 shows a build order that predates Pine v5 and is wrong;
-  the authoritative module order is the `SOURCES` array in `scripts/assemble.mjs`.
-- `src/lib/colors.pine`, `utils.pine`, `inputs.pine` are listed in `SOURCES` but not written yet:
-  the build warns and skips them. Expected, not a failure.
-- CLI refusals are hard errors, not precedence rules: `--strategy` with `--diagnostic` is
-  rejected, and `validate` accepts only `--timeframe 5m` (its readings were captured on that grid).
+- La suite de smoke nunca lee `backtest/data/`: los datos de prueba (fixtures) son velas sintéticas
+  construidas a mano dentro de `smoke.mjs`. Por eso no puede detectar una discrepancia de forma de vela
+  contra el dataset real — ese tipo de bug ya ocurrió una vez y solo se vio en una ejecución en vivo (ver README).
+- Los subcomandos nuevos de `run.mjs` tienen su propia lista de registro, que se une a `DISPATCHABLE`
+  (`SUBCOMMANDS`, `EXTRA_SUBCOMMANDS`, `LATER_SUBCOMMANDS`, `CONCEPT_SUBCOMMANDS`). Ampliar una
+  lista existente es un defecto; la suite verifica que los nombres reales estén y que los erróneos no.
+- `docs/technical-spec.md` sección 12.3 muestra un orden de compilación anterior a Pine v5 y está
+  mal; el orden autoritativo de módulos es el arreglo `SOURCES` en `scripts/assemble.mjs`.
+- `src/lib/colors.pine`, `utils.pine`, `inputs.pine` están en `SOURCES` pero aún no existen:
+  la compilación avisa y los omite. Es lo esperado, no un fallo.
+- Los rechazos de la CLI son errores duros, no reglas de precedencia: `--strategy` con `--diagnostic` se
+  rechaza, y `validate` acepta solo `--timeframe 5m` (sus lecturas se capturaron en ese intervalo).
 
-## Docs
+## Documentos
 
-- [README.md](README.md) — what the indicator is (and is not), measured results, layout, limits.
-- [docs/technical-spec.md](docs/technical-spec.md) — behavior specification.
-- [docs/WEIGHT-CALIBRATION.md](docs/WEIGHT-CALIBRATION.md) — calibration findings + appendices.
-- [docs/VALIDATION.md](docs/VALIDATION.md) — chart readings replayed by the `validate` gate.
-- [docs/ROUTE-A.md](docs/ROUTE-A.md) — strategy build and install procedure.
+- [README.md](README.md) — qué es (y qué no es) el indicador, resultados medidos, estructura, límites.
+- [docs/technical-spec.md](docs/technical-spec.md) — especificación de comportamiento.
+- [docs/WEIGHT-CALIBRATION.md](docs/WEIGHT-CALIBRATION.md) — hallazgos de calibración + apéndices.
+- [docs/VALIDATION.md](docs/VALIDATION.md) — lecturas de gráfico que reproduce la verificación `validate`.
+- [docs/ROUTE-A.md](docs/ROUTE-A.md) — compilación de la estrategia y procedimiento de instalación.
 
-## Ownership & review
+## Propiedad y revisión
 
-- Authored by an AI for AI readers; the human owner reviews and signs off on any change to this
-  file. Read it whole at least once before trusting individual lines — it doubles as the
-  shortest map of the project.
-- An AI-authored line can be wrong: an invented command, or a "source of truth" that is not one.
-  If something here fails or contradicts the code, fix THIS file first — until it is fixed,
-  every session repeats the same wrong instruction.
-- Every entry must be verified (commands executed, gotchas observed in this repo); unverifiable
-  lines are deleted, not softened. Keep it short — past ~100 lines it stops being read.
+- Escrito por una IA para lectores IAs; el dueño humano revisa y aprueba cualquier cambio en este
+  archivo. Lee el archivo completo al menos una vez antes de confiar en líneas sueltas — además es
+  el mapa más corto del proyecto.
+- Una línea escrita por IA puede estar mal: un comando inventado, o una "fuente de verdad" que no lo es.
+  Si algo aquí falla o contradice el código, arregla PRIMERO este archivo — hasta que se arregle,
+  cada sesión repite la misma instrucción equivocada.
+- Cada entrada debe estar verificada (comandos ejecutados, advertencias observadas en este
+  repositorio); lo no verificable se elimina, no se suaviza. Mantenlo corto: pasadas ~100 líneas
+  deja de leerse.
