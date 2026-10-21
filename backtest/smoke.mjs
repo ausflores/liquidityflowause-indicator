@@ -117,7 +117,10 @@ import {
 // and it would pass exactly when the two disagreed most.
 import {
   SOURCES,
+  MAIN_SOURCE_FILES,
   assertModuleParity,
+  assertDeclaredModulesPresent,
+  assertDeclaredModulesComplete,
   readModuleParts,
 } from "../scripts/assemble.mjs";
 // fileURLToPath, not URL.pathname: on Windows the latter yields "/C:/Users/…",
@@ -126,7 +129,7 @@ import {
 // malformed path is precisely the kind of vacuous pass this section exists to
 // avoid, so the path is built the way node documents it.
 import { fileURLToPath } from "node:url";
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 import {
   baselineCandidate,
@@ -4496,7 +4499,7 @@ sec("route-a-strategy");
   const moduleParts = await readModuleParts(ROOT, SOURCES);
   check(
     moduleParts.length === 5,
-    `five modules assembled from SOURCES (got ${moduleParts.length}) — the three src/lib/ files are still planned and are warned about, not built`,
+    `five modules assembled from SOURCES (got ${moduleParts.length}) — the declared list names five files, and all five exist`,
   );
   check(
     moduleParts.every((p) => p.label.startsWith("src/modules/")),
@@ -5059,6 +5062,153 @@ sec("route-a-strategy");
   })) {
     check(re.test(routeADoc), `docs/ROUTE-A.md covers: ${claim}`);
   }
+}
+
+// -- 15k. the declared module list vs the real source tree --------------------
+//
+// Two directions, and BOTH must be provable:
+//
+//   1. every DECLARED module exists on disk. A declared module that is missing
+//      used to produce a warning, and the assembled artifact quietly shipped
+//      without it.
+//   2. every *.pine under src/ that is not a main source file is DECLARED. A
+//      file nobody declared is dead code the build never reads, and it is how a
+//      stray file sneaks in without any error appearing.
+//
+// The failing paths are DRIVEN WITH A DELIBERATELY absent module and a
+// DELIBERATELY shortened list, because a check that has only ever been
+// exercised against the real build cannot prove it is capable of failing.
+
+sec("declared-modules");
+{
+  const buildSrc = readFileSync(new URL("../scripts/build.mjs", import.meta.url), "utf8");
+  const specSrc = readFileSync(new URL("../docs/technical-spec.md", import.meta.url), "utf8");
+  const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+
+  // ── The pass path: the real list and the real tree agree ──
+  const present = assertDeclaredModulesPresent(ROOT, SOURCES);
+  check(
+    present.ok,
+    `every declared module exists on disk (missing: ${present.missing.length})`,
+  );
+  check(
+    present.errors.length === 0,
+    "the declared-modules-present check reports no error against the real list",
+  );
+
+  const complete = await assertDeclaredModulesComplete(ROOT, SOURCES);
+  check(
+    complete.ok,
+    `every *.pine under src/ is either declared or a main file (undeclared: ${complete.undeclared.length})`,
+  );
+  check(
+    complete.found.length === SOURCES.length + MAIN_SOURCE_FILES.length,
+    `the tree holds exactly the declared modules plus the two main files (found ${complete.found.length})`,
+  );
+  check(
+    MAIN_SOURCE_FILES.every((rel) => complete.found.includes(rel)),
+    "both main source files are found in the tree",
+  );
+  check(
+    !SOURCES.some((rel) => MAIN_SOURCE_FILES.includes(rel)),
+    "no main source file is declared as a module — the main files are assembled, not spliced",
+  );
+  check(
+    !SOURCES.some((rel) => rel.startsWith("src/lib/")),
+    "no planned-but-unwritten src/lib/ file is declared — the list names files that exist",
+  );
+
+  // ── The failing path: a DELIBERATELY missing declared module ──
+  const MISSING = "src/modules/does-not-exist.pine";
+  const absent = assertDeclaredModulesPresent(ROOT, [...SOURCES, MISSING]);
+  check(
+    absent.ok === false,
+    "a declared module that is NOT on disk is reported as a FAILURE, not a warning",
+  );
+  check(
+    absent.missing.includes(MISSING),
+    "the failure names the missing path",
+  );
+  check(
+    absent.errors.some((e) => e.includes(MISSING)),
+    "the failure MESSAGE names the missing path, so the reader knows what to restore",
+  );
+  check(
+    absent.errors.every((e) => /declared module not found on disk/.test(e)),
+    "the message says what is wrong (a declared module is not on disk), not merely that something failed",
+  );
+
+  // A root that does not exist is a failure too — never an empty pass.
+  const noRoot = assertDeclaredModulesPresent(join(ROOT, "no-such-directory"), SOURCES);
+  check(
+    noRoot.ok === false && noRoot.missing.length === SOURCES.length,
+    "a missing root fails EVERY declaration rather than passing vacuously",
+  );
+
+  // ── The failing path: a real file that is NOT declared ──
+  const shortened = await assertDeclaredModulesComplete(ROOT, SOURCES.slice(1));
+  check(
+    shortened.ok === false,
+    "a *.pine file that exists but is NOT declared is reported as a FAILURE",
+  );
+  check(
+    shortened.undeclared.includes(SOURCES[0]),
+    "the failure names the undeclared file, so a stray src/ file cannot hide",
+  );
+  check(
+    shortened.errors.some((e) => e.includes(SOURCES[0])),
+    "the failure MESSAGE names the undeclared file",
+  );
+
+  // The main files are never reported as undeclared: they are assembled, not
+  // spliced, so excluding them is correct rather than a loophole.
+  const withMains = await assertDeclaredModulesComplete(ROOT, [...SOURCES, ...MAIN_SOURCE_FILES]);
+  check(
+    withMains.ok,
+    "declaring the main files as well is still not an undeclared-file failure — they exist on disk",
+  );
+
+  // ── The build must act on both findings ──
+  check(
+    /onMissing:\s*\(rel\)\s*=>\s*fail\(/.test(buildSrc),
+    "build.mjs routes a missing declared module to fail() — the build fails rather than warning",
+  );
+  check(
+    /assertDeclaredModulesPresent/.test(buildSrc) && /assertDeclaredModulesComplete/.test(buildSrc),
+    "build.mjs runs BOTH directions of the declared-list check",
+  );
+  check(
+    !/module not built yet/.test(buildSrc),
+    "build.mjs no longer carries the 'module not built yet' warning",
+  );
+
+  // ── The spec must not promise files that do not exist ──
+  //
+  // The spec's source-order table is read back and compared to the build's own
+  // list. A table that drifts from SOURCES is a table that lies, and a
+  // documented order that is not the compiled order is a lie with a build
+  // consequence.
+  const specOrder = [...specSrc.matchAll(/^\|\s*\d+\s*\|\s*`([^`]+)`/gm)].map((m) => m[1]);
+  check(
+    specOrder.length === SOURCES.length + 1 && specOrder[0] === MAIN_SOURCE_FILES[0],
+    `the spec's source-order table lists the main file plus the ${SOURCES.length} declared modules (got ${specOrder.length} rows)`,
+  );
+  check(
+    JSON.stringify(specOrder.slice(1)) === JSON.stringify(SOURCES),
+    "the spec's documented module order is the build's SOURCES order, verbatim",
+  );
+  check(
+    !specOrder.some((p) => p.startsWith("src/lib/")),
+    "the spec's source-order table promises no src/lib/ file",
+  );
+  check(
+    /never written|were planned|planned and never/i.test(specSrc),
+    "the spec records that the planned src/lib/ files were never written",
+  );
+  check(
+    /declared but \*\*does not exist on disk is a build failure\*\*/i.test(specSrc),
+    "the spec states that a missing declared module FAILS the build, not warns",
+  );
 }
 
 // ─── Report ─────────────────────────────────────────────────────────────────
@@ -6583,6 +6733,7 @@ const ORDER = [
   "exit-ratio",
   "horizon-sweep",
   "route-a-strategy",
+  "declared-modules",
   "equity-curve",
     "band-sweep",
     "concept-matrix",
