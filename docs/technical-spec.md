@@ -1662,42 +1662,53 @@ if longSignal
 ```
 liquidityflowause-indicator/
 ├── .github/
-│   ├── ISSUE_TEMPLATE/
-│   │   ├── bug_report.yml
-│   │   └── feature_request.yml
-│   ├── workflows/
-│   │   └── pine-validator.yml        # CI: validate Pine Script syntax
-│   └── PULL_REQUEST_TEMPLATE.md
+│   └── workflows/
+│       └── ci.yml                      # CI: build, Route A SHA pin, regression suite
 ├── docs/
-│   ├── technical-spec.md             # This document
-│   ├── user-guide.md                 # How to use the indicator
-│   ├── signal-examples.md            # Annotated chart examples
-│   └── changelog.md                  # Version history
+│   ├── technical-spec.md               # This document
+│   ├── VALIDATION.md                   # Chart readings replayed by the validate gate
+│   ├── WEIGHT-CALIBRATION.md           # Calibration findings + appendices (section 11 = closed line)
+│   ├── ROUTE-A.md                      # Route A strategy: build and install
+│   └── technical-spec.backup.md        # Pre-calibration copy of this document
 ├── src/
-│   ├── liquidityflowause.pine        # Main indicator (single file)
+│   ├── liquidityflowause.pine          # Main indicator (single file)
+│   ├── liquidityflowause-strategy.pine # Route A strategy main (same modules)
 │   └── modules/
-│       ├── liquidity-zones.pine      # Liquidity zone detection
-│       ├── session-markers.pine      # Session detection & rendering
-│       ├── imbalance-detector.pine   # Imbalance & volume delta
-│       ├── structure-break.pine      # BoS/ChoCh detection
-│       └── signal-engine.pine        # Confluence & signal output
-├── tests/
-│   ├── backtest-results.md          # Documented backtest performance
-│   ├── signal-accuracy.md           # Signal hit-rate analysis
-│   └── test-cases/                  # Specific chart test scenarios
-│       ├── btc-2024-bull-run.md
-│       ├── eth-range-bound.md
-│       └── low-cap-altcoin.md
+│       ├── liquidity-zones.pine        # Liquidity zone detection
+│       ├── session-markers.pine        # Session detection & rendering
+│       ├── imbalance-detector.pine     # Imbalance & volume delta
+│       ├── structure-break.pine        # BoS/ChoCh detection
+│       └── signal-engine.pine          # Confluence & signal output
 ├── scripts/
-│   ├── build.mjs                     # Concatenate modules + structural checks
-│   ├── validate-pine.py              # Pine Script syntax checker
-│   └── export-data.py                # Export indicator data for testing
-├── dist/                             # Build output (gitignored)
-├── LICENSE                           # MIT License
-├── README.md                         # Project overview & quick start
-├── CHANGELOG.md                      # Version history
-└── CONTRIBUTING.md                   # How to contribute
+│   ├── assemble.mjs                    # The single SOURCES list + module assembly
+│   └── build.mjs                       # Concatenate modules + structural checks
+├── backtest/
+│   ├── run.mjs                         # Measurement CLI: fetch, validate, baseline, diagnose, compare, ratio, band, concept, equity
+│   ├── smoke.mjs                       # Regression suite: 2,116 checks, no data, no network
+│   ├── *.mjs                           # One module per measurement (band, baseline, compare, concept, equity, gate, ratio, tier-diagnostic, timeframes)
+│   ├── modules/                        # JS ports of the five Pine modules
+│   └── data/                           # Fetched OHLCV (gitignored)
+├── odd/tasks/                          # Task records per feature
+├── openspec/                           # Spec tooling state
+├── dist/                               # Build output (gitignored)
+├── .gitignore
+├── AGENTS.md                           # Instructions for AI agents
+├── LICENSE                             # MIT License
+└── README.md                           # Project overview & quick start
 ```
+
+The following were planned in this layout and **were never written**: the
+GitHub issue and pull-request templates, `docs/user-guide.md`,
+`docs/signal-examples.md`, `docs/changelog.md`, the whole `tests/` tree,
+`scripts/validate-pine.py`, `scripts/export-data.py`, `CHANGELOG.md` and
+`CONTRIBUTING.md`. They are recorded here so the plan is not lost, not because
+the repository contains them.
+
+`pine-validator.yml` was to be a CI job that validates Pine syntax. The CI that
+exists (`ci.yml`) gates the build, the shipped-SHA pin and the regression suite
+instead: this repository has no Pine compiler, and the build's own checks are
+textual - only the TradingView Pine Editor verifies Pine semantics, builtins and
+runtime behaviour.
 
 ### 12.2 Single-File vs. Modular
 
