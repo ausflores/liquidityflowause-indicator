@@ -1,0 +1,46 @@
+# CI for liquidityflowause-indicator.
+# Gates: the indicator build, the Route A strategy build (which also checks the
+# SHIPPED_INDICATOR_SHA256 pin), and the 2,116-check regression suite.
+# The fidelity gate (`node backtest/run.mjs validate`) is intentionally NOT here:
+# it reads the gitignored 5m dataset from backtest/data/, so it would need a
+# network fetch on every run. Keep it as a local step.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # Must run first: it writes dist/liquidityflowause.pine, the file the
+      # SHA pin check in the next step compares against.
+      - name: Build indicator
+        run: node scripts/build.mjs
+
+      - name: Build Route A strategy and verify shipped SHA
+        run: node scripts/build.mjs --strategy
+
+      - name: Run regression suite
+        run: node backtest/smoke.mjs
