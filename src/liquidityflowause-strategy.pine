@@ -150,9 +150,16 @@ strategy("LiquidityFlowAuse Strategy", overlay=true,
 // ----------------------------------------------------------------------------
 // Pine Script v5 titles are const strings, so the runtime mode cannot be written
 // into the strategy's name. The active configuration is printed in two places
-// instead: the MODE table on the chart (top right), and the Strategy Tester's
+// instead: the MODE table on the chart (bottom right), and the Strategy Tester's
 // Overview tab, which lists the live input values including "Entry Model".
 // Check one of the two before reading any number off the tester.
+//
+// The mode table sits at bottom_right BECAUSE the module list is shared with
+// the indicator: the Dashboard module (spliced in below) draws its own state
+// table at top right, and Pine keeps ONE table per position — a later
+// table.new() call replaces the earlier one at the same position (Pine docs,
+// "Tables"). If both tables sat at top right, whichever ran later would
+// replace the other silently. Distinct positions keep both visible.
 // ============================================================================
 
 // ─── Module: Session Markers ────────────────────────────────────────────────
@@ -296,8 +303,13 @@ if inPosition
 // Pine v5 strategy titles are const, so the runtime mode cannot appear in the
 // script's name. It is printed here instead. See the header section "WHERE THE
 // ACTIVE CONFIGURATION IS SHOWN".
+//
+// POSITION: bottom_right, NOT top_right. The Dashboard module spliced in above
+// renders its state table at top right, and Pine keeps ONE table per position
+// — a later table.new() call at the same position REPLACES the earlier one,
+// silently. bottom_right keeps both tables visible.
 
-var table modeTable = table.new(position.top_right, 2, 6, bgcolor = color.new(color.black, 20), frame_color = color.gray)
+var table modeTable = table.new(position.bottom_right, 2, 6, bgcolor = color.new(color.black, 20), frame_color = color.gray)
 
 if barstate.islast
     table.cell(modeTable, 0, 0, "LiquidityFlowAuse", text_color = color.white, text_size = size.small)

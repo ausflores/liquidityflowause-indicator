@@ -49,11 +49,11 @@ exists, and why it is a separate artifact rather than a mode of the indicator.
 ## What this file is not
 
 - **Not the indicator.** Different artifact, different build path. The indicator
-  build is byte-identical to what it was before this work, and the strategy build
-  asserts it (`dist/liquidityflowause.pine`,
-  SHA256 `1dd6f536…582ce2`).
+  build is pinned (`dist/liquidityflowause.pine`,
+  SHA256 `af2c2e3b…0d6866`) and the strategy build asserts the shared module
+  text is byte-identical.
 - **Not a second implementation of the model.** Every line of signal logic comes
-  from `src/modules/*.pine`, the same five files the indicator is built from. The
+  from `src/modules/*.pine`, the same six files the indicator is built from. The
   build **asserts** the embedded module text is byte-identical between the two
   builds and fails if it is not. That assertion is the guarantee that the strategy
   trades what the indicator signals.
@@ -184,9 +184,9 @@ Two honest warnings about those costs:
 
 | Check | Where |
 |---|---|
-| Module text byte-identical between the indicator build and the strategy build (5/5, ~68 KB) | `scripts/build.mjs --strategy`, asserted not warned |
+| Module text byte-identical between the indicator build and the strategy build (6/6, ~82 KB) | `scripts/build.mjs --strategy`, asserted not warned |
 | The parity assertion **can fail** — driven with a divergent pair | `node backtest/smoke.mjs`, section `route-a-strategy` |
-| `dist/liquidityflowause.pine` SHA256 unchanged | `1dd6f536…582ce2`, checked on every strategy build |
+| `dist/liquidityflowause.pine` SHA256 unchanged | `af2c2e3b…0d6866`, checked on every strategy build |
 | Exactly one `strategy()`; no `indicator()`/`study()` anywhere | build + smoke |
 | `//@version=5` first; two `strategy.entry` calls; two `strategy.exit` calls | build + smoke |
 | Every declared input is read | build + smoke |

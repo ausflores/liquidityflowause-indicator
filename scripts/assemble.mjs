@@ -40,6 +40,11 @@ export const SOURCES = [
   "src/modules/imbalance-detector.pine",
   "src/modules/structure-break.pine",
   "src/modules/signal-engine.pine",
+  // The Dashboard is a PRESENTATION module: it reads the other five modules'
+  // exports and draws one table. Pine v5 has no forward declarations, so it
+  // MUST stay last — moving it earlier is a duplicate-identifier compile
+  // error on the names it reads, and it re-derives none of them.
+  "src/modules/dashboard.pine",
 ];
 
 /**

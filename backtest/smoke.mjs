@@ -4498,8 +4498,8 @@ sec("route-a-strategy");
   const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
   const moduleParts = await readModuleParts(ROOT, SOURCES);
   check(
-    moduleParts.length === 5,
-    `five modules assembled from SOURCES (got ${moduleParts.length}) — the declared list names five files, and all five exist`,
+    moduleParts.length === 6,
+    `six modules assembled from SOURCES (got ${moduleParts.length}) — the declared list names six files, and all six exist`,
   );
   check(
     moduleParts.every((p) => p.label.startsWith("src/modules/")),
@@ -4511,12 +4511,21 @@ sec("route-a-strategy");
   // therefore meaningful: it is not a tautology over a re-derived list.
   const realParity = assertModuleParity(moduleParts, moduleParts);
   check(
-    realParity.ok && realParity.report.length === 5,
-    `the real module set is byte-identical across targets (${realParity.report.filter((r) => r.identical).length}/5)`,
+    realParity.ok && realParity.report.length === 6,
+    `the real module set is byte-identical across targets (${realParity.report.filter((r) => r.identical).length}/6)`,
   );
   check(
     realParity.report.reduce((sum, r) => sum + r.bytes, 0) > 60000,
     "the compared module text is over 60 KB in total — the comparison is of real content, not a stub",
+  );
+  // The Dashboard is a module too: it must be IN the parity comparison, not
+  // merely tolerated by it. Without this, a module added to one target's list
+  // but not the other would still be compared against whatever sits at its
+  // position — by name, so a silent reordering cannot hide here either.
+  check(
+    realParity.report.some((r) => r.label === "src/modules/dashboard.pine") &&
+      moduleParts[moduleParts.length - 1].label === "src/modules/dashboard.pine",
+    "the Dashboard module is spliced LAST in SOURCES — it reads the other five modules' exports, and Pine has no forward declarations",
   );
 
   // Every module's text must be a strict, non-trivial substring of what the
@@ -4784,9 +4793,20 @@ sec("route-a-strategy");
   }
 
   // The mode must be VISIBLE, since the reader cannot see a const title change.
+  // Position is bottom_right BECAUSE the Dashboard module (spliced in from the
+  // shared module list) draws its own table at top right, and Pine keeps ONE
+  // table per position — a later table.new() call at the same position
+  // REPLACES the earlier one. The file must SAY so, or a future reader will
+  // "fix" the position back and silently drop one of the two tables.
   check(
-    /table\.new\(\s*position\.top_right/.test(strategyCode),
+    /table\.new\(\s*position\.bottom_right/.test(strategyCode),
     "the active configuration is printed in a chart table — Pine v5 titles are const, so the mode cannot be in the name",
+  );
+  check(
+    !/table\.new\(\s*position\.top_right/.test(strategyCode) &&
+      /Dashboard module/.test(strategySrc) &&
+      /ONE table per position/.test(strategySrc),
+    "the mode table moved OFF top_right and the file documents why: the Dashboard module's table lives there, and Pine keeps one table per position",
   );
   check(
     /table\.cell\(\s*modeTable,\s*1,\s*1,\s*entryModel/.test(strategyCode),
@@ -4950,7 +4970,11 @@ sec("route-a-strategy");
     "strategy.entry", "strategy.exit", "strategy.long", "strategy.short",
     "strategy.percent_of_equity", "strategy.commission.percent",
     "strategy.position_size", "strategy.position_avg_price",
-    "position.top_right", "position.size", "barstate.islast",
+    // position.bottom_right joins position.top_right: the mode table moved
+    // there so the Dashboard module's table (spliced in from the shared
+    // module list) stays visible at top right. Pine keeps ONE table per
+    // position — a later table.new() call replaces the earlier one.
+    "position.top_right", "position.bottom_right", "position.size", "barstate.islast",
   ]);
   const badMembers = [];
   // strategy.position_size, position.top_right, barstate.islast —
@@ -5012,7 +5036,7 @@ sec("route-a-strategy");
     "build.mjs never writes either main SOURCE file — only assembled output",
   );
   check(
-    /SHIPPED_INDICATOR_SHA256\s*=\s*\n?\s*"1dd6f536ae4f50c2f669e9c1a2b34a0fb97a7d51428905b9e18f8616d1582ce2"/i.test(buildSrc),
+    /SHIPPED_INDICATOR_SHA256\s*=\s*\n?\s*"af2c2e3b4689826949259216a9ad663eb47d5281bc8fc7227c1b071b5a0d6866"/i.test(buildSrc),
     "build.mjs pins the shipped indicator's SHA256 as a literal, so a moved artifact cannot pass silently",
   );
   check(
@@ -5208,6 +5232,166 @@ sec("declared-modules");
   check(
     /declared but \*\*does not exist on disk is a build failure\*\*/i.test(specSrc),
     "the spec states that a missing declared module FAILS the build, not warns",
+  );
+}
+
+// -- dashboard-module -----------------------------------------------------------
+//
+// T1 of the visual-polish feature (odd/tasks/visual-polish-p0-p1.md). The
+// Dashboard is a PRESENTATION module: one Pine table, zero new logic. The
+// checks below are the contract that keeps it that way:
+//
+//   * it is declared and spliced LAST in SOURCES — it reads the other five
+//     modules' exports, and Pine v5 has no forward declarations;
+//   * it owns ONE table, bounded 2 columns x 7 rows, created lazily and
+//     written only under `showDashboard and barstate.islast`;
+//   * its inputs live in the "Dashboard" group and are actually read;
+//   * it REUSES the sibling modules' exports — no session detection, no ta.*
+//     series of its own, no arrays, no drawing primitives, zero plot-family
+//     calls — so it cannot drift into becoming a second measuring brain;
+//   * its ATR distances anchor on atrH4 (the corrected cull anchor), never on
+//     the entry timeframe's atrChart. That anchor was a real bug once; a
+//     dashboard showing distances in the wrong unit would quietly undo the fix.
+
+sec("dashboard-module");
+{
+  const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  const dashLabel = "src/modules/dashboard.pine";
+  const dashSrc = readFileSync(new URL("../src/modules/dashboard.pine", import.meta.url), "utf8");
+
+  // The embedded text is the banner-stripped module — exactly what the build
+  // splices into BOTH targets. Comments are stripped for every shape check,
+  // so prose about the contract cannot satisfy it.
+  const dashParts = await readModuleParts(ROOT, SOURCES);
+  const dashPart = dashParts.find((p) => p.label === dashLabel);
+  check(
+    dashPart !== undefined && dashPart.text.length > 1000,
+    "dashboard.pine exists, is declared in SOURCES, and its banner-stripped text is what the build splices",
+  );
+  check(
+    SOURCES[SOURCES.length - 1] === dashLabel,
+    "dashboard.pine is the LAST entry in SOURCES — it reads the other five modules' exports",
+  );
+  check(
+    !/^\s*(indicator|study|strategy)\s*\(/m.test(dashSrc),
+    "the Dashboard declares no script of its own",
+  );
+
+  const dashCode = stripPineLineComments(dashPart?.text ?? dashSrc);
+
+  // ── Table budget ──
+  const dashTables = (dashCode.match(/(?<![\w.])table\.new\s*\(/g) ?? []).length;
+  check(
+    dashTables === 1,
+    `exactly ONE table.new in the Dashboard (got ${dashTables}) — Pine keeps one table per POSITION, so a second table here could silently replace the strategy's mode table`,
+  );
+  check(
+    /table\.new\([\s\S]{0,80}?,\s*2,\s*7\s*,/.test(dashCode),
+    "the Dashboard's table is declared 2 columns x 7 rows — bounded, no dynamic growth",
+  );
+  const dashCells = (dashCode.match(/(?<![\w.])table\.cell\s*\(/g) ?? []).length;
+  check(
+    dashCells === 14,
+    `the Dashboard writes exactly 14 cells for its 2x7 table (got ${dashCells}) — adding a row means touching this bound, not silently growing it`,
+  );
+  check(
+    /if showDashboard and barstate\.islast/.test(dashCode),
+    "every cell is written under `if showDashboard and barstate.islast` — no work on historical bars, and the toggle actually gates the table",
+  );
+  check(
+    /if na\(dashTable\)/.test(dashCode),
+    "the table is created lazily once, not re-created per bar",
+  );
+
+  // ── Input contract ──
+  check(
+    /showDashboard\s*=\s*input\.bool\(\s*true\s*,\s*"Show Dashboard"/.test(dashCode) &&
+      /group="Dashboard"/.test(dashCode),
+    "Show Dashboard defaults ON, in the Dashboard input group",
+  );
+  check(
+    /dashPosition\s*=\s*input\.string\(\s*"Top Right"/.test(dashCode) &&
+      /options=\["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Right", "Middle Left"\]/.test(dashCode),
+    "the position input defaults to Top Right and offers the six chart positions",
+  );
+  for (const name of ["showDashboard", "dashPosition"]) {
+    const uses = (dashCode.match(new RegExp(`\\b${name}\\b`, "g")) ?? []).length;
+    check(
+      uses >= 2,
+      `Dashboard input "${name}" is read beyond its declaration (${uses - 1} read site(s)) — a control that gates nothing must not appear in the input panel`,
+    );
+  }
+
+  // ── Drawing and plot budget ──
+  const dashPlots = (dashCode.match(/(?<![\w.])(plot|plotshape|plotchar|plotcandle|plotbar|plotarrow|hline|bgcolor|linefill|alertcondition)\s*\(/g) ?? []).length;
+  check(
+    dashPlots === 0,
+    `the Dashboard spends ZERO plot-family calls (got ${dashPlots}) — tables sit outside the 64-plot budget and the module must keep it that way`,
+  );
+  check(
+    !/(?<![\w.])(box|line|label)\.new\s*\(/.test(dashCode),
+    "the Dashboard draws no boxes, lines or labels — zones and markers stay the sibling modules' job",
+  );
+
+  // ── No new logic ──
+  const dashTa = (dashCode.match(/(?<![\w.])ta\.\w+/g) ?? []).length;
+  check(
+    dashTa === 0,
+    `the Dashboard computes NO ta.* series (got ${dashTa}) — it formats module exports, it does not measure`,
+  );
+  check(
+    !/(?<![\w.])array\.\w+\s*\(/.test(dashCode),
+    "the Dashboard holds NO arrays — counts arrive as module outputs, so every array walk stays in the module that owns it",
+  );
+  check(
+    !/(?<![\w.])time\s*\(/.test(dashCode) && !/input\.session/.test(dashCode),
+    "the Dashboard re-detects NO sessions — membership comes from Session Markers' flags, not a second time() call",
+  );
+  check(
+    /\binAsia\b/.test(dashCode) && /\binLondon\b/.test(dashCode) &&
+      /\binNY\b/.test(dashCode) && /\binOverlap\b/.test(dashCode),
+    "the Dashboard reads the session flags it shows — the reuse is wired, not aspirational",
+  );
+
+  // ── The atrH4 anchor ──
+  check(
+    /\batrH4\b/.test(dashCode),
+    "the Dashboard's ATR distances anchor on atrH4 — the same unit as the cull threshold",
+  );
+  check(
+    !/\batrChart\b/.test(dashCode),
+    "the Dashboard never anchors on atrChart — 15 x entry-timeframe ATR is a different quantity from 15 x 4H ATR, and that confusion already cost the D1 tiers once",
+  );
+
+  // ── The dashboard interface: exports exist upstream, and are read ──
+  const dashSiblings = dashParts.filter((p) => p.label !== dashLabel).map((p) => p.text).join("\n");
+  const DASH_INTERFACE = [
+    "liveZoneCount",
+    "nearestZoneAbovePrice",
+    "nearestZoneAboveTier",
+    "nearestZoneBelowPrice",
+    "nearestZoneBelowTier",
+    "imbalanceLiveCount",
+    "lastBreakSide",
+    "lastBreakBar",
+  ];
+  for (const name of DASH_INTERFACE) {
+    check(
+      new RegExp(`(?:var\\s+)?(?:int|float)\\s+${name}\\b`).test(dashSiblings),
+      `a sibling module exports "${name}" — the Dashboard's data has exactly one owner`,
+    );
+    check(
+      new RegExp(`\\b${name}\\b`).test(dashCode),
+      `the Dashboard reads "${name}" — the interface is wired, not aspirational`,
+    );
+  }
+  check(
+    /\bmarketStructure\b/.test(dashSiblings) && /\bmarketStructure\b/.test(dashCode),
+    "the health line reads Structure Break's marketStructure, not a re-derived copy",
+  );
+  check(
+    /\blastSignalBar\b/.test(dashSiblings) && /\blastSignalBar\b/.test(dashCode),
+    "the health line reads the Signal Engine's lastSignalBar, not a second stamp",
   );
 }
 
@@ -6734,6 +6918,7 @@ const ORDER = [
   "horizon-sweep",
   "route-a-strategy",
   "declared-modules",
+  "dashboard-module",
   "equity-curve",
     "band-sweep",
     "concept-matrix",

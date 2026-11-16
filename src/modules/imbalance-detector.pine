@@ -309,3 +309,15 @@ if array.size(imbalances) > 0 and not na(atrChart)
                 nearImbalanceLong := true
             else
                 nearImbalanceShort := true
+
+// ─── Dashboard Interface (visual, no signal semantics) ───────────────────────
+//
+// The live-gap count the Dashboard module shows. Recomputed AFTER the
+// retirement block above has run, so it never counts a gap the module has
+// already retired — the table and the array cannot disagree. Exposed here
+// rather than letting the dashboard call array.size(imbalances) itself, for
+// the same reason as the Liquidity Zones interface block: every read of the
+// array stays inside the module that owns it. Nothing here feeds the Signal
+// Engine or draws anything.
+
+int imbalanceLiveCount = array.size(imbalances)
