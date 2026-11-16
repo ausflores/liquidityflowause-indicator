@@ -22,6 +22,7 @@
 10. [Alert System](#10-alert-system)
 11. [Limitations & Risk Disclaimer](#11-limitations--risk-disclaimer)
 12. [File Structure](#12-file-structure)
+13. [Module: Dashboard (visual)](#13-module-dashboard-visual)
 
 ---
 
@@ -448,6 +449,15 @@ What this module exports to the Signal Engine:
 | `nearD1LiquidityLong` / `Short` | bool | That proximity is to a D1 (tier 1) zone, **per side** |
 | `nearH4LiquidityLong` / `Short` | bool | That proximity is to a 4H (tier 2) zone, **per side** |
 | `nearH1LiquidityLong` / `Short` | bool | That proximity is to a 1H (tier 3) zone, **per side** |
+| `liveZoneCount` | int | Zones held after the cull rules ran this bar — Dashboard display output |
+| `nearestZoneAbovePrice` / `Tier` | float / int | Center price and tier of the **nearest supply-side** zone above price (`na` when none; tier `1` D1, `2` 4H, `3` 1H) — Dashboard display output |
+| `nearestZoneBelowPrice` / `Tier` | float / int | Same for the **nearest demand-side** zone below price — Dashboard display output |
+
+The last three rows exist **only** so the Dashboard module can render without
+walking `zones` itself: the nearest-zone search runs on the same array the cull
+block has already applied its rules to, so a zone the module considers retired
+can never reach the table. Nothing here feeds the Signal Engine or alters a
+proximity or cull decision — see the module's "Dashboard Interface" block.
 
 **Tier flags are per side, and must stay that way.** An earlier draft exposed
 `nearD1Liquidity` as a single flag set from both the demand and the supply
@@ -880,6 +890,7 @@ if array.size(imbalances) > 0 and not na(atrChart)
 | `inImbalanceLong` | bool | Price is inside a **touched** bullish gap |
 | `inImbalanceShort` | bool | Price is inside a **touched** bearish gap |
 | `volumeConfirmed` | bool | Current volume exceeds its 20-bar average by 1.2x |
+| `imbalanceLiveCount` | int | Imbalances currently held in the module's array, touched ones included — Dashboard display output |
 
 A bullish gap sits *below* price when it forms, and price returns upward into it.
 That is why `nearImbalanceLong` reads a gap the price approaches from above —
@@ -1081,12 +1092,21 @@ if breakDown and showStructureBreaks
 | `breakDown` | bool | Price crossed below the last confirmed 1H swing low this bar |
 | `structureFlipped` | bool | That break opposed the structure in force, so it is a ChoCh rather than a BoS |
 | `marketStructure` | int | `1` bullish, `-1` bearish, `0` not yet established |
+| `lastBreakSide` | int | `1` the last break was up, `-1` down, `0` no break yet — Dashboard display output |
+| `lastBreakBar` | int | `bar_index` of that break (`na` until the first) — Dashboard display output |
 
-`marketStructure` is a `var` and therefore persists across bars; the other three
-are recomputed each bar. A consumer that needs "structure turned bullish" should
+`marketStructure` is a `var` and therefore persists across bars;
+`breakUp`, `breakDown` and `structureFlipped` are recomputed each bar. A consumer
+that needs "structure turned bullish" should
 test `breakUp and structureFlipped` — **not** a separate `bullishChoCh` boolean,
 which would be true whenever `breakUp` is true in a downtrend and would
 double-count the event.
+
+`lastBreakSide`/`lastBreakBar` are a recorded **history for display**, not a
+parallel signal pair: the Signal Engine never reads them, and the "structure
+turned bullish" test above stays the only correct one. On a bar that breaks both
+sides, the bearish stamp wins by block order — the same arbitrary resolution the
+break-detection comment documents for `structureFlipped`.
 
 ### 6.8 Drawing Budget
 
@@ -1453,6 +1473,18 @@ imbBearColor    = input.color(color.new(color.red, 85),   "Bearish Imbalance Col
 signalBullColor = input.color(color.new(color.green, 20), "LONG Signal Color",   group="Visual")
 signalBearColor = input.color(color.new(color.red, 20),   "SHORT Signal Color",  group="Visual")
 labelSize       = input.string("Normal", "Label Size", options=["Tiny", "Small", "Normal", "Large"], group="Visual")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GROUP: Dashboard
+// ═══════════════════════════════════════════════════════════════════════════════
+showDashboard = input.bool(true, "Show Dashboard", group="Dashboard")
+dashPosition  = input.string("Top Right", "Position",
+     options=["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Right", "Middle Left"],
+     group="Dashboard")
+// The Dashboard owns ONE table. The strategy variant already runs its own mode
+// table at bottom_right — a second table at the same position would REPLACE the
+// first (Pine keeps one table per position) — so the strategy's mode table was
+// moved there deliberately and documented. See section 13.
 ```
 
 ### 8.2 Input Summary Table
@@ -1678,13 +1710,14 @@ liquidityflowause-indicator/
 │       ├── session-markers.pine        # Session detection & rendering
 │       ├── imbalance-detector.pine     # Imbalance & volume delta
 │       ├── structure-break.pine        # BoS/ChoCh detection
-│       └── signal-engine.pine          # Confluence & signal output
+│       ├── signal-engine.pine          # Confluence & signal output
+│       └── dashboard.pine              # Presentation dashboard (visual)
 ├── scripts/
 │   ├── assemble.mjs                    # The single SOURCES list + module assembly
 │   └── build.mjs                       # Concatenate modules + structural checks
 ├── backtest/
 │   ├── run.mjs                         # Measurement CLI: fetch, validate, baseline, diagnose, compare, ratio, band, concept, equity
-│   ├── smoke.mjs                       # Regression suite: 2,116 checks, no data, no network
+│   ├── smoke.mjs                       # Regression suite: 2,156 checks, no data, no network
 │   ├── *.mjs                           # One module per measurement (band, baseline, compare, concept, equity, gate, ratio, tier-diagnostic, timeframes)
 │   ├── modules/                        # JS ports of the five Pine modules
 │   └── data/                           # Fetched OHLCV (gitignored)
@@ -1757,6 +1790,7 @@ Output: `dist/liquidityflowause.pine` — paste into the TradingView Pine Editor
 | 4 | `src/modules/imbalance-detector.pine` | Imbalance & volume delta |
 | 5 | `src/modules/structure-break.pine` | BoS/ChoCh detection |
 | 6 | `src/modules/signal-engine.pine` | Confluence & signal output |
+| 7 | `src/modules/dashboard.pine` | Presentation dashboard (visual) |
 
 A source that is declared but **does not exist on disk is a build failure**,
 not a warning: the assembled script would otherwise ship without a module the
@@ -1777,12 +1811,12 @@ script:
 
 | Planned file | Its role | Where that role lives today |
 |--------------|----------|-----------------------------|
-| `src/lib/colors.pine` | Colour constants | `color.*` calls inside the five modules |
+| `src/lib/colors.pine` | Colour constants | `color.*` calls inside the six modules |
 | `src/lib/utils.pine` | Shared utility functions | the `f_*` helpers inside the modules |
 | `src/lib/inputs.pine` | All input declarations | `input.*` declarations inside the modules |
 
-Verified in the assembled single file that ships: **33 `input.*` declarations,
-51 `color.*` references and 6 `f_*` helper functions** — every one of them
+Verified in the assembled single file that ships: **35 `input.*` declarations,
+71 `color.*` references and 7 `f_*` helper functions** — every one of them
 coming from a declared module under `src/modules/`, never from an undeclared
 file. The concatenation root `src/liquidityflowause.pine` itself carries none
 of them: it is the version directive, the `indicator()` declaration, the file
@@ -1830,6 +1864,94 @@ says.
   - `MAJOR`: Breaking changes to signal logic or input parameters
   - `MINOR`: New features, new modules, new visual elements
   - `PATCH`: Bug fixes, visual tweaks, documentation updates
+
+---
+
+## 13. Module: Dashboard (visual)
+
+### 13.1 Concept
+
+The Dashboard is a **presentation module**: ONE Pine table that renders state
+the other five modules already measured. It measures nothing, scores nothing and
+decides nothing — every value it displays is an export the build splices in
+EARLIER, which is also why it must be the **last** entry in `SOURCES` (Pine v5
+has no forward declarations). The smoke suite's `dashboard-module` section
+(38 checks) holds that line: no `ta.*`, no arrays, no `time()`, no session
+re-detection, zero plot-family calls, no boxes, lines or labels, and a bounded
+cell budget.
+
+### 13.2 The Table
+
+The table is declared **2 columns × 7 rows** — 14 cells, written cell by cell —
+and is created lazily (`var table dashTable = na`) on the last bar. Every cell
+is written under `if showDashboard and barstate.islast`, so the module does no
+work on historical bars, and the toggle actually gates the table. On realtime
+ticks of the last bar the cells are re-written, not re-created — the same
+pattern the strategy's own mode table uses.
+
+| Label cell | Value cell |
+|------------|------------|
+| (title) `LiquidityFlowAuse` / `STATE` | Module name and header |
+| `Session` | Active session by the SAME priority chain the Session Markers tint uses (Overlap > London > NY > Asia), or "Closed" when no enabled window holds the bar |
+| `Zone above` | Nearest supply-side zone: tier and distance in **4H ATR**, e.g. `D1 · 2.5 ATR`; an em dash when there is none |
+| `Zone below` | Nearest demand-side zone, same format and anchor |
+| `Imbalances` | Live gap count from Imbalance Detector, computed AFTER that module's retirement block has run |
+| `Last break` | Side and age of the last BoS/ChoCh, e.g. `Up ▲ · 12 bars`; an em dash before the first break |
+| `Modules` | Health line `SES · LZ · IMB · SB · SE` — green when all five report data, orange otherwise |
+
+**Distances anchor on `atrH4`, never on `atrChart`.** The ATR distance shown is
+`(zonePrice − close) / atrH4`, the same unit the module's own distance cull
+uses, so "2.5 ATR" on the table and `maxZoneDistance` mean the same thing on any
+chart grid. That anchor confusion already cost the D1 tiers once; a dashboard
+showing distances in the entry timeframe's unit would quietly undo the fix.
+
+### 13.3 Position and the Strategy's Mode Table
+
+The position is an input (default "Top Right"; six chart positions) rather than
+a fixed constant, because Route A's strategy is assembled from the SAME modules
+and draws its own mode table: **Pine keeps one table per position, and a later
+`table.new()` at the same position REPLACES the earlier one.** Two tables at
+top right would silently delete the strategy's mode table. The strategy main
+file therefore moved its mode table to `position.bottom_right`, where both
+tables stay visible. That move is asserted by the smoke suite, and the strategy
+file carries the comment explaining why.
+
+On the indicator, top right is free — nothing else draws a table there — so the
+default keeps the panel where the title header used to be read from.
+
+### 13.4 Interface (What It Reads)
+
+| Export | Owner module | Used for |
+|--------|--------------|----------|
+| `inAsia`, `inLondon`, `inNY`, `inOverlap` | Session Markers | Session row and the health line's SES flag |
+| `nearestZoneAbovePrice` / `nearestZoneAboveTier` | Liquidity Zones | "Zone above" row |
+| `nearestZoneBelowPrice` / `nearestZoneBelowTier` | Liquidity Zones | "Zone below" row |
+| `liveZoneCount` | Liquidity Zones | Health line's LZ flag |
+| `imbalanceLiveCount` | Imbalance Detector | "Imbalances" row and health line's IMB flag |
+| `lastBreakSide`, `lastBreakBar` | Structure Break | "Last break" row |
+| `marketStructure` | Structure Break | Health line's SB flag |
+| `lastSignalBar` | Signal Engine | Health line's SE flag |
+
+Every one of these has exactly one owner; the Dashboard keeps no second copy of
+any of them. The health flags mean: SES — a session window is open on this bar;
+LZ — at least one live zone after culling; IMB — at least one live gap after
+retirement; SB — structure has been established (`marketStructure ≠ 0`); SE — a
+signal has fired at least once. One cell holds one colour, so the health line is
+green only when ALL five report data.
+
+### 13.5 What the Dashboard Must Never Do
+
+- **No measurement of its own.** No `ta.*` series, no arrays, no `time()` or
+  `input.session` — the session row reads Session Markers' flags, so the table
+  and the chart can never disagree about which session is showing.
+- **No plot-family calls.** Tables sit outside the 64-plot budget, and the
+  module must keep spending zero of it. The module contributes 2 inputs,
+  1 table and 0 plots to the figures section 12.3 verifies.
+- **No drawing primitives.** Zones and markers stay the sibling modules' job.
+- **No theme sampling.** The panel carries its own near-opaque dark background
+  (`color.new(color.black, 20)`) so it reads on both dark and light chart
+  themes; Pine v5 offers no theme-aware palette. Theme presets remain future
+  work, not a licence to re-derive one here.
 
 ---
 

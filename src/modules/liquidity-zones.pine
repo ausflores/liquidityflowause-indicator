@@ -319,3 +319,47 @@ if array.size(zones) > 0 and not na(atrChart)
                 nearD1LiquidityShort := nearD1LiquidityShort or zp.tier == 1
                 nearH4LiquidityShort := nearH4LiquidityShort or zp.tier == 2
                 nearH1LiquidityShort := nearH1LiquidityShort or zp.tier == 3
+
+// ─── Dashboard Interface (visual, no signal semantics) ───────────────────────
+//
+// State the Dashboard module (spliced AFTER this one) reads to render the
+// chart-side table. NOTHING here feeds the Signal Engine, alters a proximity
+// or cull decision, or draws anything: the dashboard is a reader, and this
+// block only republishes state the module already holds. Exposing it here —
+// rather than letting the dashboard walk `zones` itself — keeps every read of
+// the array inside the module that owns it.
+//
+// The nearest-zone search runs on the SAME array the cull block above has
+// already applied its rules to, so a zone the module considers retired can
+// never appear on the table. The side test is the module's own convention
+// (see the header: direction is NOT stored; a pivot is demand-side until
+// price crosses it), so "below price" is the demand side and "above price"
+// the supply side. Ties on distance resolve to the FIRST zone found in array
+// order, which is deterministic but arbitrary — two zones equidistant above
+// price are a coincidence of the pivot grid, not information.
+//
+// The distance RATIO itself is left to the dashboard: it must be expressed in
+// atrH4 units — the SAME anchor the `tooFar` cull rule uses — so that "2.5
+// ATR" on the table and maxZoneDistanceATR mean the same unit on any chart
+// timeframe. Computing it from the raw prices there keeps this block free of
+// presentation concerns.
+
+int liveZoneCount = array.size(zones)
+
+float nearestZoneAbovePrice = na
+int   nearestZoneAboveTier  = na
+float nearestZoneBelowPrice = na
+int   nearestZoneBelowTier  = na
+
+if array.size(zones) > 0
+    for i = 0 to array.size(zones) - 1
+        LiquidityZone zd = array.get(zones, i)
+
+        if zd.center >= close
+            if na(nearestZoneAbovePrice) or zd.center < nearestZoneAbovePrice
+                nearestZoneAbovePrice := zd.center
+                nearestZoneAboveTier  := zd.tier
+        if zd.center < close
+            if na(nearestZoneBelowPrice) or zd.center > nearestZoneBelowPrice
+                nearestZoneBelowPrice := zd.center
+                nearestZoneBelowTier  := zd.tier

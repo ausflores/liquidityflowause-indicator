@@ -1,0 +1,190 @@
+// ============================================================================
+// LiquidityFlowAuse — Dashboard Module
+// ----------------------------------------------------------------------------
+// Module:   Dashboard
+// Version:  LiquidityFlowAuse v1.0.0
+//
+// Purpose:  Renders ONE chart-side table (default top right) that shows the
+//           state the other modules already hold, at a glance:
+//
+//             1. the active session (Asia / London / New York / overlap), or
+//                "Closed" when no enabled session window holds the bar;
+//             2. the nearest liquidity zone per side, with its distance
+//                expressed in 4H ATR (atrH4) — the SAME anchor the module's
+//                own distance cull uses, so "2.5 ATR" here and
+//                maxZoneDistanceATR mean the same unit on any chart grid;
+//             3. the number of live imbalances (FVG bands);
+//             4. the last structure break — side and how long ago;
+//             5. a module health line naming which modules hold data on the
+//                current bar.
+//
+//           This is a PRESENTATION module. It computes no signals, scores
+//           nothing, draws no boxes, lines or labels, adds zero plot-family
+//           calls, and re-derives NO detection logic: every value it shows is
+//           an export the build splices in EARLIER. Pine v5 has no forward
+//           declarations, which is also why this module MUST be the last
+//           entry in the SOURCES list in scripts/assemble.mjs.
+//
+// Pine:     Pine Script v5. The //@version=5 directive is declared once in
+//           the main indicator file (src/liquidityflowause.pine); this
+//           module MUST NOT contain an indicator() or study() declaration.
+//
+// Usage:    Designed for file concatenation into the main indicator file.
+//           For a standalone syntax check in the Pine Editor, wrap the
+//           contents of this file in a temporary indicator() declaration.
+// ============================================================================
+
+// ─── User Inputs ─────────────────────────────────────────────────────────────
+
+showDashboard = input.bool(true, "Show Dashboard", group="Dashboard")
+
+// The position is selectable rather than fixed because the Route A strategy
+// is assembled from the SAME modules and draws its own mode table: Pine keeps
+// ONE table per position, and a later table.new() call REPLACES the earlier
+// one at the same position (TradingView, Pine Script docs, "Tables"). The
+// strategy main file moved its mode table to bottom_right so both tables
+// stay visible there; on the indicator, top right is free.
+dashPosition = input.string("Top Right", "Position",
+     options=["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Right", "Middle Left"],
+     group="Dashboard")
+
+// ─── Presentation Constants ──────────────────────────────────────────────────
+//
+// The panel carries its own near-opaque dark background, so its text is
+// readable on dark AND light chart themes: nothing here samples the chart's
+// background colour, because Pine v5 offers no theme-aware palette.
+
+color COLOR_DASH_BG    = color.new(color.black, 20)
+color COLOR_DASH_FRAME = color.gray
+color COLOR_DASH_TITLE = color.white
+color COLOR_DASH_LABEL = color.silver
+color COLOR_DASH_NONE  = color.silver
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+// Maps the position input to Pine's position constants. A ternary chain,
+// because Pine v5 does not allow `else <condition>` to open an indented
+// block. The chain over an input string keeps the value `simple`, which is
+// what table.new's position argument accepts.
+f_dashPosition(string which) =>
+    which == "Top Left"     ? position.top_left :
+    which == "Bottom Right" ? position.bottom_right :
+    which == "Bottom Left"  ? position.bottom_left :
+    which == "Middle Right" ? position.middle_right :
+    which == "Middle Left"  ? position.middle_left :
+    position.top_right
+
+// ─── Table ───────────────────────────────────────────────────────────────────
+//
+// ONE table for the module's whole lifetime, created lazily on the last bar
+// and bounded: 2 columns x 7 rows, 14 cells written cell by cell. The cells
+// are re-written (not re-created) on every realtime tick of the last bar —
+// the same barstate.islast pattern the strategy's own mode table uses.
+//
+// The module holds NO arrays. Every value is read from another module's
+// exports, and all the string building happens inside the last-bar guard so
+// no text is built on historical bars.
+//
+// DRAWING BUDGET: tables are not plot-family calls, so this module spends
+// zero of the 64-plot budget, zero boxes, zero lines and zero labels. Pine's
+// table limit is one table PER POSITION (a script can display up to nine at
+// nine distinct positions); this module creates exactly one.
+
+var table dashTable = na
+
+if showDashboard and barstate.islast
+    if na(dashTable)
+        dashTable := table.new(f_dashPosition(dashPosition), 2, 7,
+             bgcolor = COLOR_DASH_BG, frame_color = COLOR_DASH_FRAME, frame_width = 1)
+
+    // Session — read from Session Markers' membership flags. The priority
+    // chain Overlap > London > NY > Asia is the SAME chain the module's
+    // background tint uses, so the table and the chart can never disagree
+    // about which session is showing. "Closed" means no enabled session
+    // window holds the current bar; the flags are false there by definition,
+    // which is why nothing is re-detected here.
+    string dashSessionName = inOverlap ? "London + NY" :
+         inLondon ? "London" :
+         inNY ? "New York" :
+         inAsia ? "Asia" : "Closed"
+    color dashSessionColor = inOverlap ? color.yellow :
+         inLondon ? color.aqua :
+         inNY ? color.orange :
+         inAsia ? color.fuchsia : COLOR_DASH_NONE
+
+    // Nearest zones — prices and tiers are Liquidity Zones exports, so the
+    // table cannot disagree with the chart about which bands exist. The
+    // DISTANCE is expressed in atrH4 units (the cull anchor), never in the
+    // chart timeframe's atrChart. A side with no zone above/below shows an
+    // em dash.
+    float dashZoneAboveATR = not na(nearestZoneAbovePrice) and not na(atrH4) and atrH4 > 0 ?
+         (nearestZoneAbovePrice - close) / atrH4 : na
+    string dashZoneAboveText = na(dashZoneAboveATR) ? "—" :
+         (nearestZoneAboveTier == 1 ? "D1" : nearestZoneAboveTier == 2 ? "4H" : "1H") + " · " +
+         str.tostring(dashZoneAboveATR, "#.##") + " ATR"
+    color dashZoneAboveColor = na(dashZoneAboveATR) ? COLOR_DASH_NONE : color.new(color.red, 0)
+
+    float dashZoneBelowATR = not na(nearestZoneBelowPrice) and not na(atrH4) and atrH4 > 0 ?
+         (close - nearestZoneBelowPrice) / atrH4 : na
+    string dashZoneBelowText = na(dashZoneBelowATR) ? "—" :
+         (nearestZoneBelowTier == 1 ? "D1" : nearestZoneBelowTier == 2 ? "4H" : "1H") + " · " +
+         str.tostring(dashZoneBelowATR, "#.##") + " ATR"
+    color dashZoneBelowColor = na(dashZoneBelowATR) ? COLOR_DASH_NONE : color.new(color.green, 0)
+
+    // Imbalances — the live count is Imbalance Detector's export, computed
+    // AFTER that module's retirement block has run, so it never counts a gap
+    // the module has already retired.
+    string dashImbText  = str.tostring(imbalanceLiveCount) + " live"
+    color dashImbColor  = imbalanceLiveCount > 0 ? color.aqua : COLOR_DASH_NONE
+
+    // Last break — side and age come from Structure Break's own record, so
+    // the table does not keep a second copy of break state. Side 1 is the
+    // bullish break (up), -1 the bearish one; 0 with a na bar means no break
+    // has happened yet.
+    string dashBreakText = na(lastBreakBar) ? "—" :
+         (lastBreakSide == 1 ? "Up ▲" : "Down ▼") + " · " +
+         str.tostring(bar_index - lastBreakBar) + " bars"
+    color dashBreakColor = na(lastBreakBar) ? COLOR_DASH_NONE :
+         lastBreakSide == 1 ? color.lime : color.red
+
+    // Module health — which modules hold data on the CURRENT bar:
+    //
+    //   SES = Session Markers    a session window is open on this bar
+    //   LZ  = Liquidity Zones    at least one live zone after culling
+    //   IMB = Imbalance Detector at least one live gap after retirement
+    //   SB  = Structure Break    structure has been established (≠ 0)
+    //   SE  = Signal Engine      a signal has fired at least once
+    //
+    // One cell holds one colour, so the line is green when all five report
+    // data and orange when any of them does not.
+    bool dashSessionLive = inAsia or inLondon or inNY
+    string dashHealthText = "SES " + (dashSessionLive ? "✓" : "✗") +
+         " LZ " + (liveZoneCount > 0 ? "✓" : "✗") +
+         " IMB " + (imbalanceLiveCount > 0 ? "✓" : "✗") +
+         " SB " + (marketStructure != 0 ? "✓" : "✗") +
+         " SE " + (not na(lastSignalBar) ? "✓" : "✗")
+    bool dashAllHealthy = dashSessionLive and liveZoneCount > 0 and
+         imbalanceLiveCount > 0 and marketStructure != 0 and not na(lastSignalBar)
+    color dashHealthColor = dashAllHealthy ? color.lime : color.orange
+
+    // Cells. Column 0 is the label column, column 1 the value column.
+    table.cell(dashTable, 0, 0, "LiquidityFlowAuse", text_color = COLOR_DASH_TITLE, text_size = size.small)
+    table.cell(dashTable, 1, 0, "STATE",             text_color = color.aqua,       text_size = size.small)
+
+    table.cell(dashTable, 0, 1, "Session",     text_color = COLOR_DASH_LABEL, text_size = size.small)
+    table.cell(dashTable, 1, 1, dashSessionName, text_color = dashSessionColor, text_size = size.small)
+
+    table.cell(dashTable, 0, 2, "Zone above", text_color = COLOR_DASH_LABEL,     text_size = size.small)
+    table.cell(dashTable, 1, 2, dashZoneAboveText, text_color = dashZoneAboveColor, text_size = size.small)
+
+    table.cell(dashTable, 0, 3, "Zone below", text_color = COLOR_DASH_LABEL,     text_size = size.small)
+    table.cell(dashTable, 1, 3, dashZoneBelowText, text_color = dashZoneBelowColor, text_size = size.small)
+
+    table.cell(dashTable, 0, 4, "Imbalances", text_color = COLOR_DASH_LABEL,     text_size = size.small)
+    table.cell(dashTable, 1, 4, dashImbText,  text_color = dashImbColor,         text_size = size.small)
+
+    table.cell(dashTable, 0, 5, "Last break", text_color = COLOR_DASH_LABEL,     text_size = size.small)
+    table.cell(dashTable, 1, 5, dashBreakText, text_color = dashBreakColor,      text_size = size.small)
+
+    table.cell(dashTable, 0, 6, "Modules",    text_color = COLOR_DASH_LABEL,     text_size = size.small)
+    table.cell(dashTable, 1, 6, dashHealthText, text_color = dashHealthColor,    text_size = size.small)

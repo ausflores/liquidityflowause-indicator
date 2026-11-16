@@ -61,7 +61,7 @@ const MAIN = join(ROOT, "src", "liquidityflowause.pine");
 // Route A. The strategy's main file owns the strategy() declaration, the
 // strategy-only inputs, the D.3 spread filter and the entry/exit rules. It is
 // assembled from the SAME SOURCES array as the indicator — imported above, not
-// re-declared here — so the five modules are read from the same bytes in the
+// re-declared here — so the six modules are read from the same bytes in the
 // same order, and there is no second list to drift.
 //
 // SOURCES names files that EXIST. A declared module that is missing from disk
@@ -89,9 +89,12 @@ const STRATEGY_MAIN = join(ROOT, "src", "liquidityflowause-strategy.pine");
 // silently. This file is the product; the strategy is a measuring instrument
 // built beside it and must never be able to rewrite the artifact it measures.
 //
-// Recorded from dist/liquidityflowause.pine at commit 4097ee4.
+// Recorded from dist/liquidityflowause.pine on branch feat/visual-dashboard,
+// after splicing the Dashboard module (src/modules/dashboard.pine) and adding
+// the module outputs its table reads: a presentation-layer change approved in
+// odd/tasks/visual-polish-p0-p1.md (T1), with zero measurement-behaviour change.
 export const SHIPPED_INDICATOR_SHA256 =
-  "1dd6f536ae4f50c2f669e9c1a2b34a0fb97a7d51428905b9e18f8616d1582ce2";
+  "af2c2e3b4689826949259216a9ad663eb47d5281bc8fc7227c1b071b5a0d6866";
 
 // The D.4 exit levels, cross-checked against backtest/modules/label.mjs at
 // build time so the strategy cannot drift from the definition the whole

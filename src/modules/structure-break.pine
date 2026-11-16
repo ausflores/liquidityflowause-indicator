@@ -177,6 +177,37 @@ if crossedBelow
     structureFlipped := marketStructure == 1
     marketStructure  := -1
 
+// ─── Last Break Record (dashboard interface) ────────────────────────────────
+//
+// The Dashboard module reports the LAST structure break — side and age —
+// which breakUp / breakDown cannot express: they are per-bar edge flags, true
+// only on the bar the break happened. These two `var`s persist that one event.
+//
+// THIS IS NOT THE FORBIDDEN PARALLEL-FLAG PAIR. The central invariant above
+// outlaws a SECOND BOOLEAN describing the same break's character
+// (bullishBoS / bullishChoCh), because overlapping booleans let a scorer award
+// one event twice. A which-and-when record is a different dimension — WHICH
+// break was last, not a reclassification of the current one — and nothing
+// scores it. A consumer that wants the character of the last break still
+// reads `breakUp and structureFlipped` on the bar it fired; these fields exist
+// so the dashboard does not have to keep its own copy of break state.
+//
+// Malformed-bar note: crossedAbove and crossedBelow are independent blocks,
+// and on a bar that breaks both sides the bearish stamp wins by block order —
+// the same arbitrary resolution the break-detection comment above documents
+// for structureFlipped.
+
+var int lastBreakSide = 0   // 1 last break was up, -1 down, 0 no break yet
+var int lastBreakBar  = na  // bar_index of the last break; na until the first
+
+if breakUp
+    lastBreakSide := 1
+    lastBreakBar  := bar_index
+
+if breakDown
+    lastBreakSide := -1
+    lastBreakBar  := bar_index
+
 // ─── Rendering: Swing Levels (spec 6.6) ─────────────────────────────────────
 //
 // TWO `var` LINE HANDLES FOR THE MODULE'S WHOLE LIFETIME, NOT ONE PER BAR.
