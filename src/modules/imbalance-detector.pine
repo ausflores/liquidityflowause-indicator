@@ -29,6 +29,11 @@
 //           scripts/build.mjs splices BEFORE this file. It is used, not
 //           redeclared: a second `atrChart = ta.atr(14)` here would be a
 //           duplicate-declaration compile error.
+//           Also from liquidity-zones.pine: the four SHARED visual inputs of
+//           the "Zonas (visual)" group (zoneStateColors, zoneAgeFade,
+//           zoneBullColor, zoneBearColor), added by T2 of the visual-polish
+//           feature. They gate DRAWING ONLY — detection, retirement, the
+//           proximity exports and the JS port are untouched by them.
 //
 // Usage:    Designed for file concatenation into the main indicator file.
 //           For a standalone syntax check in the Pine Editor, wrap the
@@ -68,6 +73,7 @@ type ImbalanceZone
     int   bornBar
     int   touchedBar    // bar_index on first entry after birth; na while virgin
     box   zoneBox
+    int   brokenBar     // bar_index price closed THROUGH the gap; VISUAL ONLY — no retirement rule, proximity test or module output reads it
 
 var array<ImbalanceZone> imbalances = array.new<ImbalanceZone>()
 
@@ -191,7 +197,7 @@ if creatingBull or creatingBear
         box.delete(array.get(imbalances, evictIdx).zoneBox)
         array.remove(imbalances, evictIdx)
 
-    array.push(imbalances, ImbalanceZone.new(top, bottom, isBull, bar_index, na, f_newImbalance(isBull, top, bottom)))
+    array.push(imbalances, ImbalanceZone.new(top, bottom, isBull, bar_index, na, f_newImbalance(isBull, top, bottom), na))
 
 // ─── Touch Marking (spec 5.3) ────────────────────────────────────────────────
 //
@@ -215,6 +221,19 @@ if creatingBull or creatingBear
 // Fields of a user type are immutable, so setting touchedBar means replacing
 // the whole record and carrying the existing box handle across. Forward
 // iteration is safe: nothing is removed here.
+//
+// BROKEN (visual only, T2). On the SAME pass, a bar that OPENED below the
+// gap and CLOSED above it — or the mirror — drove through the whole band:
+// the gap failed to act as a magnet and reads as invalidated from then on.
+// Two cases, both handled without a second pass: first contact IS a
+// close-through (swept and broken stamped together), or a gap already
+// touched is traversed on a later bar (broken stamped there). brokenBar is
+// sticky and is read by the visual-state pass below and by NOTHING else —
+// no retirement rule, proximity export or JS-port line consults it. A
+// close-through implies `reached` (the bar's range covers the band), so
+// state precedence is broken > touched > active by construction. The
+// bornBar guard above still governs everything: a gap is never marked —
+// touched OR broken — on its own creation bar.
 
 if array.size(imbalances) > 0
     for i = 0 to array.size(imbalances) - 1
@@ -223,8 +242,15 @@ if array.size(imbalances) > 0
         bool reached   = high >= fi.bottom and low <= fi.top
         bool canTouch  = fi.bornBar < bar_index
 
+        bool closedThrough = (open < fi.bottom and close > fi.top) or (open > fi.top and close < fi.bottom)
+
         if reached and canTouch and na(fi.touchedBar)
-            array.set(imbalances, i, ImbalanceZone.new(fi.top, fi.bottom, fi.isBull, fi.bornBar, bar_index, f_markImbalanceTouched(fi)))
+            int brokenStamp = na
+            if closedThrough
+                brokenStamp := bar_index
+            array.set(imbalances, i, ImbalanceZone.new(fi.top, fi.bottom, fi.isBull, fi.bornBar, bar_index, f_markImbalanceTouched(fi), brokenStamp))
+        else if not na(fi.touchedBar) and na(fi.brokenBar) and closedThrough
+            array.set(imbalances, i, ImbalanceZone.new(fi.top, fi.bottom, fi.isBull, fi.bornBar, fi.touchedBar, fi.zoneBox, bar_index))
 
 // ─── Retirement (spec 5.3) ───────────────────────────────────────────────────
 //
@@ -252,6 +278,70 @@ if array.size(imbalances) > 0
         if tooOld or filledOut
             box.delete(fr.zoneBox)
             array.remove(imbalances, i)
+
+// ─── Visual States & Age Fade (presentation only, T2) ────────────────────────
+//
+// Restyles the EXISTING box of every live gap — box.set_* on the record's
+// own handle, never a second box.new — so the drawing budget of 5.3.1 is
+// untouched. Runs AFTER the retirement block, so only live gaps are touched,
+// and is gated on the SHARED visual inputs declared by liquidity-zones.pine
+// (see "Depends" in the header): with both toggles OFF the pass does nothing
+// and a box keeps the creation/touched styling above for life.
+//
+// Three lifecycle states, drawn when "Colorear por estado" is ON — the SAME
+// state language the Liquidity Zones pass applies, so both zone types read
+// alike on the chart:
+//
+//   active     virgin gap — base color, faint fill
+//   mitigated  price returned into the band (touchedBar set) — base color,
+//              stronger border and fill (the f_markImbalanceTouched shift)
+//   broken     close-through (brokenBar set) — GRAY: the gap failed to act
+//              as a magnet, and gray reads as dead rather than as a side
+//
+// The base color is the gap's OWN stored direction (isBull), frozen at
+// creation — the same side rule the proximity exports below use.
+//
+// AGE FADE ("Desvanecer con la edad") adds transparency in four steps over
+// the SAME horizon the age retirement uses (maxFvgAgeBars), anchored at the
+// bar of the gap's LAST EVENT — birth, touch or break — so a gap that just
+// did something snaps back to full strength and then recedes again. A gap
+// about to be retired by age is the most transparent. With "Colorear por
+// estado" OFF the pass reproduces the creation/touched palette (the
+// f_newImbalance + f_markImbalanceTouched tables, mirrored here so fade has
+// a base to add to — if those change, this mirror must change with them)
+// and only fades it.
+//
+// The fade ladder compares integer ages against integer thresholds and adds
+// literal steps: no float division anywhere, so transparency stays an int
+// for color.new and this module's no-local-compiler rule is respected.
+
+if zoneStateColors or zoneAgeFade
+    if array.size(imbalances) > 0
+        for i = 0 to array.size(imbalances) - 1
+            ImbalanceZone fv = array.get(imbalances, i)
+
+            bool gBroken  = not na(fv.brokenBar)
+            bool gTouched = not na(fv.touchedBar)
+
+            int ageAnchor = gBroken ? fv.brokenBar : gTouched ? fv.touchedBar : fv.bornBar
+            int gapAge    = bar_index - ageAnchor
+
+            int fadeExtra = zoneAgeFade ? gapAge > maxFvgAgeBars * 3 / 4 ? 30 : gapAge > maxFvgAgeBars * 2 / 4 ? 20 : gapAge > maxFvgAgeBars * 1 / 4 ? 10 : 0 : 0
+
+            color stateBase   = gBroken ? color.gray : fv.isBull ? zoneBullColor : zoneBearColor
+            int   stateBorder = gBroken ? 45 : gTouched ? 25 : 50
+            int   stateFill   = gBroken ? 88 : gTouched ? 60 : 88
+
+            color legacyBase   = fv.isBull ? color.green : color.red
+            int   legacyBorder = gTouched ? 25 : 50
+            int   legacyFill   = gTouched ? 60 : 88
+
+            color borderBase = zoneStateColors ? stateBase : legacyBase
+            int   borderT    = math.min(94, (zoneStateColors ? stateBorder : legacyBorder) + fadeExtra)
+            int   fillT      = math.min(97, (zoneStateColors ? stateFill : legacyFill) + fadeExtra)
+
+            box.set_border_color(fv.zoneBox, color.new(borderBase, borderT))
+            box.set_bgcolor(fv.zoneBox, color.new(borderBase, fillT))
 
 // ─── Module Outputs (Signal Engine Interface, spec 5.5) ──────────────────────
 //
