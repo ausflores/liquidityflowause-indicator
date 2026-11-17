@@ -62,6 +62,23 @@ sweptRetainBars    = input.int(100,   "Swept Zone Retention (bars)", minval=10, 
 proxATRMult = input.float(3.0, "Proximity (x ATR)", minval=0.5, step=0.5, group="Liquidity Zones")
 sweepWindow = input.int(10,   "Sweep Signal Window (bars)", minval=1, group="Liquidity Zones")
 
+// ─── Visual States & Fade (presentation only, T2) ────────────────────────────
+//
+// Four SHARED visual inputs, declared HERE and consumed by Imbalance Detector
+// too — the same dependency shape as atrChart: the earlier module declares,
+// the later module reads. One palette, one pair of toggles, so both zone
+// types speak the same visual language on the chart.
+//
+// They gate DRAWING ONLY. Detection, culling, proximity and every module
+// output are computed before any of these values is consulted, and the JS
+// port (backtest/modules/liquidity-zones.mjs) ports no drawing at all, so a
+// toggle can never move a measured number. With both toggles OFF the chart
+// keeps the pre-T2 look exactly.
+zoneStateColors = input.bool(true, "Colorear por estado", group="Zonas (visual)")
+zoneAgeFade     = input.bool(true, "Desvanecer con la edad", group="Zonas (visual)")
+zoneBullColor   = input.color(color.green, "Color alcista", group="Zonas (visual)")
+zoneBearColor   = input.color(color.red, "Color bajista", group="Zonas (visual)")
+
 // ─── Zone Record ─────────────────────────────────────────────────────────────
 
 type LiquidityZone
@@ -71,6 +88,7 @@ type LiquidityZone
     int   bornBar
     int   sweptBar       // bar_index of the sweep; na while untested
     box   zoneBox
+    int   brokenBar      // bar_index price closed THROUGH the band; VISUAL ONLY — no cull rule, proximity test or module output reads it
 
 var array<LiquidityZone> zones = array.new<LiquidityZone>()
 
@@ -197,7 +215,7 @@ for k = 0 to array.size(confirmedPivots) - 1
             box.delete(array.get(zones, evictIdx).zoneBox)
             array.remove(zones, evictIdx)
 
-        array.push(zones, LiquidityZone.new(pivotPrice, halfW, tierOf, bar_index, na, f_newZone(tierOf, pivotPrice, halfW)))
+        array.push(zones, LiquidityZone.new(pivotPrice, halfW, tierOf, bar_index, na, f_newZone(tierOf, pivotPrice, halfW), na))
 
 // ─── Sweep Marking ───────────────────────────────────────────────────────────
 //
@@ -213,6 +231,21 @@ for k = 0 to array.size(confirmedPivots) - 1
 // rather than surviving untouched. Fields of a user type are immutable, so
 // setting sweptBar means replacing the whole record and carrying the existing
 // box handle across. Forward iteration is safe: nothing is removed here.
+//
+// BROKEN (visual only, T2). On the SAME pass, a bar that OPENED on one side
+// of the band and CLOSED beyond the other drove through the whole zone —
+// the level failed and reads as invalidated from then on. Two cases, both
+// handled without a second pass:
+//
+//   first contact is a close-through  -> swept and broken stamped together;
+//   a zone already swept is traversed later -> broken stamped on that bar.
+//
+// brokenBar is sticky: once set it is never cleared. It is read by the
+// visual-state pass below and by NOTHING else — no cull rule, proximity
+// test or module output consults it, and the JS port does not port it.
+// A close-through implies an in-body bar (the bar's range covers the band),
+// so no zone can become broken without also being swept: state precedence
+// is broken > mitigated > active by construction.
 
 if array.size(zones) > 0
     for i = 0 to array.size(zones) - 1
@@ -220,8 +253,15 @@ if array.size(zones) > 0
 
         bool inBodyM = high >= zm.center - zm.halfWidth and low <= zm.center + zm.halfWidth
 
+        bool closedThrough = (open < zm.center - zm.halfWidth and close > zm.center + zm.halfWidth) or (open > zm.center + zm.halfWidth and close < zm.center - zm.halfWidth)
+
         if inBodyM and na(zm.sweptBar)
-            array.set(zones, i, LiquidityZone.new(zm.center, zm.halfWidth, zm.tier, zm.bornBar, bar_index, zm.zoneBox))
+            int brokenStamp = na
+            if closedThrough
+                brokenStamp := bar_index
+            array.set(zones, i, LiquidityZone.new(zm.center, zm.halfWidth, zm.tier, zm.bornBar, bar_index, zm.zoneBox, brokenStamp))
+        else if not na(zm.sweptBar) and na(zm.brokenBar) and closedThrough
+            array.set(zones, i, LiquidityZone.new(zm.center, zm.halfWidth, zm.tier, zm.bornBar, zm.sweptBar, zm.zoneBox, bar_index))
 
 // ─── Culling ─────────────────────────────────────────────────────────────────
 //
@@ -252,6 +292,70 @@ if array.size(zones) > 0
         if tooOld or tooFar or stale
             box.delete(zc.zoneBox)
             array.remove(zones, i)
+
+// ─── Visual States & Age Fade (presentation only, T2) ────────────────────────
+//
+// Restyles the EXISTING box of every live zone — box.set_* on the record's
+// own handle, never a second box.new — so max_boxes_count semantics are
+// untouched. Runs AFTER the cull block, so only live zones are touched, and
+// is gated on the shared toggles: with both OFF the pass does nothing and a
+// box keeps its creation colors for life (the pre-T2 look, byte for byte).
+//
+// Three lifecycle states, drawn when "Colorear por estado" is ON. The state
+// language is shared with Imbalance Detector, so both zone types read alike:
+//
+//   active     untouched — base color, faint fill
+//   mitigated  price entered the body (sweptBar set) — base color, stronger
+//              border and fill, the SAME emphasis shift the Imbalance
+//              Detector applies to a touched gap
+//   broken     close-through (brokenBar set) — GRAY: the level failed, and
+//              gray reads as dead rather than as a side
+//
+// The base color is the zone's DERIVED side (below close = demand, the same
+// convention the proximity block and the Dashboard's zone rows use), so the
+// bull/bear inputs color the chart exactly the way the table already does.
+//
+// AGE FADE ("Desvanecer con la edad") adds transparency in four steps over
+// the SAME horizon the age cull uses (maxZoneAgeBars), anchored at the bar
+// of the zone's LAST EVENT — birth, sweep or break — so a zone that just
+// did something snaps back to full strength and then recedes again. A zone
+// about to be culled by age is the most transparent: the eye reads the cull
+// before it happens. With "Colorear por estado" OFF the pass reproduces the
+// creation palette (the f_newZone tier table, mirrored here so fade has a
+// base to add to — if f_newZone changes, this mirror must change with it)
+// and only fades it.
+//
+// The fade ladder compares integer ages against integer thresholds and adds
+// literal steps: no float division anywhere, so transparency stays an int
+// for color.new and this module's no-local-compiler rule is respected.
+
+if zoneStateColors or zoneAgeFade
+    if array.size(zones) > 0
+        for i = 0 to array.size(zones) - 1
+            LiquidityZone zv = array.get(zones, i)
+
+            bool zBroken  = not na(zv.brokenBar)
+            bool zTouched = not na(zv.sweptBar)
+
+            int ageAnchor = zBroken ? zv.brokenBar : zTouched ? zv.sweptBar : zv.bornBar
+            int zoneAge   = bar_index - ageAnchor
+
+            int fadeExtra = zoneAgeFade ? zoneAge > maxZoneAgeBars * 3 / 4 ? 30 : zoneAge > maxZoneAgeBars * 2 / 4 ? 20 : zoneAge > maxZoneAgeBars * 1 / 4 ? 10 : 0 : 0
+
+            color stateBase   = zBroken ? color.gray : zv.center < close ? zoneBullColor : zoneBearColor
+            int   stateBorder = zBroken ? 45 : zTouched ? 25 : 50
+            int   stateFill   = zBroken ? 88 : zTouched ? 60 : 88
+
+            color legacyBase   = color.red
+            int   legacyBorder = zv.tier == 1 ? 60 : zv.tier == 2 ? 75 : 88
+            int   legacyFill   = zv.tier == 1 ? 92 : zv.tier == 2 ? 94 : 96
+
+            color borderBase = zoneStateColors ? stateBase : legacyBase
+            int   borderT    = math.min(94, (zoneStateColors ? stateBorder : legacyBorder) + fadeExtra)
+            int   fillT      = math.min(97, (zoneStateColors ? stateFill : legacyFill) + fadeExtra)
+
+            box.set_border_color(zv.zoneBox, color.new(borderBase, borderT))
+            box.set_bgcolor(zv.zoneBox, color.new(borderBase, fillT))
 
 // ─── Module Outputs (Signal Engine Interface) ────────────────────────────────
 //

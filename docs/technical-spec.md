@@ -839,6 +839,10 @@ and Imbalances at 60, and both delete every box on removal, so live drawings sta
 bounded by the sum of the two caps. The invariant is the deletion, not the cap:
 raising either past its budget would require raising the declaration too.
 
+The visual state/fade layer (section 9.4) respects the same budget: it restyles
+the record's EXISTING box with `box.set_bgcolor()` / `box.set_border_color()` and
+never creates a second box for a zone or a gap.
+
 ### 5.4 Imbalance Proximity for Signal
 
 **Proximity is evaluated over the stored imbalances, not over the current bar's
@@ -1475,6 +1479,17 @@ signalBearColor = input.color(color.new(color.red, 20),   "SHORT Signal Color", 
 labelSize       = input.string("Normal", "Label Size", options=["Tiny", "Small", "Normal", "Large"], group="Visual")
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// GROUP: Zonas (visual) — zone lifecycle states & age fade (section 9.4)
+// ═══════════════════════════════════════════════════════════════════════════════
+// Declared ONCE in liquidity-zones.pine and READ by imbalance-detector.pine —
+// the atrChart precedent: the earlier module declares, the later one consumes.
+// They gate DRAWING ONLY; no cull, proximity or module output depends on them.
+zoneStateColors = input.bool(true, "Colorear por estado", group="Zonas (visual)")
+zoneAgeFade     = input.bool(true, "Desvanecer con la edad", group="Zonas (visual)")
+zoneBullColor   = input.color(color.green, "Color alcista", group="Zonas (visual)")
+zoneBearColor   = input.color(color.red, "Color bajista", group="Zonas (visual)")
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // GROUP: Dashboard
 // ═══════════════════════════════════════════════════════════════════════════════
 showDashboard = input.bool(true, "Show Dashboard", group="Dashboard")
@@ -1560,6 +1575,55 @@ The indicator uses a **dark-theme-optimized** palette with sufficient contrast:
 │  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  │  ← Session bg tint
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+### 9.4 Zone Lifecycle States & Age Fade (visual, T2)
+
+Both zone types — liquidity zones and imbalances — are drawn with ONE shared
+visual language, driven by the four inputs of the **"Zonas (visual)"** group:
+`zoneStateColors` (default ON), `zoneAgeFade` (default ON), and the two base
+colors `zoneBullColor` / `zoneBearColor`. The inputs are declared ONCE in
+`liquidity-zones.pine` and read by `imbalance-detector.pine` — the same
+dependency shape as `atrChart` — so both modules cannot drift apart stylistically.
+
+**Color by lifecycle state** (`zoneStateColors` ON):
+
+| State | When | Drawn as |
+|-------|------|----------|
+| Active | never touched by price | base color (bull/bear), faint fill |
+| Mitigated | price entered the band (swept / touched) | base color, stronger border and fill |
+| Broken | a bar OPENED on one side of the band and CLOSED beyond the other | **gray** — the level failed, and gray reads as dead, not as a side |
+
+The base color for a liquidity zone is its **derived side** (below close =
+demand, above = supply) — the same convention the proximity block and the
+Dashboard's zone rows already use, so the chart and the table agree. A gap's
+base color is its stored `isBull`. Broken wins over mitigated, mitigated over
+active, by construction: a close-through implies the band was entered.
+
+**Age fade** (`zoneAgeFade` ON) adds transparency in four steps (+10 / +20 / +30
+at 1/4, 1/2 and 3/4 of the horizon), anchored at the bar of the zone's LAST
+EVENT — birth, touch or break — so a zone that just did something snaps back to
+full strength and then recedes again. The horizon is each module's OWN age-cull
+input (`maxZoneAgeBars` / `maxFvgAgeBars`): a zone about to be culled by age is
+the most transparent, so the eye reads the cull before it happens.
+
+**This layer is presentation-only, and the suite holds that line:**
+
+- invalidation is a sticky, VISUAL-ONLY record field (`brokenBar`): no cull
+  rule, proximity test or module output reads it, and the JS ports
+  (`backtest/modules/*.mjs`, which port no drawing at all) carry no trace of
+  the visual layer — so no measured value can move;
+- styling mutates the record's EXISTING box handle (`box.set_bgcolor()` /
+  `box.set_border_color()`), never a second `box.new` — the drawing budget of
+  5.3.1 is untouched, and each module still declares exactly one `box.new`
+  (the birth site);
+- the fade ladder uses integer comparisons and literal steps, no float
+  division, because transparency must stay an int for `color.new()` and the
+  repo has no Pine compiler to catch a type slip;
+- with BOTH toggles OFF the restyle pass does nothing and every box keeps its
+  pre-T2 creation colors for life;
+- the smoke suite's `zone-states` section (32 checks) asserts the input group,
+  the shared read, the close-through stamp, the JS-port purity, the single
+  `box.new` per module, the gray broken look and the cull-horizon fade anchor.
 
 ---
 
@@ -1717,7 +1781,7 @@ liquidityflowause-indicator/
 │   └── build.mjs                       # Concatenate modules + structural checks
 ├── backtest/
 │   ├── run.mjs                         # Measurement CLI: fetch, validate, baseline, diagnose, compare, ratio, band, concept, equity
-│   ├── smoke.mjs                       # Regression suite: 2,156 checks, no data, no network
+│   ├── smoke.mjs                       # Regression suite: 2,188 checks, no data, no network
 │   ├── *.mjs                           # One module per measurement (band, baseline, compare, concept, equity, gate, ratio, tier-diagnostic, timeframes)
 │   ├── modules/                        # JS ports of the five Pine modules
 │   └── data/                           # Fetched OHLCV (gitignored)
@@ -1815,8 +1879,8 @@ script:
 | `src/lib/utils.pine` | Shared utility functions | the `f_*` helpers inside the modules |
 | `src/lib/inputs.pine` | All input declarations | `input.*` declarations inside the modules |
 
-Verified in the assembled single file that ships: **35 `input.*` declarations,
-71 `color.*` references and 7 `f_*` helper functions** — every one of them
+Verified in the assembled single file that ships: **39 `input.*` declarations,
+82 `color.*` references and 7 `f_*` helper functions** — every one of them
 coming from a declared module under `src/modules/`, never from an undeclared
 file. The concatenation root `src/liquidityflowause.pine` itself carries none
 of them: it is the version directive, the `indicator()` declaration, the file

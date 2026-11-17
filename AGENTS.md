@@ -10,14 +10,14 @@ No hay `package.json`, ni scripts de npm, ni linter — ejecuta `node` a secas d
 node scripts/build.mjs                        # REQUERIDO PRIMERO: ensambla dist/ (gitignored) + verificaciones textuales
 node scripts/build.mjs --check                # solo valida, no escribe nada
 node scripts/build.mjs --strategy             # variante estrategia Route A (docs/ROUTE-A.md)
-node backtest/smoke.mjs                       # suite de regresión: 2.156 verificaciones, sin datos, sin red
+node backtest/smoke.mjs                       # suite de regresión: 2.188 verificaciones, sin datos, sin red
 node backtest/run.mjs validate                # gate de fidelidad vs docs/VALIDATION.md — SOLO 5m
 node backtest/run.mjs                         # uso + lista completa de subcomandos
 ```
 
-- **CI en GitHub Actions**: `.github/workflows/ci.yml` corre el build del indicador, el build de la estrategia Route A (incluye el check del pin `SHIPPED_INDICATOR_SHA256`) y la suite de 2.156 verificaciones en cada PR y en cada push a `main`. El gate de fidelidad (`run.mjs validate`) queda local: lee el dataset 5m, que no está en el repo.
+- **CI en GitHub Actions**: `.github/workflows/ci.yml` corre el build del indicador, el build de la estrategia Route A (incluye el check del pin `SHIPPED_INDICATOR_SHA256`) y la suite de 2.188 verificaciones en cada PR y en cada push a `main`. El gate de fidelidad (`run.mjs validate`) queda local: lee el dataset 5m, que no está en el repo.
 - `backtest/data/` está gitignored: un clone nuevo no tiene datos. `node backtest/run.mjs fetch` (toca la red) es el primer paso de cualquier medición; solo `fetch` usa la red o escribe, el resto de los subcomandos solo imprimen.
-- La suite no se puede correr parcial: `smoke.mjs` no parsea `process.argv`; son 2.156 verificaciones de una sola pasada.
+- La suite no se puede correr parcial: `smoke.mjs` no parsea `process.argv`; son 2.188 verificaciones de una sola pasada.
 - Las cifras de `docs/` se midieron con `--timeframe 1h`; con el default **5m** el indicador prácticamente nunca dispara.
 
 ## Subcomandos de medición
@@ -70,10 +70,10 @@ node backtest/run.mjs                         # uso + lista completa de subcoman
   y también FALLA si hay un `*.pine` bajo `src/` que no esté declarado (mismo criterio en las dos direcciones).
 - Pine v5: `time()` por defecto devuelve `1234567` (dom-sáb), no `23456`.
 - Route A: nunca pegarlo sobre el indicador (el build rehúsa una `strategy()` con `indicator()`); los seis
-  módulos deben quedar byte-idénticos y el SHA del indicador es `af2c2e3b…0d6866`. En `strategy.exit`,
+  módulos deben quedar byte-idénticos y el SHA del indicador es `c3e5624b…6c3e88`. En `strategy.exit`,
   `profit=1.5`/`loss=0.8` serían TICKS, no %: el archivo usa `limit`/`stop` con niveles absolutos.
 - Los documentos tienen cifras viejas: `WEIGHT-CALIBRATION.md` dice 1.450/1.718/1.985 verificaciones (la real
-  se imprime en runtime: 2.156) y su `LATER_SUBCOMMANDS` quedó desactualizada. NO ajustes el código para calzar con el doc.
+  se imprime en runtime: 2.188) y su `LATER_SUBCOMMANDS` quedó desactualizada. NO ajustes el código para calzar con el doc.
 - La línea de pesos y exits está cerrada (§11): ambos modelos de entrada pierden (weighted −4,07%, binary −11,84%
   en 5 años 1h) y el gross ya es negativo antes de la comisión. No re-tunear target/stop, no cambiar pesos, no
   adoptar binary: es decisión del maintainer, no tuya. Toda cifra es cota superior (fills al cierre, sin

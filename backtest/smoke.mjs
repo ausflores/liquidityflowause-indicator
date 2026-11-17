@@ -5036,7 +5036,7 @@ sec("route-a-strategy");
     "build.mjs never writes either main SOURCE file — only assembled output",
   );
   check(
-    /SHIPPED_INDICATOR_SHA256\s*=\s*\n?\s*"af2c2e3b4689826949259216a9ad663eb47d5281bc8fc7227c1b071b5a0d6866"/i.test(buildSrc),
+    /SHIPPED_INDICATOR_SHA256\s*=\s*\n?\s*"c3e5624b132be994accbce3b09f65297ce768dd674d14def09c04829a16c3e88"/i.test(buildSrc),
     "build.mjs pins the shipped indicator's SHA256 as a literal, so a moved artifact cannot pass silently",
   );
   check(
@@ -5392,6 +5392,125 @@ sec("dashboard-module");
   check(
     /\blastSignalBar\b/.test(dashSiblings) && /\blastSignalBar\b/.test(dashCode),
     "the health line reads the Signal Engine's lastSignalBar, not a second stamp",
+  );
+}
+
+// -- zone-states ----------------------------------------------------------------
+//
+// T2 of the visual-polish feature (odd/tasks/visual-polish-p0-p1.md). The two
+// zone modules gain PRESENTATION-ONLY styling: color by lifecycle state
+// (active / mitigated / broken) and an age fade. The contract below keeps the
+// guarantee visible:
+//
+//   * the four visual inputs live in ONE group, "Zonas (visual)", declared in
+//     liquidity-zones and READ by imbalance-detector — the atrChart precedent:
+//     the earlier module declares, the later module consumes;
+//   * invalidation is a new VISUAL-ONLY field (brokenBar), stamped when a bar
+//     opens on one side of the band and closes beyond the other, sticky, and
+//     absent from the JS ports, which port no drawing at all — so a styling
+//     change cannot move a measured number;
+//   * styling mutates the EXISTING box handle (box.set_* on the record's
+//     zoneBox), never a second box.new, so the drawing budget is untouched;
+//   * the fade ladder is anchored to the SAME horizon each module's age cull
+//     uses (maxZoneAgeBars / maxFvgAgeBars), so fade and cull agree on what
+//     "old" means;
+//   * neither module spends a single plot-family call.
+
+sec("zone-states");
+{
+  const lzSrc = readFileSync(new URL("../src/modules/liquidity-zones.pine", import.meta.url), "utf8");
+  const imbSrc = readFileSync(new URL("../src/modules/imbalance-detector.pine", import.meta.url), "utf8");
+  const lzCode = stripPineLineComments(lzSrc);
+  const imbCode = stripPineLineComments(imbSrc);
+  const zoneCode = `${lzCode}\n${imbCode}`;
+
+  // ── The shared visual input group ──
+  check(
+    (lzCode.match(/group="Zonas \(visual\)"/g) ?? []).length === 4,
+    `the four visual inputs each declare group="Zonas (visual)" in liquidity-zones (got ${(lzCode.match(/group="Zonas \(visual\)"/g) ?? []).length})`,
+  );
+  check(
+    !/group="Zonas \(visual\)"/.test(imbCode),
+    'the "Zonas (visual)" group is declared ONCE — imbalance-detector reads the variables, it does not re-declare the group',
+  );
+  check(
+    /zoneStateColors\s*=\s*input\.bool\(\s*true\s*,\s*"Colorear por estado"/.test(lzCode),
+    'zoneStateColors defaults ON ("Colorear por estado") — color-by-state ships enabled',
+  );
+  check(
+    /zoneAgeFade\s*=\s*input\.bool\(\s*true\s*,\s*"Desvanecer con la edad"/.test(lzCode),
+    'zoneAgeFade defaults ON ("Desvanecer con la edad") — the age fade ships enabled',
+  );
+  check(
+    /zoneBullColor\s*=\s*input\.color\(/.test(lzCode) && /zoneBearColor\s*=\s*input\.color\(/.test(lzCode),
+    "the group carries the two base colors (zoneBullColor / zoneBearColor) as input.color declarations",
+  );
+  for (const name of ["zoneStateColors", "zoneAgeFade", "zoneBullColor", "zoneBearColor"]) {
+    const usesLz = (lzCode.match(new RegExp(`\\b${name}\\b`, "g")) ?? []).length;
+    check(
+      usesLz >= 2,
+      `visual input "${name}" is read beyond its declaration in liquidity-zones (${usesLz - 1} read site(s)) — a control that gates nothing must not appear in the input panel`,
+    );
+    check(
+      new RegExp(`\\b${name}\\b`).test(imbCode),
+      `visual input "${name}" is READ by imbalance-detector — one palette, both zone types`,
+    );
+  }
+
+  // ── The visual-only broken state ──
+  check(
+    /int\s+brokenBar/.test(lzCode) && /int\s+brokenBar/.test(imbCode),
+    "both zone records carry a brokenBar field — invalidation is sticky state, not a per-bar re-derivation",
+  );
+  check(
+    /\bclosedThrough\b/.test(lzCode) && /\bclosedThrough\b/.test(imbCode),
+    "both modules stamp broken from a close-through test: open beyond one edge of the band, close beyond the other",
+  );
+
+  // ── Measurement purity: the JS ports carry NO trace of the visual layer ──
+  const lzPort = readFileSync(new URL("./modules/liquidity-zones.mjs", import.meta.url), "utf8");
+  const imbPort = readFileSync(new URL("./modules/imbalance-detector.mjs", import.meta.url), "utf8");
+  for (const [portName, portSrc] of [["liquidity-zones.mjs", lzPort], ["imbalance-detector.mjs", imbPort]]) {
+    for (const visual of ["brokenBar", "zoneStateColors", "zoneAgeFade", "zoneBullColor", "zoneBearColor"]) {
+      check(
+        !portSrc.includes(visual),
+        `${portName} carries no trace of "${visual}" — the visual state/fade layer lives in Pine only, so measurements cannot move`,
+      );
+    }
+  }
+
+  // ── Drawing budget: restyle the existing box, never a second one ──
+  check(
+    (lzCode.match(/(?<![\w.])box\.new\s*\(/g) ?? []).length === 1,
+    `liquidity-zones still declares exactly ONE box.new — the birth site (got ${(lzCode.match(/(?<![\w.])box\.new\s*\(/g) ?? []).length})`,
+  );
+  check(
+    (imbCode.match(/(?<![\w.])box\.new\s*\(/g) ?? []).length === 1,
+    `imbalance-detector still declares exactly ONE box.new — the birth site (got ${(imbCode.match(/(?<![\w.])box\.new\s*\(/g) ?? []).length})`,
+  );
+  check(
+    /box\.set_bgcolor\(\w+\.zoneBox/.test(lzCode) && /box\.set_border_color\(\w+\.zoneBox/.test(lzCode) &&
+      /box\.set_bgcolor\(\w+\.zoneBox/.test(imbCode) && /box\.set_border_color\(\w+\.zoneBox/.test(imbCode),
+    "state styling mutates the record's EXISTING box handle (box.set_* on zoneBox) — no second box is created",
+  );
+  check(
+    /if zoneStateColors or zoneAgeFade/.test(lzCode) && /if zoneStateColors or zoneAgeFade/.test(imbCode),
+    "the restyle pass is gated on the two toggles — with both OFF the chart keeps the pre-T2 look",
+  );
+  check(
+    /color\.gray/.test(lzCode) && /color\.gray/.test(imbCode),
+    "broken zones draw gray in BOTH modules — invalidation reads as dead, not as a side",
+  );
+  check(
+    /maxZoneAgeBars \* 3 \/ 4/.test(lzCode) && /maxFvgAgeBars \* 3 \/ 4/.test(imbCode),
+    "the fade ladder is anchored to each module's OWN age-cull horizon (maxZoneAgeBars / maxFvgAgeBars) — fade and cull agree on what 'old' means",
+  );
+
+  // ── Plot budget: zone drawing stays box-only ──
+  const zonePlots = (zoneCode.match(/(?<![\w.])(plot|plotshape|plotchar|plotcandle|plotbar|plotarrow|hline|bgcolor|linefill|alertcondition)\s*\(/g) ?? []).length;
+  check(
+    zonePlots === 0,
+    `the two zone modules spend ZERO plot-family calls (got ${zonePlots}) — the 64-plot budget is untouched by the styling layer`,
   );
 }
 
@@ -6919,6 +7038,7 @@ const ORDER = [
   "route-a-strategy",
   "declared-modules",
   "dashboard-module",
+  "zone-states",
   "equity-curve",
     "band-sweep",
     "concept-matrix",

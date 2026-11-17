@@ -50,7 +50,7 @@ exists, and why it is a separate artifact rather than a mode of the indicator.
 
 - **Not the indicator.** Different artifact, different build path. The indicator
   build is pinned (`dist/liquidityflowause.pine`,
-  SHA256 `af2c2e3b…0d6866`) and the strategy build asserts the shared module
+  SHA256 `c3e5624b…6c3e88`) and the strategy build asserts the shared module
   text is byte-identical.
 - **Not a second implementation of the model.** Every line of signal logic comes
   from `src/modules/*.pine`, the same six files the indicator is built from. The
@@ -186,7 +186,7 @@ Two honest warnings about those costs:
 |---|---|
 | Module text byte-identical between the indicator build and the strategy build (6/6, ~82 KB) | `scripts/build.mjs --strategy`, asserted not warned |
 | The parity assertion **can fail** — driven with a divergent pair | `node backtest/smoke.mjs`, section `route-a-strategy` |
-| `dist/liquidityflowause.pine` SHA256 unchanged | `af2c2e3b…0d6866`, checked on every strategy build |
+| `dist/liquidityflowause.pine` SHA256 unchanged | `c3e5624b…6c3e88`, checked on every strategy build |
 | Exactly one `strategy()`; no `indicator()`/`study()` anywhere | build + smoke |
 | `//@version=5` first; two `strategy.entry` calls; two `strategy.exit` calls | build + smoke |
 | Every declared input is read | build + smoke |

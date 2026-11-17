@@ -89,12 +89,14 @@ const STRATEGY_MAIN = join(ROOT, "src", "liquidityflowause-strategy.pine");
 // silently. This file is the product; the strategy is a measuring instrument
 // built beside it and must never be able to rewrite the artifact it measures.
 //
-// Recorded from dist/liquidityflowause.pine on branch feat/visual-dashboard,
-// after splicing the Dashboard module (src/modules/dashboard.pine) and adding
-// the module outputs its table reads: a presentation-layer change approved in
-// odd/tasks/visual-polish-p0-p1.md (T1), with zero measurement-behaviour change.
+// Recorded from dist/liquidityflowause.pine on branch feat/visual-zone-states,
+// after adding the visual state/fade layer to the two zone modules
+// (src/modules/liquidity-zones.pine, src/modules/imbalance-detector.pine):
+// color by lifecycle state, an age fade, and the "Zonas (visual)" input group,
+// per T2 of odd/tasks/visual-polish-p0-p1.md — a presentation-layer change
+// with zero measurement-behaviour change (the JS ports port no drawing).
 export const SHIPPED_INDICATOR_SHA256 =
-  "af2c2e3b4689826949259216a9ad663eb47d5281bc8fc7227c1b071b5a0d6866";
+  "c3e5624b132be994accbce3b09f65297ce768dd674d14def09c04829a16c3e88";
 
 // The D.4 exit levels, cross-checked against backtest/modules/label.mjs at
 // build time so the strategy cannot drift from the definition the whole
